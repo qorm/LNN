@@ -18,7 +18,8 @@ var _ Cell = (*LTC)(nil)
 // at time span ts), threading the hidden state through. h0 may be nil for a
 // zero initial state. It returns the per-step outputs and the final state;
 // the whole sequence stays in the graph, so a loss built on ys differentiates
-// through time with a single Backward.
+// through time with a single Backward. For an empty xs, ys is an empty slice
+// and hN is h0 unchanged (callers must handle a nil final state).
 func Unroll(cell Cell, xs []*autograd.Variable, h0 *autograd.Variable, ts float64) (ys []*autograd.Variable, hN *autograd.Variable) {
 	h := h0
 	ys = make([]*autograd.Variable, len(xs))

@@ -49,6 +49,10 @@ The library ships no optimizer — training loops are written by hand against
 below fits `y = 2x + 1` with a hand-rolled linear model and plain SGD.
 It uses only `tensor` and `autograd`, and runs with `go run`.
 
+Plain `float32` SGD has no built-in stabilization: use modest learning rates,
+and consider clipping the global gradient norm on larger problems
+(`examples/ltc-sequence` clips to max-norm 1.0).
+
 ```go
 package main
 
