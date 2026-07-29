@@ -12,6 +12,7 @@
 | 2 | 汇总分析 → 产出 PLAN.md 规划 | ✅ 完成（见 PLAN.md） |
 | 3 | 按规划实施（目录整顿 + 缺陷修复 + 补测试） | ✅ 完成 |
 | 4 | 红队复审 + 全量验证 | ✅ 完成（裁决：生产就绪，置信度 ~90%） |
+| 5 | 技术债清扫 + 工程成熟度（Benchmark/CI/双语文档） | ✅ 完成 |
 
 ## 阶段 1：并行分析（已完成）
 
@@ -112,6 +113,42 @@
 - **新发现 F1～F5**：均 Informational/Low，无阻断项——F1 极负 cm+极小 ts 下 cmT 可为负但输出仍有限（tiny-ts 为 finiteness-only 域，留档）；F2 训练需裁剪（**已采纳**：README Quick start 补裁剪提示）；F3 ts=+Inf 被接受（契约一致，留档）；F4 Randn 7.43σ 截尾（既有接受项）；F5 Unroll 空序列语义（**已采纳**：cell.go 注释补齐）
 - 采纳 F2/F5 后主控复跑 gauntlet：gofmt 空 / build / vet / test -race 全绿 / example loss 下降 —— 验证状态无漂移
 
+## 阶段 5：技术债清扫 + 工程成熟度 + 双语文档（进行中）
+
+派发时间：2026-07-29（应用户追加要求，文档按中英双语交付：doc/ 英文 + doc/zh/ 中文镜像 + README_zh.md；godoc 依 Go 惯例保持英文）
+
+| Agent | 职责 | 状态 |
+|---|---|---|
+| 实施 D1 | Div 闭式单节点（债#2）、LTC 拒绝非有限 ts（F3）、Randn 截尾/Stack 孤立 API 文档标注（债#4/#6） | ✅ 已回报 |
+| 实施 D2 | 全库 Benchmark（13 函数）+ make bench + GitHub Actions CI | ✅ 已回报 |
+| 实施 D3 | 英文文档体系：3× doc.go + doc/ 六篇指南 + README Documentation 索引 | ✅ 已回报 |
+| 实施 D4 | 中文镜像：doc/zh/ + README_zh.md + 中英互链（等 D3 定稿） | ✅ 已回报 |
+
+### 实施回报摘要
+
+**D1（数值技术债，已完成）**：四项清扫全部落地，零行为破坏：
+- **Div 闭式化**（autograd/ops.go:171-194）：`Hadamard(a,Pow(b,-1))` 双节点 → 单节点闭式，图节点砍半。一致性经**三层验证**：① `broadcastShape` 全部 12 种形状组合前向+双梯度逐位断言（`TestDivMatchesLegacyComposition`）；② 随机 5 组 gradcheck；③ LTC 端到端 example 首迭代 loss 与留档值 0.690761 **逐位吻合**。b=0 前向 [+Inf,-Inf,NaN] 与旧实现逐位一致；nn 内唯一调用点（ltc.go:170）分母恒 ≥ eps，b=0 不可达。2 项偏离均论证（db 求值次序对齐旧 Pow 链以保证 float32 逐位一致；前向复用 `Pow(b.Data,-1)` 走标准库 1/x 快路径排除舍入差异）
+- **F3**：`LTC.Step` 校验加 `math.IsInf`，±Inf 均 panic（+Inf 是旧版漏网点，红队 F3 销账）；既有 finiteness 回归不受影响
+- **债#4/#6 文档化**：Randn doc comment 注明 7.43σ 硬截尾与"仅适用初始化"边界；Stack 标注 Experimental（3D 产出无算子支持，为 API 兼容保留）——均为纯注释，代码零改动
+- 验证：build/vet/test-race 全绿；覆盖率 autograd 97.7%→**97.8%**，nn 98.3%，tensor 89.5%
+
+**D3（英文文档体系，已完成）**：`tensor/autograd/nn` 三个 `doc.go` godoc 门面（79/75/92 行）+ `doc/` 六篇指南（architecture 168 行：三层数据流图、无 stride 设计取舍、图即内存模型；shapes-and-broadcasting 127 行：广播 9 case 全表 + 诚实标注不对称约定；training 220 行：四步回路 + 三纪律 + 裁剪/动量实测范例 + 7 项发散清单；**ltc 218 行：ODE 各项↔ltc.go 行号逐项对照、半隐式 Euler 代数推导、15 行参数表、ts 四档有限性域、ncps 对应表**；pitfalls 188 行：红队发现转用户视角 9 条；README 索引 27 行）+ README 纯追加 Documentation 小节（+16 行）。**全部示例 /tmp 实测**（README quickstart 输出逐行一致、doc.go 三片段、广播/归约全表逐条、二次 Backward [2 4 6]→[4 8 12]、`-race` 并发范式无竞争）；主动与 D1 并行改动实时对齐（Div 行号核至 171-194、+Inf 拒绝已验证）。遗留：三份源码内旧包注释与 doc.go 并存（go 1.26 下 doc.go 胜出，用户无感，未来可清理）
+
+**D2（Benchmark + CI，已完成）**：新增 `tensor/bench_test.go`（8：MatMul64/128、SoftmaxRows、广播 Add、Hadamard、SumRows/SumCols、Transpose）/ `autograd/bench_test.go`（3：16 层链前反向、GatherRows 反向、Div 密集回路）/ `nn/bench_test.go`（2：LTCStep、Unroll+Backward 复刻 example）——13 项实测全通；`make bench`（BENCH 变量可过滤，不并入 all）；`.github/workflows/ci.yml` 7 步（gofmt 门禁/vet/build/test-race/example 冒烟），YAML 经 python yaml 解析校验。**首次量化性能债**：`LTCStep` 7372 allocs/op（~502KB）、`UnrollBackward` 120452 allocs/op（~12MB）——O(units²·unfolds) 图规模问题有了度量尺子；`BenchmarkDivDenLoop`（807 allocs/op）留作 D1 Div 闭式化的回归基线。范围自律确认（未触碰他人文件）。
+
+### 主控前置验证（D1/D2/D3 合并态，不等 D4）
+
+- **Div 闭式化收益量化**（重跑 `BenchmarkDivDenLoop`，-count=3 稳定）：807 allocs/op → **753 allocs/op（−6.7%，每 Div 省 6 次分配）**；750,186 B/op → 712,043 B/op（−5.1%）；454,680 ns/op → ~404,500 ns/op（**−11%**）。留档债 #2 销账且有度量证据
+- **全量 gauntlet**：`gofmt -l .` 空 / build / vet / `go test ./... -race` 全包绿 / example loss 0.690761→0.041996 **与留档值逐位一致**（Div 替换未扰动训练行为）
+
+**D3+D4（双语文档体系，已完成）**：
+- 英文（D3）：3× `doc.go` godoc 门面 + `doc/` 六篇指南（architecture/shapes-and-broadcasting/training/**ltc**（论文↔代码逐项对照）/pitfalls/索引）+ README Documentation 小节；全部示例 /tmp 实测
+- 中文（D4）：`README_zh.md`（202 行）+ `doc/zh/` 六篇镜像（共 931 行），篇首中英互链，术语表 13 词条首现括注英文；结构自检标题数/表格行数逐篇一一对应；全部示例（含 `-race` 并发范式）实测通过
+- **D4 回源核对反查出英文版 4 处与代码漂移，已双语修正**：①training.md 裁剪实测值不可复现（16.46/0.003038 → 可复现的 2.50/0.019975）；②shapes 文档"标量×标量→[1]"不精确（实为 [1,1]，仅 0 维操作数得 [1] 且混用顺序敏感）；③ltc.md 位级偏差起点 1e-38 → 1e-37–1e-38（含钳制阈值 1.8e-38）；④README 覆盖率 ~86% → ~90%。"不许纯机翻"纪律兑现为一次额外的文档审计
+- 终检 gauntlet 全绿；godoc 依 Go 惯例保持英文（中文文档已注明）
+
+**阶段 5 关闭**。留档表更新：债#2（Div）、F3（+Inf ts）已销账；#4/#6 已文档化；残余项见下表。
+
 ## 项目终态
 
 | 指标 | 基线（87ccf77） | 终态 |
@@ -119,22 +156,25 @@
 | 编译 | nn ❌ 失败 | ✅ 全包绿 |
 | 测试 | nn 无测试；tensor/autograd 绿 | ✅ 全包 `-race` 绿（44+ 测试） |
 | 覆盖率 | tensor 85.7% / autograd 97.6% / nn 无 | **tensor 89.5% / autograd 97.7% / nn 98.3%** |
-| 红队漏洞 | 13 项（1C/4H/5M/3L），裁决不可用于生产 | 全部销账，裁决生产就绪（~90%） |
-| 基建 | 非 Git 仓库，无文档 | Git 4 提交 · README（示例实测）· MIT LICENSE · Makefile · examples |
+| 红队漏洞 | 13 项（1C/4H/5M/3L），裁决不可用于生产 | 全部销账 + F3 销账，裁决生产就绪（~90%） |
+| 基建 | 非 Git 仓库，无文档 | Git 提交链 · 双语文档（README/README_zh + doc/ 与 doc/zh/ 各六篇 + 3× godoc）· MIT · Makefile（含 bench）· GitHub Actions CI · 13 项基准 · examples |
 | 端到端 | 无 | example 实测 loss 0.691→0.042（降 94%） |
+| 技术债 | 6 项留档 | Div 闭式（−11% 时延）等 2 项销账、2 项文档化、性能债首次量化 |
 
-Git 历史：`87ccf77` 基线 → `08aba45` 阶段3a → `102af40` 阶段3b → 终局文档收尾提交
+Git 历史：`87ccf77` 基线 → `08aba45` 阶段3a → `102af40` 阶段3b → `a351daf` 阶段4收尾 → 阶段5（技术债+基建+双语文档）终局提交
 
 ## 遗留问题登记（技术债留档，均不阻断）
 
 | # | 问题 | 来源 | 严重度 | 处置 |
 |---|---|---|---|---|
 | 1 | 并发 Backward 数据竞争 | V-04 | 接受风险 | 单线程契约文档化（README + module.go），用户遵守契约即无风险 |
-| 2 | `Div` 借 `Pow(-1)`，den≈eps 时梯度 ~1e16 | 核心B/V-11 | Low | 技术债，建议未来闭式实现 |
+| 2 | ~~`Div` 借 `Pow(-1)`~~ | 核心B/V-11 | — | ✅ **阶段 5 已销账**（闭式单节点，−11% 时延 / −6.7% allocs）；den≈eps 的 1/b² 梯度放大为数学本性，已文档化 |
 | 3 | `SumRows→[1,n]` vs `SumCols→[m]`、1D⊕1D→[1,n] 约定不对称 | 核心A/V-12 | Low | API 破坏性，另立评估（README 已披露） |
 | 4 | Randn Box-Muller 尾部硬截断 ~7.43σ | V-13/F4 | Low | 对初始化可忽略，采样器用途需留意 |
 | 5 | tiny-ts 域（<1e-38）仅保有限性、物理保真退化 | F1 | Info | 正常训练域不受影响，留档 |
-| 6 | `Stack` 产出 3D 无消费方、ops.go 五职责、无 CI/Benchmark | 核心A/健康度 | 🟢 | 后续迭代候选 |
+| 6 | `Stack` 产出 3D 无消费方、ops.go 五职责 | 核心A/健康度 | 🟢 | Stack 已标注 Experimental；~~无 CI/Benchmark~~ ✅ 阶段 5 已补（GitHub Actions + 13 基准） |
+| 7 | nn 热路径分配量（LTCStep 7372 allocs/op、Unroll 12 万 allocs/op） | D2 基准量化 | 🟢 | 已有基准尺子，图算子融合/掩码预施加为后续优化方向 |
+| 8 | 三份源码内旧包注释与 doc.go 并存 | D3 发现 | 🟢 | go 1.26 下 doc.go 胜出、用户无感，未来可清理 |
 
 ## 变更日志
 
@@ -142,4 +182,6 @@ Git 历史：`87ccf77` 基线 → `08aba45` 阶段3a → `102af40` 阶段3b → 
 - 2026-07-29：阶段 1 完成（4 路回报，红队 13 项实测漏洞）；阶段 2 产出 PLAN.md，建立 Git 基线 87ccf77。
 - 2026-07-29：阶段 3a 完成（Agent-T 核心修复 + Agent-I 基建），提交 08aba45。
 - 2026-07-29：阶段 3b 完成（Agent-N nn 大修 + examples），主控独立 gauntlet 复核一致，提交 102af40。
-- 2026-07-29：阶段 4 红队复审：**V-01～V-13 全部销账，裁决生产就绪（~90%）**；采纳 F2/F5 文档建议并复跑 gauntlet 无漂移；全部阶段关闭。
+- 2026-07-29：阶段 4 红队复审：**V-01～V-13 全部销账，裁决生产就绪（~90%）**；采纳 F2/F5 文档建议并复跑 gauntlet 无漂移；前四阶段关闭。
+- 2026-07-29：阶段 5 启动（技术债 + 工程成熟度），应用户要求文档按中英双语交付；D1（Div 闭式/F3/注释化）+ D2（13 基准/CI/make bench）+ D3（英文文档）并行完成；DivDenLoop 复测确认 −11% 时延。
+- 2026-07-29：D4 中文镜像文档交付（931 行，全部示例实测），回源核对反查英文版 4 处漂移并由主控双语修正；终检 gauntlet 全绿；**全部五个阶段关闭**。

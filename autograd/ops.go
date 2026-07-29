@@ -168,8 +168,30 @@ func Relu(a *Variable) *Variable {
 	return out
 }
 
-// Div computes a / b elementwise with broadcasting; b must be nonzero.
-func Div(a, b *Variable) *Variable { return Hadamard(a, Pow(b, -1)) }
+// Div differentiably computes a / b elementwise with broadcasting; b must be
+// nonzero (b == 0 yields +/-Inf in the forward pass, as float32 division does).
+//
+// Div is a single closed-form graph node. The previous implementation
+// composed Hadamard(a, Pow(b, -1)), which recorded two op nodes and ran
+// Pow's backward on top of Hadamard's. The forward deliberately reuses the
+// exact tensor-level computation of that composition (a ⊙ pow(b, -1)), so
+// shapes, broadcasting and values are bit-identical. The backward follows
+// the quotient rule, da = g/b and db = -g·a/b²; because b⁻² is constant
+// along every axis b was broadcast over, db may reduce g·a to b's shape
+// first and only then scale by -b⁻² — which equals the closed form and also
+// keeps gradients bit-identical to the legacy two-node chain.
+func Div(a, b *Variable) *Variable {
+	inv := tensor.Pow(b.Data, -1)
+	out := newOp(tensor.Hadamard(a.Data, inv), []*Variable{a, b}, nil)
+	out.backward = func() {
+		// da = g / b
+		a.addGrad(tensor.SumToShape(tensor.Hadamard(out.Grad, inv), a.Data.Shape))
+		// db = -g·a/b², reduced first, then scaled (see doc comment).
+		ga := tensor.SumToShape(tensor.Hadamard(out.Grad, a.Data), b.Data.Shape)
+		b.addGrad(tensor.Neg(tensor.Hadamard(ga, tensor.Pow(b.Data, -2))))
+	}
+	return out
+}
 
 // ConcatCol concatenates 2D variables along the column axis.
 func ConcatCol(vs ...*Variable) *Variable {

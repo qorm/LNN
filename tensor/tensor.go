@@ -161,6 +161,12 @@ func (t *Tensor) IsRowVec() bool {
 
 // Stack stacks tensors along a new leading dimension. All inputs must share
 // one shape; the result has shape [len(ts), shape...].
+//
+// Experimental: stacking 2D inputs yields a 3D tensor, and no other operator
+// in this library (MatMul, the broadcasting binary ops, reductions, softmax
+// families) supports 3D tensors — they panic on Dims() != 2. Consume the
+// result manually (Data/Shape access) rather than feeding it back into ops.
+// Kept for API compatibility; know this before relying on it in new code.
 func Stack(ts ...*Tensor) *Tensor {
 	if len(ts) == 0 {
 		panic("tensor.Stack: no tensors")

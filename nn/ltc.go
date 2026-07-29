@@ -133,13 +133,16 @@ func (c *LTC) Parameters() []*autograd.Variable {
 }
 
 // Step advances the cell by one RNN step, integrating the ODE over the time
-// span ts (which must be positive; NaN is rejected). x is [batch, inDim], h
-// is [batch, units] or nil for a zero initial state. It returns the
-// (affinely mapped) output and the new raw state.
+// span ts (which must be positive and finite; NaN and +/-Inf are rejected).
+// x is [batch, inDim], h is [batch, units] or nil for a zero initial state.
+// It returns the (affinely mapped) output and the new raw state.
 func (c *LTC) Step(x, h *autograd.Variable, ts float64) (out, hNew *autograd.Variable) {
 	// NaN-aware positivity check: NaN > 0 is false, so NaN panics here too.
-	if !(ts > 0) {
-		panic(fmt.Sprintf("nn.LTC.Step: ts must be positive, got %v", ts))
+	// +Inf passes `ts > 0` but would silently integrate over an infinite time
+	// span (the "infinite-time steady state"), which callers rarely intend;
+	// reject both infinities explicitly, on the same panic path.
+	if !(ts > 0) || math.IsInf(ts, 0) {
+		panic(fmt.Sprintf("nn.LTC.Step: ts must be positive and finite, got %v", ts))
 	}
 	batch := x.Data.Rows()
 	if h == nil {

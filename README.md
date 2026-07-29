@@ -1,5 +1,7 @@
 # lnn
 
+> [简体中文](README_zh.md)
+
 A pure-Go numerical computation library: dense `float32` tensors, reverse-mode
 automatic differentiation, and Liquid Time-Constant (LTC) neural cells —
 with **zero third-party dependencies** (the standard library is the only
@@ -18,6 +20,22 @@ no code generation, no GPU backend, no operator overloading tricks — just Go.
 | `lnn/tensor` | Dense row-major `float32` tensors with a 1D/2D-focused op set: matmul, elementwise math with limited broadcasting, activations, reductions, slicing, random initialization. |
 | `lnn/autograd` | A dynamic computation-graph engine. Each op records a backward closure on its output `Variable`; `Backward` walks the graph in reverse topological order and accumulates gradients into leaves. |
 | `lnn/nn` | Neural-network building blocks: `Linear` layers, `Wiring` synapse topologies, the `LTC` liquid cell, and the `Cell`/`Unroll` abstractions for driving recurrent cells over sequences. |
+
+## Documentation
+
+Guides for building on the library live in [`doc/`](doc/):
+
+| Guide | Covers |
+|---|---|
+| [doc/training.md](doc/training.md) | Hand-rolled training loops, plain SGD, gradient clipping, a divergence checklist |
+| [doc/shapes-and-broadcasting.md](doc/shapes-and-broadcasting.md) | The broadcasting rule table, reduction output shapes, asymmetric conventions |
+| [doc/ltc.md](doc/ltc.md) | The LTC paper↔code correspondence, parameter table, `ts` contract, wiring |
+| [doc/architecture.md](doc/architecture.md) | Three-layer design, computation-graph mechanics, the `float32` constraint |
+| [doc/pitfalls.md](doc/pitfalls.md) | Concurrency contract, overflow scenarios, residual risks, roadmap |
+
+Start with [doc/README.md](doc/README.md) for a suggested reading order.
+Per-package API reference is available via godoc: `go doc lnn/tensor`,
+`go doc lnn/autograd`, `go doc lnn/nn`.
 
 ## Installation
 
@@ -191,7 +209,7 @@ Honest maturity assessment as of this commit:
 
 | Package | Status |
 |---|---|
-| `tensor` | Core is stable and well tested (~86% line coverage). Some defensive checks (overflow-safe sizing, empty-input edge cases) are being hardened. |
+| `tensor` | Core is stable and well tested (~90% line coverage). Some defensive checks (overflow-safe sizing, empty-input edge cases) are being hardened. |
 | `autograd` | Stable and well tested (~98% line coverage); gradients pass finite-difference checks on the covered paths. |
 | `nn` | Functional and well tested (~98% line coverage): the LTC forward/backward paths are regression-tested, including a closed-form degenerate-case check, tiny/NaN `ts` guards, and wiring validation. Reversal potentials are fixed ±1 constants, not trainable. The API may still evolve. |
 

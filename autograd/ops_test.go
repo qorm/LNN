@@ -276,6 +276,175 @@ func TestBackwardWithSeededNonScalarGrad(t *testing.T) {
 	}
 }
 
+// legacyDiv rebuilds the pre-cleanup Div composition so tests can pin the
+// closed-form implementation to the exact historical behavior.
+func legacyDiv(a, b *Variable) *Variable { return Hadamard(a, Pow(b, -1)) }
+
+// TestDivRandomGradCheck exercises the closed-form Div quotient gradients on
+// random inputs of both signs, plus the row/column broadcast paths and the
+// shared-variable case. Denominators stay away from zero so the finite
+// differences remain well conditioned.
+func TestDivRandomGradCheck(t *testing.T) {
+	rng := rand.New(rand.NewSource(101))
+	signedDen := func(shape ...int) *Variable {
+		v := randVar(rng, 0.5, 2.5, shape...)
+		for i := range v.Data.Data {
+			if i%2 == 0 {
+				v.Data.Data[i] = -v.Data.Data[i]
+			}
+		}
+		return v
+	}
+	div := func(v ...*Variable) *Variable { return Div(v[0], v[1]) }
+
+	gradCheck(t, "Div random", div, randVar(rng, -2, 2, 2, 3), signedDen(2, 3))
+	gradCheck(t, "Div random row broadcast", div, randVar(rng, -2, 2, 2, 3), signedDen(3))
+	gradCheck(t, "Div random col broadcast", div, randVar(rng, -2, 2, 2, 3), signedDen(2, 1))
+	gradCheck(t, "Div random outer product", div, randVar(rng, -2, 2, 2, 1), signedDen(3))
+	gradCheck(t, "Div shared variable", func(v ...*Variable) *Variable { return Div(v[0], v[0]) },
+		signedDen(2, 3))
+}
+
+// TestDivMatchesLegacyComposition pins debt-#2's zero-behavior-change claim:
+// across every broadcast combination the library supports, the closed-form
+// Div must produce the same output shape and bit-identical values as the old
+// Hadamard(a, Pow(b, -1)) composition, and its leaf gradients must match the
+// legacy chain bit-for-bit as well.
+func TestDivMatchesLegacyComposition(t *testing.T) {
+	rng := rand.New(rand.NewSource(5))
+	num := func(shape ...int) *tensor.Tensor { return tensor.Uniform(rng, -2, 2, shape...) }
+	den := func(shape ...int) *tensor.Tensor {
+		d := tensor.Uniform(rng, 0.5, 2.5, shape...)
+		for i := range d.Data {
+			if i%2 == 0 {
+				d.Data[i] = -d.Data[i]
+			}
+		}
+		return d
+	}
+	cases := []struct {
+		name      string
+		a, b      *tensor.Tensor
+		wantShape []int
+	}{
+		{"same shape", num(2, 3), den(2, 3), []int{2, 3}},
+		{"scalar numerator", num(1), den(2, 3), []int{2, 3}},
+		{"scalar denominator", num(2, 3), den(1), []int{2, 3}},
+		{"1D row denominator", num(2, 3), den(3), []int{2, 3}},
+		{"2D row denominator", num(2, 3), den(1, 3), []int{2, 3}},
+		{"1D row numerator", num(3), den(2, 3), []int{2, 3}},
+		{"col denominator", num(2, 3), den(2, 1), []int{2, 3}},
+		{"col numerator", num(2, 1), den(2, 3), []int{2, 3}},
+		{"outer product col/row", num(2, 1), den(3), []int{2, 3}},
+		{"outer product row/col", num(3), den(2, 1), []int{2, 3}},
+		{"1D over 1D", num(3), den(3), []int{1, 3}},
+		{"scalar over scalar", num(1), den(1), []int{1, 1}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := Div(Var(tc.a.Clone()), Var(tc.b.Clone()))
+			legacy := legacyDiv(Var(tc.a.Clone()), Var(tc.b.Clone()))
+
+			if !tensor.SameShape(d.Data, legacy.Data) {
+				t.Fatalf("shape drift: Div %v vs legacy %v", d.Data.Shape, legacy.Data.Shape)
+			}
+			want := &tensor.Tensor{Shape: tc.wantShape}
+			if !tensor.SameShape(d.Data, want) {
+				t.Fatalf("shape %v, want %v", d.Data.Shape, tc.wantShape)
+			}
+			for i := range d.Data.Data {
+				if d.Data.Data[i] != legacy.Data.Data[i] {
+					t.Fatalf("elem %d: Div %v vs legacy %v", i, d.Data.Data[i], legacy.Data.Data[i])
+				}
+			}
+
+			// Gradients must be bit-identical too.
+			a1, b1 := Var(tc.a.Clone()), Var(tc.b.Clone())
+			a2, b2 := Var(tc.a.Clone()), Var(tc.b.Clone())
+			SumAll(Div(a1, b1)).Backward()
+			SumAll(legacyDiv(a2, b2)).Backward()
+			for _, pair := range []struct {
+				name      string
+				got, want *tensor.Tensor
+			}{{"da", a1.Grad, a2.Grad}, {"db", b1.Grad, b2.Grad}} {
+				if !tensor.SameShape(pair.got, pair.want) {
+					t.Fatalf("%s shape drift: %v vs legacy %v", pair.name, pair.got.Shape, pair.want.Shape)
+				}
+				for i := range pair.got.Data {
+					if pair.got.Data[i] != pair.want.Data[i] {
+						t.Fatalf("%s elem %d: %v vs legacy %v", pair.name, i, pair.got.Data[i], pair.want.Data[i])
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestDivSingleNodeGraph verifies the debt-#2 cleanup itself: Div records one
+// closed-form op node wired directly to a and b, where the old composition
+// recorded two op nodes (Hadamard over a Pow) that Backward had to traverse.
+func TestDivSingleNodeGraph(t *testing.T) {
+	countOps := func(root *Variable) int {
+		n := 0
+		seen := map[*Variable]bool{}
+		var walk func(v *Variable)
+		walk = func(v *Variable) {
+			if seen[v] {
+				return
+			}
+			seen[v] = true
+			if len(v.parents) > 0 {
+				n++
+			}
+			for _, p := range v.parents {
+				walk(p)
+			}
+		}
+		walk(root)
+		return n
+	}
+	a := New([]float32{1, 2, 3, 4}, 2, 2)
+	b := New([]float32{4, 3, 2, 1}, 2, 2)
+
+	d := Div(a, b)
+	if len(d.parents) != 2 || d.parents[0] != a || d.parents[1] != b {
+		t.Fatalf("Div must wire a and b directly, got %d parents", len(d.parents))
+	}
+	if got := countOps(d); got != 1 {
+		t.Fatalf("Div graph has %d op nodes, want 1", got)
+	}
+	if got := countOps(legacyDiv(a, b)); got != 2 {
+		t.Fatalf("legacy composition has %d op nodes, want 2", got)
+	}
+}
+
+// TestDivZeroDivisor pins the b == 0 contract: the forward yields +/-Inf (and
+// NaN for 0/0) exactly as the legacy composition did, and Backward must not
+// panic (gradients may be non-finite; b == 0 is documented as out of contract).
+func TestDivZeroDivisor(t *testing.T) {
+	a := New([]float32{1, -1, 0}, 1, 3)
+	b := New([]float32{0, 0, 0}, 1, 3)
+
+	d := Div(a, b)
+	legacy := legacyDiv(a, b)
+	for i := range d.Data.Data {
+		x, y := float64(d.Data.Data[i]), float64(legacy.Data.Data[i])
+		if d.Data.Data[i] != legacy.Data.Data[i] && !(math.IsNaN(x) && math.IsNaN(y)) {
+			t.Fatalf("elem %d: Div %v vs legacy %v", i, d.Data.Data[i], legacy.Data.Data[i])
+		}
+	}
+	got := d.Data.Data
+	if !math.IsInf(float64(got[0]), 1) || !math.IsInf(float64(got[1]), -1) || !math.IsNaN(float64(got[2])) {
+		t.Fatalf("Div at b=0 = %v, want [+Inf -Inf NaN]", got)
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("Backward panicked at b=0: %v", r)
+		}
+	}()
+	SumAll(d).Backward()
+}
+
 func almostEq(a, b, eps float32) bool {
 	d := a - b
 	if d < 0 {

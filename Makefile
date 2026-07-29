@@ -2,8 +2,10 @@
 # POSIX shell syntax; every recipe line is indented with a TAB.
 
 GO ?= go
+# Regex filter for `make bench` (e.g. `make bench BENCH=MatMul`).
+BENCH ?= .
 
-.PHONY: all fmt vet test cover build
+.PHONY: all fmt vet test cover build bench
 
 # Default: format, vet, and run the whole test suite with the race detector.
 all: fmt vet test
@@ -26,3 +28,9 @@ cover:
 
 build:
 	$(GO) build ./...
+
+# Run the benchmark suite with allocation stats. Filter with the BENCH
+# variable, e.g. `make bench BENCH=MatMul`. Deliberately not part of `all`:
+# a full benchmark run is slow.
+bench:
+	$(GO) test ./... -run '^$$' -bench $(BENCH) -benchmem

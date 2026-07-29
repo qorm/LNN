@@ -1,8 +1,10 @@
 package nn
 
 import (
+	"fmt"
 	"math"
 	"math/rand"
+	"strings"
 	"testing"
 
 	"lnn/autograd"
@@ -166,6 +168,37 @@ func TestLTCStepRejectsBadTs(t *testing.T) {
 			cell.Step(x, nil, ts)
 		})
 	}
+}
+
+// TestLTCStepRejectsInfTs is the F3 cleanup: +Inf passed the old positivity
+// check (Inf > 0 is true) and silently integrated over an infinite time span
+// (the "infinite-time steady state"), which callers rarely intend. Both
+// infinities must panic now, on the same path as NaN/0/negative ts, and the
+// panic message must carry the offending ts value.
+func TestLTCStepRejectsInfTs(t *testing.T) {
+	rng := rand.New(rand.NewSource(31))
+	cell := NewLTC(2, 4, nil, 6, rng)
+	x := autograd.Var(tensor.New(2, 2))
+	for _, ts := range []float64{math.Inf(1), math.Inf(-1)} {
+		ts := ts
+		t.Run(fmt.Sprint(ts), func(t *testing.T) {
+			defer func() {
+				r := recover()
+				if r == nil {
+					t.Fatalf("Step with ts=%v did not panic", ts)
+				}
+				if msg := fmt.Sprint(r); !strings.Contains(msg, fmt.Sprint(ts)) {
+					t.Fatalf("panic message %q should carry the ts value %v", msg, ts)
+				}
+			}()
+			cell.Step(x, nil, ts)
+		})
+	}
+	// Sane ts values, including the tiny-ts finiteness regime, are unaffected.
+	out, h := cell.Step(x, nil, 1e-40)
+	assertFinite(t, "ts=1e-40 under new validation", out, h)
+	out, h = cell.Step(x, nil, 0.1)
+	assertFinite(t, "ts=0.1 under new validation", out, h)
 }
 
 // TestLTCParametersExcludeErev checks that reversal potentials are fixed
