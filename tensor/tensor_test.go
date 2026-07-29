@@ -1,8 +1,10 @@
 package tensor
 
 import (
+	"fmt"
 	"math"
 	"math/rand"
+	"strings"
 	"testing"
 )
 
@@ -75,7 +77,7 @@ func TestCloneIndependence(t *testing.T) {
 }
 
 func TestMatMul(t *testing.T) {
-	a := FromRows([]float32{1, 2, 3}, []float32{4, 5, 6})          // 2x3
+	a := FromRows([]float32{1, 2, 3}, []float32{4, 5, 6})               // 2x3
 	b := FromRows([]float32{7, 8}, []float32{9, 10}, []float32{11, 12}) // 3x2
 	got := MatMul(a, b)
 	checkShape(t, got, 2, 2)
@@ -294,6 +296,140 @@ func TestSliceRow(t *testing.T) {
 	r.Data[0] = 99
 	if a.At(1, 0) != 4 {
 		t.Fatal("SliceRow shares backing array")
+	}
+}
+
+// TestSizeOverflowPanics is a regression test for V-05: FromData([], 1<<62, 4)
+// used to return a "ghost tensor" whose shape implies 2^64 elements but whose
+// Data buffer was empty, because Size()'s signed multiplication wrapped to 0.
+func TestSizeOverflowPanics(t *testing.T) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic on overflowing shape")
+		}
+		msg := fmt.Sprint(r)
+		if !strings.Contains(msg, fmt.Sprintf("%v", []int{1 << 62, 4})) {
+			t.Fatalf("panic message %q should carry the offending shape", msg)
+		}
+	}()
+	FromData([]float32{}, 1<<62, 4)
+}
+
+// TestNewNegativeDimPanics is a regression test for V-06: New(-2, -3) must not
+// construct a tensor with no legal indices.
+func TestNewNegativeDimPanics(t *testing.T) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic on negative dimension")
+		}
+		if msg := fmt.Sprint(r); !strings.Contains(msg, "negative dimension") {
+			t.Fatalf("panic message %q should mention the negative dimension", msg)
+		}
+	}()
+	New(-2, -3)
+}
+
+// TestSoftmaxRowsEmptyCols is a regression test for V-07: a zero-column tensor
+// used to make SoftmaxRows/LogSoftmaxRows panic on row[0] instead of returning
+// an empty result.
+func TestSoftmaxRowsEmptyCols(t *testing.T) {
+	a := New(3, 0)
+
+	s := SoftmaxRows(a)
+	checkShape(t, s, 3, 0)
+	if len(s.Data) != 0 {
+		t.Fatalf("SoftmaxRows data = %v, want empty", s.Data)
+	}
+
+	ls := LogSoftmaxRows(a)
+	checkShape(t, ls, 3, 0)
+	if len(ls.Data) != 0 {
+		t.Fatalf("LogSoftmaxRows data = %v, want empty", ls.Data)
+	}
+}
+
+// TestMeanAllEmptyPanics is a regression test for V-13: the mean of an empty
+// tensor must panic explicitly rather than return NaN via 0/0.
+func TestMeanAllEmptyPanics(t *testing.T) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic on MeanAll of empty tensor")
+		}
+		if msg := fmt.Sprint(r); !strings.Contains(msg, "empty") {
+			t.Fatalf("panic message %q should mention the empty tensor", msg)
+		}
+	}()
+	MeanAll(New(0, 3))
+}
+
+// TestPanicContracts pins down the panics that constructors and operators must
+// raise on malformed input, so a future refactor cannot turn them into silent
+// miscomputation.
+func TestPanicContracts(t *testing.T) {
+	cases := []struct {
+		name string
+		f    func()
+	}{
+		{"MatMul shape mismatch", func() { MatMul(New(2, 3), New(2, 3)) }},
+		{"SliceCol negative from", func() { SliceCol(New(2, 3), -1, 2) }},
+		{"SliceCol empty range", func() { SliceCol(New(2, 3), 2, 2) }},
+		{"SliceCol beyond cols", func() { SliceCol(New(2, 3), 0, 4) }},
+		{"broadcast incompatible", func() { Add(New(2, 3), New(2, 2)) }},
+		{"FromRows ragged", func() { FromRows([]float32{1, 2}, []float32{3}) }},
+		{"At out of bounds", func() { New(2, 3).At(2, 0) }},
+		{"Set out of bounds", func() { New(2, 3).Set(1, 0, 3) }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Fatalf("%s: expected panic", tc.name)
+				}
+			}()
+			tc.f()
+		})
+	}
+}
+
+// TestRandnOddLength covers the Box-Muller tail branch (odd element count) and
+// sanity-checks that the sample variance stays near 1.
+func TestRandnOddLengthAndVariance(t *testing.T) {
+	rng := rand.New(rand.NewSource(3))
+	n := Randn(rng, 1001) // odd length forces the single-sample tail branch
+	if len(n.Data) != 1001 {
+		t.Fatalf("len = %d, want 1001", len(n.Data))
+	}
+	var mean float64
+	for _, v := range n.Data {
+		if math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) {
+			t.Fatalf("randn produced non-finite value %v", v)
+		}
+		mean += float64(v)
+	}
+	mean /= float64(len(n.Data))
+	var variance float64
+	for _, v := range n.Data {
+		d := float64(v) - mean
+		variance += d * d
+	}
+	variance /= float64(len(n.Data) - 1)
+	if variance < 0.85 || variance > 1.15 {
+		t.Fatalf("randn sample variance %v, want roughly 1", variance)
+	}
+}
+
+// TestUniformMirroredInterval documents the deliberate legacy behavior of
+// Uniform with lo > hi: the interval is mirrored, values fall in [hi, lo].
+func TestUniformMirroredInterval(t *testing.T) {
+	rng := rand.New(rand.NewSource(1))
+	u := Uniform(rng, 3, -2, 50) // lo > hi
+	for _, v := range u.Data {
+		if v < -2 || v > 3 {
+			t.Fatalf("mirrored uniform value %v outside [-2, 3]", v)
+		}
 	}
 }
 

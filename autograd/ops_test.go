@@ -2,7 +2,9 @@ package autograd
 
 import (
 	"fmt"
+	"math"
 	"math/rand"
+	"strings"
 	"testing"
 
 	"lnn/tensor"
@@ -99,6 +101,7 @@ func TestOpGradients(t *testing.T) {
 		{"Add row broadcast", func(v ...*Variable) *Variable { return Add(v[0], v[1]) }, []*Variable{rand23(), randVar(rng, -1, 1, 3)}},
 		{"Add col broadcast", func(v ...*Variable) *Variable { return Add(v[0], v[1]) }, []*Variable{rand23(), randVar(rng, -1, 1, 2, 1)}},
 		{"Sub row broadcast", func(v ...*Variable) *Variable { return Sub(v[0], v[1]) }, []*Variable{rand23(), randVar(rng, -1, 1, 3)}},
+		{"Sub col broadcast", func(v ...*Variable) *Variable { return Sub(v[0], v[1]) }, []*Variable{rand23(), randVar(rng, -1, 1, 2, 1)}},
 		{"Hadamard outer", func(v ...*Variable) *Variable { return Hadamard(v[0], v[1]) }, []*Variable{randVar(rng, -1, 1, 2, 1), randVar(rng, -1, 1, 3)}},
 		{"Hadamard same shape", func(v ...*Variable) *Variable { return Hadamard(v[0], v[1]) }, []*Variable{rand23(), rand23()}},
 		{"Scale", func(v ...*Variable) *Variable { return Scale(v[0], -2.5) }, []*Variable{rand23()}},
@@ -172,6 +175,113 @@ func TestBackwardPanicsOnNonScalar(t *testing.T) {
 	}()
 	a := randVar(rand.New(rand.NewSource(1)), -1, 1, 2, 2)
 	Tanh(a).Backward()
+}
+
+// TestAddGradPanicsOnShapeMismatch is a regression test for V-12: gradients
+// with equal element counts but different shapes ([1, 6] vs [2, 3]) used to be
+// added silently, producing wrong gradients without any diagnostic.
+func TestAddGradPanicsOnShapeMismatch(t *testing.T) {
+	v := New([]float32{1, 2, 3, 4, 5, 6}, 1, 6)
+	v.Grad = tensor.New(1, 6)
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic on gradient shape mismatch")
+		}
+		msg := fmt.Sprint(r)
+		if !strings.Contains(msg, "[1 6]") || !strings.Contains(msg, "[2 3]") {
+			t.Fatalf("panic message %q should carry both shapes", msg)
+		}
+	}()
+	v.addGrad(tensor.New(2, 3))
+}
+
+// TestGatherRowsIdxMutation is a regression test for V-08: the backward
+// closure used to capture the caller's idx slice by reference, so mutating it
+// between the forward pass and Backward silently corrupted the gradient (the
+// red team measured [0 1 1 0] where [1 0 0 1] is correct).
+func TestGatherRowsIdxMutation(t *testing.T) {
+	a := New([]float32{1, 2, 3, 4}, 2, 2)
+	idx := []int{0, 1}
+	out := GatherRows(a, idx)
+
+	// Mutate the caller's slice after the forward pass, before Backward.
+	idx[0], idx[1] = 1, 0
+
+	SumAll(out).Backward()
+	want := []float32{1, 0, 0, 1} // row 0 col 0 and row 1 col 1 gathered
+	for i, w := range want {
+		if a.Grad.Data[i] != w {
+			t.Fatalf("grad = %v, want %v (idx aliasing corrupted the gradient)", a.Grad.Data, want)
+		}
+	}
+}
+
+// TestBackwardTwiceAccumulatesLinearly is a regression test for V-09: calling
+// Backward twice on the same graph used to accumulate super-linearly (the red
+// team measured 3x) because stale intermediate gradients were re-propagated.
+// Leaf gradients must instead grow linearly: two calls == twice one call.
+func TestBackwardTwiceAccumulatesLinearly(t *testing.T) {
+	a := New([]float32{1, 2, 3}, 3)
+	y := SumAll(Hadamard(a, a)) // y = sum(a^2), dy/da = 2a
+
+	y.Backward()
+	single := append([]float32(nil), a.Grad.Data...)
+	y.Backward() // same graph, second run
+
+	for i := range single {
+		if got, want := a.Grad.Data[i], 2*single[i]; got != want {
+			t.Fatalf("elem %d: grad after two Backward calls = %v, want %v (2x single %v, not super-linear)",
+				i, got, want, single[i])
+		}
+	}
+	// Concrete values: single = [2 4 6], doubled = [4 8 12] (bug gave [6 12 18]).
+	want := []float32{4, 8, 12}
+	for i, w := range want {
+		if a.Grad.Data[i] != w {
+			t.Fatalf("grad = %v, want %v", a.Grad.Data, want)
+		}
+	}
+}
+
+// TestPowZeroExponentGradient is a regression test for V-11: the backward of
+// Pow(x, 0) computed 0 * x^-1, which is 0*Inf = NaN at x == 0. The gradient of
+// the constant function x^0 must be exactly 0 everywhere.
+func TestPowZeroExponentGradient(t *testing.T) {
+	x := New([]float32{0, 0.5, -2}, 3)
+	SumAll(Pow(x, 0)).Backward()
+	for i, g := range x.Grad.Data {
+		if g != 0 || math.IsNaN(float64(g)) {
+			t.Fatalf("grad[%d] = %v, want finite 0", i, g)
+		}
+	}
+}
+
+// TestBackwardWithSeededNonScalarGrad covers the documented contract that
+// Backward on a non-scalar node is allowed when its Grad has been seeded
+// manually (variable.go doc comment).
+func TestBackwardWithSeededNonScalarGrad(t *testing.T) {
+	x := New([]float32{1, 2, 3, 4}, 2, 2)
+	y := Hadamard(x, x) // non-scalar output
+	y.Grad = tensor.FromData([]float32{1, 10, 100, 1000}, 2, 2)
+
+	y.Backward() // must not panic
+
+	// dL/dx = y.Grad ⊙ 2x
+	want := []float32{2, 40, 600, 8000}
+	for i, w := range want {
+		if !almostEq(x.Grad.Data[i], w, 1e-4) {
+			t.Fatalf("grad[%d] = %v, want %v", i, x.Grad.Data[i], w)
+		}
+	}
+}
+
+func almostEq(a, b, eps float32) bool {
+	d := a - b
+	if d < 0 {
+		d = -d
+	}
+	return d <= eps
 }
 
 func ExampleVariable() {

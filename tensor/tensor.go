@@ -4,7 +4,11 @@
 // matrices only, while elementwise operations work on any shape.
 package tensor
 
-import "fmt"
+import (
+	"fmt"
+	"math"
+	"math/bits"
+)
 
 // Tensor is a dense, row-major float32 tensor.
 type Tensor struct {
@@ -12,15 +16,22 @@ type Tensor struct {
 	Data  []float32
 }
 
-// New returns a zero-filled tensor with the given shape.
+// New returns a zero-filled tensor with the given shape. Every dimension must
+// be non-negative; a negative dimension panics.
 func New(shape ...int) *Tensor {
+	for _, d := range shape {
+		if d < 0 {
+			panic(fmt.Sprintf("tensor.New: negative dimension %d in shape %v", d, shape))
+		}
+	}
 	t := &Tensor{Shape: append([]int(nil), shape...)}
 	t.Data = make([]float32, t.Size())
 	return t
 }
 
 // FromData returns a tensor wrapping a copy of data with the given shape.
-// It panics if the shape does not match len(data).
+// It panics if the shape does not match len(data), if any dimension is
+// negative, or if the shape's element count overflows int64.
 func FromData(data []float32, shape ...int) *Tensor {
 	t := New(shape...)
 	if t.Size() != len(data) {
@@ -46,13 +57,20 @@ func FromRows(rows ...[]float32) *Tensor {
 	return t
 }
 
-// Size returns the total number of elements.
+// Size returns the total number of elements. The product of the dimensions is
+// computed with overflow checks: a shape whose element count exceeds int64
+// (e.g. {1 << 62, 4}) panics instead of silently wrapping around and
+// describing a tensor whose Data buffer cannot possibly hold its shape.
 func (t *Tensor) Size() int {
-	n := 1
+	var n uint64 = 1
 	for _, d := range t.Shape {
-		n *= d
+		hi, lo := bits.Mul64(n, uint64(d))
+		if hi != 0 || lo > math.MaxInt64 {
+			panic(fmt.Sprintf("tensor: shape %v overflows: too many elements", t.Shape))
+		}
+		n = lo
 	}
-	return n
+	return int(n)
 }
 
 // Dims returns the number of dimensions.

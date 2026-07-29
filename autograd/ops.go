@@ -103,6 +103,12 @@ func Log(a *Variable) *Variable {
 func Pow(a *Variable, p float32) *Variable {
 	out := newOp(tensor.Pow(a.Data, p), []*Variable{a}, nil)
 	out.backward = func() {
+		if p == 0 {
+			// d/dx x^0 == 0 everywhere. Computing p*x^(p-1) directly would
+			// evaluate 0 * x^-1, which is 0*Inf = NaN at x == 0.
+			a.addGrad(tensor.New(a.Data.Shape...))
+			return
+		}
 		deriv := tensor.Scale(tensor.Pow(a.Data, p-1), p)
 		a.addGrad(tensor.Hadamard(out.Grad, deriv))
 	}
@@ -234,10 +240,13 @@ func MeanAll(a *Variable) *Variable {
 
 // GatherRows picks one element per row: out[i] = a[i, idx[i]]. a must be 2D
 // and len(idx) must equal its row count. The output is 1D with shape [rows].
+// The idx slice is copied on entry, so the caller may freely reuse or mutate
+// it between the forward pass and Backward without corrupting gradients.
 func GatherRows(a *Variable, idx []int) *Variable {
 	if a.Data.Dims() != 2 || len(idx) != a.Data.Rows() {
 		panic(fmt.Sprintf("autograd.GatherRows: shape %v vs %d indices", a.Data.Shape, len(idx)))
 	}
+	idx = append([]int(nil), idx...)
 	m, n := a.Data.Rows(), a.Data.Cols()
 	data := make([]float32, m)
 	for i, j := range idx {

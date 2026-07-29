@@ -109,10 +109,14 @@ func broadcastBinary(a, b *Tensor, f func(x, y float32) float32) *Tensor {
 }
 
 // Add computes a + b with broadcasting.
-func Add(a, b *Tensor) *Tensor { return broadcastBinary(a, b, func(x, y float32) float32 { return x + y }) }
+func Add(a, b *Tensor) *Tensor {
+	return broadcastBinary(a, b, func(x, y float32) float32 { return x + y })
+}
 
 // Sub computes a - b with broadcasting.
-func Sub(a, b *Tensor) *Tensor { return broadcastBinary(a, b, func(x, y float32) float32 { return x - y }) }
+func Sub(a, b *Tensor) *Tensor {
+	return broadcastBinary(a, b, func(x, y float32) float32 { return x - y })
+}
 
 // Hadamard computes elementwise a * b with broadcasting.
 func Hadamard(a, b *Tensor) *Tensor {
@@ -150,16 +154,22 @@ func sigmoid(x float32) float32 {
 }
 
 // Tanh applies tanh elementwise.
-func Tanh(a *Tensor) *Tensor { return Apply(a, func(x float32) float32 { return float32(math.Tanh(float64(x))) }) }
+func Tanh(a *Tensor) *Tensor {
+	return Apply(a, func(x float32) float32 { return float32(math.Tanh(float64(x))) })
+}
 
 // Sigmoid applies the logistic sigmoid elementwise.
 func Sigmoid(a *Tensor) *Tensor { return Apply(a, sigmoid) }
 
 // Exp applies exp elementwise.
-func Exp(a *Tensor) *Tensor { return Apply(a, func(x float32) float32 { return float32(math.Exp(float64(x))) }) }
+func Exp(a *Tensor) *Tensor {
+	return Apply(a, func(x float32) float32 { return float32(math.Exp(float64(x))) })
+}
 
 // Log applies natural log elementwise.
-func Log(a *Tensor) *Tensor { return Apply(a, func(x float32) float32 { return float32(math.Log(float64(x))) }) }
+func Log(a *Tensor) *Tensor {
+	return Apply(a, func(x float32) float32 { return float32(math.Log(float64(x))) })
+}
 
 // Pow raises every element to p.
 func Pow(a *Tensor, p float32) *Tensor {
@@ -246,8 +256,13 @@ func SumAll(a *Tensor) *Tensor {
 	return FromData([]float32{s}, 1)
 }
 
-// MeanAll returns the mean of all elements as a scalar tensor.
+// MeanAll returns the mean of all elements as a scalar tensor. It panics on
+// an empty tensor: the mean of zero elements is undefined, and dividing by
+// Size()==0 would silently produce NaN.
 func MeanAll(a *Tensor) *Tensor {
+	if a.Size() == 0 {
+		panic(fmt.Sprintf("tensor.MeanAll: mean of empty tensor (shape %v) is undefined", a.Shape))
+	}
 	return FromData([]float32{SumAll(a).Data[0] / float32(a.Size())}, 1)
 }
 
@@ -304,10 +319,14 @@ func SumToShape(grad *Tensor, shape []int) *Tensor {
 }
 
 // LogSoftmaxRows applies log-softmax to each row of a 2D tensor, computed in
-// the numerically stable max-subtracted form.
+// the numerically stable max-subtracted form. A tensor with zero columns has
+// no elements per row and yields an empty result of the same shape.
 func LogSoftmaxRows(a *Tensor) *Tensor {
 	m, n := a.Rows(), a.Cols()
 	out := New(m, n)
+	if n == 0 {
+		return out
+	}
 	for i := 0; i < m; i++ {
 		row := a.Data[i*n : (i+1)*n]
 		max := row[0]
@@ -329,10 +348,15 @@ func LogSoftmaxRows(a *Tensor) *Tensor {
 	return out
 }
 
-// SoftmaxRows applies softmax to each row of a 2D tensor.
+// SoftmaxRows applies softmax to each row of a 2D tensor. A tensor with zero
+// columns has no elements per row and yields an empty result of the same
+// shape.
 func SoftmaxRows(a *Tensor) *Tensor {
 	m, n := a.Rows(), a.Cols()
 	out := New(m, n)
+	if n == 0 {
+		return out
+	}
 	for i := 0; i < m; i++ {
 		row := a.Data[i*n : (i+1)*n]
 		max := row[0]

@@ -5,7 +5,10 @@ import (
 	"math/rand"
 )
 
-// Uniform returns a tensor with elements drawn from U(lo, hi).
+// Uniform returns a tensor with elements drawn from U(lo, hi). If lo > hi the
+// interval is mirrored rather than rejected: values fall in [hi, lo]. This is
+// deliberate legacy behavior kept for backward compatibility; callers that
+// rely on interval bounds should pass lo <= hi.
 func Uniform(rng *rand.Rand, lo, hi float32, shape ...int) *Tensor {
 	t := New(shape...)
 	for i := range t.Data {

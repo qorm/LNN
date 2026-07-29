@@ -41,11 +41,17 @@ func newOp(data *tensor.Tensor, parents []*Variable, backward func()) *Variable 
 	return &Variable{Data: data, parents: parents, backward: backward}
 }
 
-// addGrad accumulates g into the variable's gradient buffer.
+// addGrad accumulates g into the variable's gradient buffer. It panics if the
+// incoming gradient's shape differs from the accumulated one: two tensors can
+// have the same element count yet incompatible layouts (e.g. [1, 6] vs [2,
+// 3]), and silently adding them elementwise would hide upstream shape bugs.
 func (v *Variable) addGrad(g *tensor.Tensor) {
 	if v.Grad == nil {
 		v.Grad = g.Clone()
 		return
+	}
+	if !tensor.SameShape(v.Grad, g) {
+		panic(fmt.Sprintf("autograd: gradient shape mismatch: accumulated %v vs incoming %v", v.Grad.Shape, g.Shape))
 	}
 	for i := range v.Grad.Data {
 		v.Grad.Data[i] += g.Data[i]
@@ -57,6 +63,14 @@ func (v *Variable) ZeroGrad() { v.Grad = nil }
 
 // Backward runs reverse-mode differentiation from v. v must be a scalar (the
 // usual case for a loss) unless its Grad has been seeded manually.
+//
+// Gradients accumulate into leaf variables across Backward calls (use
+// ZeroGrad to reset them). Intermediate (non-leaf) gradients, in contrast,
+// are transient: after the traversal completes, the Grad of every non-leaf
+// node other than v itself is cleared. This makes repeated Backward calls on
+// the same graph accumulate linearly into leaves; leaving stale intermediate
+// gradients in place would make each rerun propagate through already-seeded
+// buffers and accumulate super-linearly.
 func (v *Variable) Backward() {
 	if v.Grad == nil {
 		if !v.Data.IsScalar() {
@@ -81,6 +95,11 @@ func (v *Variable) Backward() {
 	for i := len(topo) - 1; i >= 0; i-- {
 		if topo[i].backward != nil {
 			topo[i].backward()
+		}
+	}
+	for _, n := range topo {
+		if n != v && len(n.parents) > 0 {
+			n.Grad = nil
 		}
 	}
 }
