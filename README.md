@@ -17,7 +17,7 @@ no code generation, no GPU backend, no operator overloading tricks — just Go.
 |---|---|
 | `lnn/tensor` | Dense row-major `float32` tensors with a 1D/2D-focused op set: matmul, elementwise math with limited broadcasting, activations, reductions, slicing, random initialization. |
 | `lnn/autograd` | A dynamic computation-graph engine. Each op records a backward closure on its output `Variable`; `Backward` walks the graph in reverse topological order and accumulates gradients into leaves. |
-| `lnn/nn` | Neural-network building blocks: `Linear` layers, `Wiring` synapse topologies, and the `LTC` liquid cell. **Currently stabilizing — see [Status](#status-and-roadmap).** |
+| `lnn/nn` | Neural-network building blocks: `Linear` layers, `Wiring` synapse topologies, the `LTC` liquid cell, and the `Cell`/`Unroll` abstractions for driving recurrent cells over sequences. |
 
 ## Installation
 
@@ -118,11 +118,7 @@ epoch 199  loss=0.000000  w=2.0000  b=1.0000
 
 The loop recovers `w ≈ 2` and `b ≈ 1` to `float32` precision.
 
-### Using the `nn` package (once it stabilizes)
-
-The signatures below are accurate as of this commit, but the `nn` package
-**does not currently compile** (see [Status](#status-and-roadmap)); treat the
-snippet as a preview.
+### Using the `nn` package
 
 ```go
 rng := rand.New(rand.NewSource(1))
@@ -132,10 +128,19 @@ fc := nn.NewLinear(4, 8, rng)   // W: [4,8], B: [8] (Xavier-uniform init)
 y := fc.Forward(x)              // x: [batch,4] -> y: [batch,8]
 params := fc.Parameters()       // []*autograd.Variable{W, B}
 
-// A Liquid Time-Constant cell.
+// A Liquid Time-Constant cell. Reversal potentials are fixed +/-1 constants
+// and are not part of Parameters().
 cell := nn.NewLTC(4, 8, nil, 6, rng) // inDim=4, units=8, fully connected wiring, 6 ODE unfolds
 out, h := cell.Step(x, nil, 0.1)     // x: [batch,4], nil = zero initial state, time span ts=0.1
+
+// Unroll any nn.Cell over a sequence; the whole sequence stays in the graph,
+// so a loss built on ys differentiates through time with one Backward.
+ys, hN := nn.Unroll(cell, xs, nil, 0.1) // xs: []*autograd.Variable of [batch,4]
 ```
+
+`examples/ltc-sequence` puts this together into a complete training loop
+(hand-rolled SGD over `nn.ParametersOf(cell, readout)`) on a toy sequence
+task — run it with `go run ./examples/ltc-sequence`.
 
 ## Numerics and scale
 
@@ -184,12 +189,12 @@ Honest maturity assessment as of this commit:
 |---|---|
 | `tensor` | Core is stable and well tested (~86% line coverage). Some defensive checks (overflow-safe sizing, empty-input edge cases) are being hardened. |
 | `autograd` | Stable and well tested (~98% line coverage); gradients pass finite-difference checks on the covered paths. |
-| `nn` | **Stabilizing.** The package currently **fails to compile** (a type mismatch in the LTC sensory-synapse path in `nn/ltc.go`), so the LTC forward pass has never actually been exercised, and the package has no tests yet. Known semantic fixes are in flight (e.g. reversal potentials `erev` are wrongly listed as trainable parameters and are being demoted to constants). |
+| `nn` | Functional and well tested (~98% line coverage): the LTC forward/backward paths are regression-tested, including a closed-form degenerate-case check, tiny/NaN `ts` guards, and wiring validation. Reversal potentials are fixed ±1 constants, not trainable. The API may still evolve. |
 
-Not implemented, despite what older doc comments in `nn/module.go` claim:
-the CfC (Closed-form Continuous-time) cell, a sequence-level RNN wrapper,
-and optimizers. An end-to-end sequence-training example is planned under
-`examples/`.
+Roadmap (not yet implemented): the CfC (Closed-form Continuous-time) cell
+and built-in optimizers. Sequence unrolling is covered by the generic
+`nn.Unroll` helper, and `examples/ltc-sequence` shows the supported
+training pattern with hand-rolled SGD.
 
 Track the remediation plan and progress in `PLAN.md` and `PROGRESS.md`.
 

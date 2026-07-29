@@ -1,6 +1,17 @@
 // Package nn provides neural network building blocks for the LNN library:
-// plain Linear layers, wiring topologies, the LTC and CfC liquid cells, and
-// a sequence-level RNN wrapper that unfolds cells over time.
+// the Linear layer, Wiring synapse topologies, the LTC liquid cell, and the
+// Cell/Unroll abstractions for driving recurrent cells over sequences.
+//
+// Roadmap (not yet implemented): the CfC (Closed-form Continuous-time) cell
+// and built-in optimizers. Hand-rolled SGD over Parameters() is the
+// supported pattern today; see examples/ltc-sequence for an end-to-end
+// training loop.
+//
+// Concurrency contract: lnn is single-threaded by design. Backward mutates
+// the Grad buffers of a graph's leaf variables without synchronization, so
+// running it concurrently on variables that share parameters is a data race
+// that loses or corrupts gradients (verified under go test -race). Never
+// share a Variable, Tensor, or computation graph across goroutines.
 package nn
 
 import "lnn/autograd"

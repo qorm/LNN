@@ -2,6 +2,7 @@ package nn
 
 import (
 	"fmt"
+	"math"
 	"math/rand"
 
 	"lnn/autograd"
@@ -29,19 +30,27 @@ type LTC struct {
 	eps          float32
 
 	gleak, vleak, cm *autograd.Variable // [units]
-	mu, sigma        *autograd.Variable // [units, units]
-	w, erev          *autograd.Variable // [units, units]
-	sMu, sSigma      *autograd.Variable // [inDim, units]
-	sW, sErev        *autograd.Variable // [inDim, units]
+	mu, sigma, w     *autograd.Variable // [units, units] recurrent synapses
+	sMu, sSigma, sW  *autograd.Variable // [inDim, units] sensory synapses
 	inW, inB         *autograd.Variable // [inDim]
 	outW, outB       *autograd.Variable // [units]
+
+	// Reversal potentials are fixed random +/-1 constants drawn once at
+	// construction time, mirroring the reference wiring. They are NOT
+	// trainable and are deliberately absent from Parameters(): learning them
+	// would flip synapses between excitatory and inhibitory polarity and
+	// degrade the LTC into an ordinary plastic network.
+	erev  *autograd.Variable // [units, units]
+	sErev *autograd.Variable // [inDim, units]
 
 	wiring *Wiring
 }
 
-// NewLTC creates an LTC cell. wiring may be nil, meaning FullyConnected.
-// unfolds is the number of ODE solver steps per RNN step (6 in the
-// reference). Parameter init ranges follow the reference implementation.
+// NewLTC creates an LTC cell. wiring may be nil, meaning FullyConnected;
+// otherwise its sensory mask must have shape [inDim, units] and its
+// recurrent mask [units, units]. unfolds is the number of ODE solver steps
+// per RNN step (6 in the reference). Parameter init ranges follow the
+// reference implementation.
 func NewLTC(inDim, units int, wiring *Wiring, unfolds int, rng *rand.Rand) *LTC {
 	if inDim < 1 || units < 1 {
 		panic(fmt.Sprintf("nn.NewLTC: invalid dims in=%d units=%d", inDim, units))
@@ -52,9 +61,13 @@ func NewLTC(inDim, units int, wiring *Wiring, unfolds int, rng *rand.Rand) *LTC 
 	if wiring == nil {
 		wiring = FullyConnected(inDim, units)
 	}
-	if !tensor.SameShape(wiring.SensoryMask, tensor.New(inDim, units)) ||
-		!tensor.SameShape(wiring.RecurrentMask, tensor.New(units, units)) {
-		panic("nn.NewLTC: wiring mask shapes do not match (inDim, units)")
+	// Shape-only validation: comparing Shape fields allocates nothing, unlike
+	// building reference tensors to diff against (which used to allocate an
+	// inDim*units tensor just to say "no").
+	if !shapeIs(wiring.sensoryMask.Shape, inDim, units) ||
+		!shapeIs(wiring.recurrentMask.Shape, units, units) {
+		panic(fmt.Sprintf("nn.NewLTC: wiring mask shapes %v and %v do not match [inDim=%d, units=%d]",
+			wiring.sensoryMask.Shape, wiring.recurrentMask.Shape, inDim, units))
 	}
 	uniform := func(lo, hi float32, shape ...int) *autograd.Variable {
 		return autograd.Var(tensor.Uniform(rng, lo, hi, shape...))
@@ -73,45 +86,60 @@ func NewLTC(inDim, units int, wiring *Wiring, unfolds int, rng *rand.Rand) *LTC 
 	}
 	return &LTC{
 		inDim: inDim, units: units, unfolds: unfolds, eps: 1e-8,
-		gleak: uniform(0.001, 1, units),
-		vleak: uniform(-0.2, 0.2, units),
-		cm:    uniform(0.4, 0.6, units),
-		mu:    uniform(0.3, 0.8, units, units),
-		sigma: uniform(3, 8, units, units),
-		w:     uniform(0.001, 1, units, units),
-		erev:  erevInit(units, units),
-		sMu:   uniform(0.3, 0.8, inDim, units),
+		gleak:  uniform(0.001, 1, units),
+		vleak:  uniform(-0.2, 0.2, units),
+		cm:     uniform(0.4, 0.6, units),
+		mu:     uniform(0.3, 0.8, units, units),
+		sigma:  uniform(3, 8, units, units),
+		w:      uniform(0.001, 1, units, units),
+		sMu:    uniform(0.3, 0.8, inDim, units),
 		sSigma: uniform(3, 8, inDim, units),
-		sW:    uniform(0.001, 1, inDim, units),
-		sErev: erevInit(inDim, units),
-		inW:   autograd.Var(tensor.New(inDim).OnesLike()),
-		inB:   autograd.Var(tensor.New(inDim)),
-		outW:  autograd.Var(tensor.New(units).OnesLike()),
-		outB:  autograd.Var(tensor.New(units)),
+		sW:     uniform(0.001, 1, inDim, units),
+		inW:    autograd.Var(tensor.New(inDim).OnesLike()),
+		inB:    autograd.Var(tensor.New(inDim)),
+		outW:   autograd.Var(tensor.New(units).OnesLike()),
+		outB:   autograd.Var(tensor.New(units)),
+		erev:   erevInit(units, units),
+		sErev:  erevInit(inDim, units),
 		wiring: wiring,
 	}
+}
+
+// shapeIs reports whether sh equals want, without allocating.
+func shapeIs(sh []int, want ...int) bool {
+	if len(sh) != len(want) {
+		return false
+	}
+	for i := range sh {
+		if sh[i] != want[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // StateSize returns the hidden state dimension.
 func (c *LTC) StateSize() int { return c.units }
 
-// Parameters returns the trainable variables of the cell.
+// Parameters returns the trainable variables of the cell. The reversal
+// potentials erev/sErev are fixed constants and intentionally excluded.
 func (c *LTC) Parameters() []*autograd.Variable {
 	return []*autograd.Variable{
 		c.gleak, c.vleak, c.cm,
-		c.mu, c.sigma, c.w, c.erev,
-		c.sMu, c.sSigma, c.sW, c.sErev,
+		c.mu, c.sigma, c.w,
+		c.sMu, c.sSigma, c.sW,
 		c.inW, c.inB, c.outW, c.outB,
 	}
 }
 
 // Step advances the cell by one RNN step, integrating the ODE over the time
-// span ts (which must be > 0). x is [batch, inDim], h is [batch, units] or
-// nil for a zero initial state. It returns the (affinely mapped) output and
-// the new raw state.
-func (c *LTC) Step(x, h *autograd.Variable, ts float32) (out, hNew *autograd.Variable) {
-	if ts <= 0 {
-		panic(fmt.Sprintf("nn.LTC.Step: ts must be > 0, got %v", ts))
+// span ts (which must be positive; NaN is rejected). x is [batch, inDim], h
+// is [batch, units] or nil for a zero initial state. It returns the
+// (affinely mapped) output and the new raw state.
+func (c *LTC) Step(x, h *autograd.Variable, ts float64) (out, hNew *autograd.Variable) {
+	// NaN-aware positivity check: NaN > 0 is false, so NaN panics here too.
+	if !(ts > 0) {
+		panic(fmt.Sprintf("nn.LTC.Step: ts must be positive, got %v", ts))
 	}
 	batch := x.Data.Rows()
 	if h == nil {
@@ -122,7 +150,7 @@ func (c *LTC) Step(x, h *autograd.Variable, ts float32) (out, hNew *autograd.Var
 	inputs := autograd.Add(autograd.Hadamard(x, c.inW), c.inB)
 
 	// Positivity-constrained parameters (softplus).
-	cmT := autograd.Scale(autograd.Softplus(c.cm), float32(c.unfolds)/ts)
+	cmT := c.scaledCapacitance(ts)
 	gleak := autograd.Softplus(c.gleak)
 	wPos := autograd.Softplus(c.w)
 	sWPos := autograd.Softplus(c.sW)
@@ -130,22 +158,10 @@ func (c *LTC) Step(x, h *autograd.Variable, ts float32) (out, hNew *autograd.Var
 	// Sensory (input) synapses are loop-invariant over the ODE unfolds.
 	numS, denS := c.synapses(inputs, c.sMu, c.sSigma, sWPos, c.sErev, c.wiring.SensoryRow)
 
-	// Hoist presynaptic parameter rows out of the unfold loop.
-	muRows := make([]*autograd.Variable, c.units)
-	sigRows := make([]*autograd.Variable, c.units)
-	wRows := make([]*autograd.Variable, c.units)
-	erevRows := make([]*autograd.Variable, c.units)
-	for i := 0; i < c.units; i++ {
-		muRows[i] = autograd.SliceRow(c.mu, i)
-		sigRows[i] = autograd.SliceRow(c.sigma, i)
-		wRows[i] = autograd.SliceRow(wPos, i)
-		erevRows[i] = autograd.SliceRow(c.erev, i)
-	}
-
 	v := h
 	epsV := autograd.Const(tensor.FromData([]float32{c.eps}, 1))
 	for t := 0; t < c.unfolds; t++ {
-		numR, denR := c.synapses(v, muRows, sigRows, wRows, erevRows, c.wiring.RecurrentRow)
+		numR, denR := c.synapses(v, c.mu, c.sigma, wPos, c.erev, c.wiring.RecurrentRow)
 		// num = cm_t .* v + gleak .* vleak + synapses
 		num := autograd.Add(autograd.Add(autograd.Hadamard(cmT, v), autograd.Hadamard(gleak, c.vleak)), numS)
 		num = autograd.Add(num, numR)
@@ -158,24 +174,51 @@ func (c *LTC) Step(x, h *autograd.Variable, ts float32) (out, hNew *autograd.Var
 	return out, v
 }
 
+// scaledCapacitance builds cm_t = softplus(cm) * unfolds/ts, the ODE's cm/dt
+// term with dt = ts/unfolds. The scalar time scale is computed in float64
+// and clamped to the finite float32 domain before being converted back: a
+// tiny ts (e.g. 1e-40, the hallmark of the LTC's variable-step regime) used
+// to overflow the float32 division to +Inf, and Inf*0 in the state update
+// then turned every output NaN.
+//
+// Clamping the scale alone is not enough: softplus(cm)*scale can still
+// exceed MaxFloat32 elementwise. We therefore cap the product with a smooth
+// differentiable min, cap(sp) = sp - softplus(sp - hi), hi = MaxFloat32/scale.
+// While sp << hi (every sane ts) softplus(sp - hi) underflows to exactly 0,
+// so cap(sp) is bit-identical to sp and the ODE algebra is untouched; the
+// cap only engages where the unscaled product would overflow. The tiny
+// relative headroom on hi absorbs float32 rounding so cm_t is always finite.
+func (c *LTC) scaledCapacitance(ts float64) *autograd.Variable {
+	scale64 := float64(c.unfolds) / ts
+	if scale64 > math.MaxFloat32 {
+		scale64 = math.MaxFloat32
+	}
+	hi64 := math.MaxFloat32 / scale64 / 1.0001
+	if hi64 > math.MaxFloat32 {
+		hi64 = math.MaxFloat32
+	}
+	hiV := autograd.Const(tensor.FromData([]float32{float32(hi64)}, 1))
+	sp := autograd.Softplus(c.cm)
+	capped := autograd.Sub(sp, autograd.Softplus(autograd.Sub(sp, hiV)))
+	return autograd.Scale(capped, float32(scale64))
+}
+
 // synapses accumulates numerator and denominator synaptic currents from a
-// presynaptic source (inputs or previous state). Param rows are extracted
-// per source neuron i via SliceRow; maskRow yields the wiring mask rows.
+// presynaptic source (inputs or previous state). The four parameter matrices
+// are passed whole; row i, extracted inside the loop with SliceRow,
+// parameterizes the synapses of presynaptic neuron i, whose wiring mask row
+// comes from maskRow(i). The sensory and recurrent paths share this single
+// calling convention.
 func (c *LTC) synapses(
-	pre *autograd.Variable,
-	muRows, sigRows, wRows, erevRows []*autograd.Variable,
+	pre, mu, sigma, w, erev *autograd.Variable,
 	maskRow func(i int) *tensor.Tensor,
 ) (num, den *autograd.Variable) {
 	n := pre.Data.Cols()
 	for i := 0; i < n; i++ {
-		muR, sigR, wR, erevR := muRows[i], sigRows[i], wRows[i], erevRows[i]
-		if muR.Data.Dims() == 2 && muR.Data.Shape[0] != 1 {
-			// Params given as full matrices: slice row i.
-			muR = autograd.SliceRow(muRows[i], i)
-			sigR = autograd.SliceRow(sigRows[i], i)
-			wR = autograd.SliceRow(wRows[i], i)
-			erevR = autograd.SliceRow(erevRows[i], i)
-		}
+		muR := autograd.SliceRow(mu, i)
+		sigR := autograd.SliceRow(sigma, i)
+		wR := autograd.SliceRow(w, i)
+		erevR := autograd.SliceRow(erev, i)
 		preCol := autograd.Col(pre, i) // [batch, 1]
 		act := autograd.Sigmoid(autograd.Hadamard(sigR, autograd.Sub(preCol, muR)))
 		act = autograd.Hadamard(act, wR)
