@@ -13,6 +13,7 @@
 | 3 | 按规划实施（目录整顿 + 缺陷修复 + 补测试） | ✅ 完成 |
 | 4 | 红队复审 + 全量验证 | ✅ 完成（裁决：生产就绪，置信度 ~90%） |
 | 5 | 技术债清扫 + 工程成熟度（Benchmark/CI/双语文档） | ✅ 完成 |
+| 6 | 双轨扩展：特性（optimizer/CfC）+ 性能（热路径向量化） | 🔄 进行中（6a ✅，6b 红队验证中） |
 
 ## 阶段 1：并行分析（已完成）
 
@@ -149,6 +150,32 @@
 
 **阶段 5 关闭**。留档表更新：债#2（Div）、F3（+Inf ts）已销账；#4/#6 已文档化；残余项见下表。
 
+## 阶段 6：双轨扩展（进行中）
+
+用户选定双轨并行。派发时间：2026-07-30
+
+| Agent | 轨道 | 职责 | 状态 |
+|---|---|---|---|
+| 实施 F-A | 特性 | `optimizer/` 新包：SGD/Momentum/Adam，显式 struct，状态按参数指针隔离 | ✅ 已回报 |
+| 实施 F-B | 特性 | `nn/cfc.go`：CfC 闭式连续时间细胞（Hasani 2022），取证 ncps 参考实现，向量化自包含 | ✅ 已回报 |
+| 实施 P-A | 性能 | `nn/ltc.go` synapses 向量化 + 掩码出热路径；门禁：allocs −50% 且三重正确性验证 | ✅ 已回报 |
+| 红队验证 | 验证 | CfC 论文符合度 + optimizer 更新式 + P-A 等价性（等 6a 落地） | ⏳ 待启动 |
+| 文档同步 | 双语 | doc/ 与 doc/zh/ 全量同步 + README 路线图改写（等红队后，代码定型） | ⏳ 待启动 |
+
+### 实施回报摘要
+
+**F-B（CfC 细胞，已完成）**：`nn/cfc.go` + 11 组测试，nn 包覆盖率 97.7%→**98.7%**，`-race` 绿。
+- **取证纠错（对抗式取证，不盲从任务书）**：任务书所给 DOI 经 Crossref 实测指向一篇合成生物学论文——真实出处为 **Nature Machine Intelligence 4, 992–1003 (2022)，DOI 10.1038/s42256-022-00556-7**（arXiv 2106.13898）；取证源含两版论文 PDF 全文 + ncps `cfc_cell.py` + 官方代码 `raminmh/CfC`
+- **"liquid cubic" 拒采**：两版论文全文与两官方仓库均无此概念，明确不采纳不臆造；实现选定论文 Lemma 1 Eq.(8) 闭式解 `v_new = A + (v−A)e^{−κ·ts}` + Algorithm 1「LTC 编译为闭式」方案，突触参数化与本库 LTC 完全同构（同 13 参数、同初值区间、erev 固定 ±1 非训练、同 ts 契约、满足 Cell 接口）
+- **exprel 稳定化**（任务硬约束）：阈值 1e-2 逐元素分支——小 B 走四阶泰勒（余项 ≤8.3e-13 ≪ float32 ε，梯度在 B→0 存活），大 B 走原式且 B 与分母**解析相消**（图中无除法节点）；阈值处函数值/导数 ~1e-10 连续（有专项跨越扫描测试）；ts 上限 clamp 1e30 保 B 有限非负；ts=1e-40 → v 精确不动（dt→0 正确语义）
+- 测试：全 13 参数 gradcheck 最大相对误差 **8.63e-3**（float32 中心差分噪声内）、零掩码纯泄漏闭式回归 1e-4、ts 五类非法值 panic、同种子逐位确定、5 步 BPTT 梯度有限
+
+**P-A（nn 热路径性能，已完成）**：`synapses()` 两级重构——逐突触对（12n−2 节点/次，掩码每突触入图）→ 逐突触前神经元向量化（5n+3 节点/次）+ 构造期稀疏指示矩阵 MatMul 收缩（erev ±1 焙入 num 指示阵）+ 掩码折叠 `wm=softplus(w)⊙mask` 每 Step 一次矩阵 Hadamard（构造期 Const 叶复用，addGrad 形状安全已论证）。
+- **基准（−benchtime=100x −count=3 稳定）**：`LTCStep` 7,360→**3,440 allocs/op（−53.3% ✅ 达标）**、ns −23.1%；`UnrollBackward` 120,163→**68,688（−42.8%）**、ns −18.6%。未达 −50% 项已 pprof 剖析：剩余分配 80.4% 为 tensor.New/Clone/broadcast 闭包等**逐节点固定开销**（tensor/autograd 属本轨禁区），−42.8% 已逼近结构上限；进一步需 autograd 层融合反向，建议独立工单（留档#9）
+- **正确性四重门禁**：①既有 ltc_test.go 全绿（含零掩码闭式回归）；②自写逐位 oracle `scalarSynapses` 复刻旧循环，严格 `==` 零容差通过（mask∈{0,1}+指示阵升序折叠 ⇒ 结合次序与旧 Add 链完全相同）；③全 15 参数有限差分 gradcheck 最大相对误差 **9.84e-5**；④example 首轮 loss **0.690761 = 0.690761 逐位相等**（优于 1e-4 容差）、终损 0.041996 不变。调试中捕获并修复一个隐蔽 bug：erev 初始化位点前移导致 rng 抽取顺序漂移（首轮 loss 变 0.777），以 HEAD 旧码 dump 15 参数指纹逐位比对定位恢复
+
+**F-A（optimizer 包，已完成）**：6 文件，覆盖率 **100%**，`-race` 干净。`Optimizer` 接口（`Step(params)`，调用方拥有 ZeroGrad 时机——免费支持梯度累积模式）+ 三个显式 struct：`SGD{LR}`、`Momentum{LR,Mu}`（经典重阻尼约定，velocity 存未缩放梯度——与 doc/training.md 范例逐字核对一致）、`Adam{LR,Beta1,Beta2,Eps}`（Kingma & Ba 含偏差校正，`NewAdamDefault` 便捷构造）。超参全导出字段（训练中途热改 LR 有测试背书）；状态按 `*Variable` 指针隔离，同指针改尺寸 panic 而非静默错步；nil-Grad 跳过且不推进 Adam 步数。测试 17 组：SGD/Momentum 手算逐位、Adam 论文 Algorithm 1 独立转写对照（~5 ulp，arm64 FMA 缩合所致，真公式错误远超此量级）、两个收敛测试复现 README quickstart 的 w=2.0000/b=1.0000、`TestMomentumMatchesDocExample` 复现文档算例 w=5.0007、状态隔离/指针键/20 例非法超参 panic。
+
 ## 项目终态
 
 | 指标 | 基线（87ccf77） | 终态 |
@@ -175,6 +202,7 @@ Git 历史：`87ccf77` 基线 → `08aba45` 阶段3a → `102af40` 阶段3b → 
 | 6 | `Stack` 产出 3D 无消费方、ops.go 五职责 | 核心A/健康度 | 🟢 | Stack 已标注 Experimental；~~无 CI/Benchmark~~ ✅ 阶段 5 已补（GitHub Actions + 13 基准） |
 | 7 | nn 热路径分配量（LTCStep 7372 allocs/op、Unroll 12 万 allocs/op） | D2 基准量化 | 🟢 | 已有基准尺子，图算子融合/掩码预施加为后续优化方向 |
 | 8 | 三份源码内旧包注释与 doc.go 并存 | D3 发现 | 🟢 | go 1.26 下 doc.go 胜出、用户无感，未来可清理 |
+| 9 | Backward 阶段逐节点固定开销（tensor.New 46%/Clone 20%/broadcast 闭包 14%） | P-A pprof | 🟢 | UnrollBackward 再压缩需 autograd 层改动（Sigmoid-Hadamard 融合反向、addGrad 原地写入、去闭包），独立工单候选 |
 
 ## 变更日志
 

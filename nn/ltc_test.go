@@ -246,6 +246,163 @@ func TestLTCDeterministicSameSeed(t *testing.T) {
 	}
 }
 
+// scalarSynapses reproduces the pre-vectorization per-synapse-pair loop as a
+// reference oracle: row i of each parameter matrix is sliced inside the loop,
+// the mask applied per synapse via maskRow(i), and the currents accumulated
+// with one Add per presynaptic neuron. Kept verbatim from the old
+// implementation to pin the vectorized synapses() to identical numerics.
+func scalarSynapses(
+	pre, mu, sigma, w, erev *autograd.Variable,
+	maskRow func(i int) *tensor.Tensor,
+) (num, den *autograd.Variable) {
+	n := pre.Data.Cols()
+	for i := 0; i < n; i++ {
+		muR := autograd.SliceRow(mu, i)
+		sigR := autograd.SliceRow(sigma, i)
+		wR := autograd.SliceRow(w, i)
+		erevR := autograd.SliceRow(erev, i)
+		preCol := autograd.Col(pre, i) // [batch, 1]
+		act := autograd.Sigmoid(autograd.Hadamard(sigR, autograd.Sub(preCol, muR)))
+		act = autograd.Hadamard(act, wR)
+		act = autograd.Hadamard(act, autograd.Const(maskRow(i)))
+		rev := autograd.Hadamard(act, erevR)
+		if i == 0 {
+			num, den = rev, act
+		} else {
+			num = autograd.Add(num, rev)
+			den = autograd.Add(den, act)
+		}
+	}
+	return num, den
+}
+
+// TestLTCSynapsesVectorizedEquivalence checks the vectorized synapses()
+// against the old per-synapse loop element by element, on both the recurrent
+// and the sensory path and under a sparse wiring mask. The new path must
+// reproduce the old currents exactly — Go's == treats +0 and -0 as equal, so
+// only genuine rounding differences can fail the test. The vectorization
+// changes the graph structure, not the floating-point accumulation order:
+// the indicator MatMul folds left-to-right over presynaptic neurons exactly
+// like the old Add chain, and mask ∈ {0, 1} makes w·mask exactly w or +0.
+func TestLTCSynapsesVectorizedEquivalence(t *testing.T) {
+	rng := rand.New(rand.NewSource(41))
+	const inDim, units = 3, 5
+	cell := NewLTC(inDim, units, RandomSparse(inDim, units, 0.6, 0.6, rng), 2, rng)
+	preR := autograd.Var(tensor.Uniform(rng, -1, 1, 4, units))
+	preS := autograd.Var(tensor.Uniform(rng, -1, 1, 4, inDim))
+
+	wM := autograd.Hadamard(autograd.Softplus(cell.w), cell.maskR)
+	sWm := autograd.Hadamard(autograd.Softplus(cell.sW), cell.maskS)
+	newRNum, newRDen := cell.synapses(preR, cell.mu, cell.sigma, wM, cell.denReduceR, cell.numReduceR)
+	oldRNum, oldRDen := scalarSynapses(preR, cell.mu, cell.sigma,
+		autograd.Softplus(cell.w), cell.erev, cell.wiring.RecurrentRow)
+	newSNum, newSDen := cell.synapses(preS, cell.sMu, cell.sSigma, sWm, cell.denReduceS, cell.numReduceS)
+	oldSNum, oldSDen := scalarSynapses(preS, cell.sMu, cell.sSigma,
+		autograd.Softplus(cell.sW), cell.sErev, cell.wiring.SensoryRow)
+
+	exact := func(name string, got, want *autograd.Variable) {
+		t.Helper()
+		if len(got.Data.Data) != len(want.Data.Data) {
+			t.Fatalf("%s: size %d, want %d", name, len(got.Data.Data), len(want.Data.Data))
+		}
+		for i := range got.Data.Data {
+			if got.Data.Data[i] != want.Data.Data[i] {
+				t.Fatalf("%s: element %d = %v, want exactly %v",
+					name, i, got.Data.Data[i], want.Data.Data[i])
+			}
+		}
+	}
+	exact("recurrent num", newRNum, oldRNum)
+	exact("recurrent den", newRDen, oldRDen)
+	exact("sensory num", newSNum, oldSNum)
+	exact("sensory den", newSDen, oldSDen)
+
+	// The single-presynaptic-source path (inDim == 1) skips the den MatMul
+	// (identity contraction); it must stay exact as well.
+	rng1 := rand.New(rand.NewSource(43))
+	cell1 := NewLTC(1, units, RandomSparse(1, units, 0.6, 0.6, rng1), 2, rng1)
+	pre1 := autograd.Var(tensor.Uniform(rng1, -1, 1, 4, 1))
+	sWm1 := autograd.Hadamard(autograd.Softplus(cell1.sW), cell1.maskS)
+	new1Num, new1Den := cell1.synapses(pre1, cell1.sMu, cell1.sSigma, sWm1, cell1.denReduceS, cell1.numReduceS)
+	old1Num, old1Den := scalarSynapses(pre1, cell1.sMu, cell1.sSigma,
+		autograd.Softplus(cell1.sW), cell1.sErev, cell1.wiring.SensoryRow)
+	exact("single-source num", new1Num, old1Num)
+	exact("single-source den", new1Den, old1Den)
+}
+
+// TestLTCGradCheckAllParameters validates the analytic Backward gradients of
+// a whole unrolled LTC training step against central finite differences, for
+// every trainable parameter of both the cell and the readout, under a sparse
+// wiring mask. The tolerance (2e-2, scaled by the gradient magnitude) is
+// generous because float32 differencing is noisy; the test guards the
+// mathematical equivalence of the vectorized synapse graph and its
+// per-synapse reductions.
+func TestLTCGradCheckAllParameters(t *testing.T) {
+	rng := rand.New(rand.NewSource(101))
+	const inDim, units, unfolds, batch, seqLen = 2, 4, 2, 3, 2
+	const h = 1e-3
+	cell := NewLTC(inDim, units, RandomSparse(inDim, units, 0.7, 0.7, rng), unfolds, rng)
+	readout := NewLinear(units, 1, rng)
+	params := ParametersOf(cell, readout)
+
+	xs := make([]*autograd.Variable, seqLen)
+	targets := make([]*autograd.Variable, seqLen)
+	for i := range xs {
+		xs[i] = autograd.Var(tensor.Uniform(rng, -1, 1, batch, inDim))
+		targets[i] = autograd.Var(tensor.Uniform(rng, -1, 1, batch, 1))
+	}
+
+	buildLoss := func() *autograd.Variable {
+		ys, _ := Unroll(cell, xs, nil, 0.3)
+		var acc *autograd.Variable
+		for i, y := range ys {
+			diff := autograd.Sub(readout.Forward(y), targets[i])
+			sq := autograd.Hadamard(diff, diff)
+			if i == 0 {
+				acc = sq
+			} else {
+				acc = autograd.Add(acc, sq)
+			}
+		}
+		return autograd.MeanAll(acc)
+	}
+
+	// Analytic gradients from one Backward.
+	for _, p := range params {
+		p.ZeroGrad()
+	}
+	buildLoss().Backward()
+
+	var maxRel float64
+	for pi, p := range params {
+		if p.Grad == nil {
+			t.Fatalf("parameter %d has nil analytic gradient", pi)
+		}
+		data := p.Data.Data
+		grad := p.Grad.Data
+		for k := range data {
+			orig := data[k]
+			data[k] = orig + h
+			lp := float64(buildLoss().Value())
+			data[k] = orig - h
+			lm := float64(buildLoss().Value())
+			data[k] = orig
+			num := (lp - lm) / (2 * h)
+			an := float64(grad[k])
+			scale := math.Max(1, math.Abs(num))
+			rel := math.Abs(an-num) / scale
+			if rel > maxRel {
+				maxRel = rel
+			}
+			if math.Abs(an-num) > 2e-2*scale {
+				t.Fatalf("parameter %d element %d: analytic %v vs numerical %v (|diff| %g)",
+					pi, k, an, num, math.Abs(an-num))
+			}
+		}
+	}
+	t.Logf("gradcheck max relative error %g (tolerance 2e-2)", maxRel)
+}
+
 // TestNewLTCValidation covers constructor argument checks.
 func TestNewLTCValidation(t *testing.T) {
 	rng := rand.New(rand.NewSource(29))
