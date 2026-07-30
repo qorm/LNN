@@ -208,6 +208,8 @@
 
 **红队·序列化组（已完成）**：7,500 变异体（位翻转/删除/插入/块交换，25% 叠连击）**0 panic / 0 静默错乱**（黑盒 oracle 重序列化核验掩码二值/形状/Step 健全；7 例"ok 垃圾入参"均为参数含 NaN/Inf 的忠实复现）；语义攻击全挡（张量顺序偷换/掩码注入 0.5/−1/2/NaN/跨 kind/未知 kind/version 0·2·99·255/UTF-16/大端伪流）；错误全透传（写端每个截断点、读端多偏移）；round-trip **训练动力学逐位等价**（加载后再训练 3 步的参数轨迹与同步训练锁死、种子无关）。**资源耗尽维度不安全**：F1 Medium——**无 Len() 读端**（网络/管道/gzip）绕过剩余字节守卫，~20 字节截断流逼出 64MiB～**4GiB** 分配（make 在读之前）；F2 Medium——`unfolds` 无上限，1<<20 展开 2.26s、1<<30 外推单次 Step ~38 分钟 CPU 耗尽（CfC 免疫）；F3 Low——count=maxCount−1 强分 8MiB 指针切片；F4 Low——加载不校验 erev∈{±1}（可造 NewLTC 永不能产生的细胞）；F5 Info——LoadParameters 保留陈旧 Grad 未文档化；F6 Info——限额私有且包注释"绝不无界分配"措辞掩盖 F1。**裁决：panic/语义维度安全，资源耗尽维度需补防——已派发修复（发布前置条件）**
 
+**发布至 GitHub（7c+，已完成）**：仓库 **https://github.com/qorm/LNN（public）**。远端原有用户初始提交（46ab9ff，仅 LICENSE），以 `--allow-unrelated-histories` 合并，LICENSE 冲突按**用户初始提交的既有选择**解决（Copyright (c) 2026 QORM，替换本项目的 LNN Authors 占位）；v0.1.0 标签重定位于合并提交（1eb157a）保证发布快照 LICENSE 与 main 逐字一致。完整历史（基线→阶段3a/3b/4/5/6/7a/7b/7c 全部原子提交）已推送；双语 README 加 CI + Go Reference 徽章。**验证三连**：①GitHub Actions 3 次运行全 `success`（含 v0.1.0 tag 流水线：gofmt 门禁/vet/build/test-race/example 冒烟）；②`go list -m github.com/qorm/LNN@v0.1.0` 经 proxy.golang.org **实测解析成功**——`go get` 全球可用；③仓库可见性 PUBLIC 确认
+
 **7c 双语文档同步（已完成）**：7 工单全部落地。新建 **doc/persistence.md 双语篇**（LNNS 格式规格表 + 六 API + 不可信流安全契约逐条回源 + 训练→保存→加载→续训示例 /tmp 实测逐字入文：60 轮训练→SaveCfC 1859B+WriteParameters 71B→异 seed 加载 Step 逐位相同→续训与无中断同迭代打印逐位吻合→恶意流三连全 error）；architecture.md 双语新增「梯度缓冲区移交非克隆」与「融合反向+FMA 屏障」两节、五基准数字刷新；README 双版加 serialize 行、**删除过时的序列化路线图句**、补 cfc-sequence；pitfalls 路线图表刷新 + 新增§10 持久化安全边界；doc 索引阅读顺序改 training→persistence→ltc→cfc→…；30+ 条 ltc/cfc 行号回源**零偏差**。**回源反查修正 7 处偏差**：覆盖率实测改写——serialize 97.4%→**97.8%**（加固新增测试），**tensor 89.5%→81.7% / autograd 97.8%→87.1%**（深改新增 MatMulTransA/B 跨包代码与防御性回退分支未覆盖，README 如实注明降幅成因不掩饰）；pitfalls 两处旧行号（Div 171-194→725-742、GatherRows 271→791）；6 处"反向闭包"过时措辞；全文档 allocs 旧值刷新（3,440/68,688→2,442/33,963，基线统一 7,360/120,163）；"少于 50 次分配"措辞修正为"不超过 50 次"（与测试断言方向一致）。终检：gauntlet 全绿、18 篇 md 零断链、中英九对同构、非文档文件零触碰
 
 **模块路径迁移（7c+，已完成）**：`module lnn` → **`module github.com/qorm/LNN`**，37 文件 187 行纯路径替换（go.mod + 27 .go 文件 45 对 import + 8 篇文档代码块 + 双版 Installation 重写为 `go get github.com/qorm/LNN@latest` 正式写法、replace 降级为源码备选）。核查：`grep '"lnn/'` 残留 **0**、活文档路径残留 **0**、五包 `-race` 全绿（包名已为 github.com/qorm/LNN/*）、两 example 输出**逐字节不变**、/tmp 下游消费者模拟五包 API 调用通过、外部 URL（ncps/CfC/DOI）零误伤、PLAN/PROGRESS 历史档案保留裸名。6 项判断性取舍留档（错误串 "not an lnn tensor stream"、表头自称、Makefile 注释等名字语境不改）
@@ -254,7 +256,7 @@
 | 覆盖率 | tensor 85.7% / autograd 97.6% / nn 无 | **tensor 89.5% / autograd 97.8% / nn 98.7% / optimizer 100%** |
 | 性能 | 无度量 | LTCStep allocs **−53.3%**（3,440/op）、UnrollBackward **−42.8%**（68,688/op）——红队独立 oracle 同机复测 |
 | 红队验证 | 初审 13 项（1C/4H/5M/3L），裁决不可用于生产 | 初审全部销账 + 阶段6三路复审（性能等价/optimizer 更新式/CfC 论文符合度）**全 ✅** |
-| 基建 | 非 Git 仓库，无文档 | 7 提交干净历史 · 双语指南 **14 篇**（doc/ 与 doc/zh/ 各七篇含 cfc.md）+ 4× godoc · MIT · Makefile（含 bench）· GitHub Actions CI · 13 项基准 · examples |
+| 基建 | 非 Git 仓库，无文档 | **已发布 https://github.com/qorm/LNN（public，v0.1.0，`go get` 可用，CI 绿）** · 双语指南 **16 篇**（doc/ 与 doc/zh/ 各八篇）+ 4× godoc · MIT（© 2026 QORM）· Makefile（含 bench）· GitHub Actions CI · 13 项基准 · 2 个 example |
 | 端到端 | 无 | LTC example loss 0.691→0.042；CfC 示例 0.621→0.029 |
 | 技术债 | 6 项留档 | Div 闭式（−11% 时延）、synapses 向量化、F3 等销账；余项 11 条全部 🟢/Info 级留档 |
 | 编排 | — | **19 个 agent / 六阶段**：分析×4（阶段1）· 实施×3（阶段3）· 红队复审×1（阶段4）· 技术债/基建/文档×4（阶段5）· 实施×3 + 红队验证×3 + 文档同步×1（阶段6） |
@@ -290,4 +292,6 @@ Git 历史：`87ccf77` 基线 → `08aba45` 阶段3a → `102af40` 阶段3b → 
 - 2026-07-29：D4 中文镜像文档交付（931 行，全部示例实测），回源核对反查英文版 4 处漂移并由主控双语修正；终检 gauntlet 全绿；前五个阶段关闭。
 - 2026-07-30：用户选定双轨并行，阶段 6 启动：6a 三路实施（optimizer 包 100% 覆盖 / CfC 闭式细胞取证实现 / synapses 向量化 −53.3%），提交 b7f302c。
 - 2026-07-30：6b 红队三路验证全 ✅——性能组（git 历史 oracle 差分，前向 ≤1.79e-7）/ optimizer 组（教科书参考逐位对照 + 鉴别力校验）/ CfC 组（六路取证 liquid cubic 零命中、方程级忠实裁决、10/10 数值对抗、含自我证伪留档）。
-- 2026-07-30：6c 双语文档同步（8 工单 20 文件，反查修正 3 处偏差），主控补修 examples 注释，终检 gauntlet 全绿、旧文案 grep 零残留，提交 fd14fdf；**全部六个阶段关闭**。
+- 2026-07-30：6c 双语文档同步（8 工单 20 文件，反查修正 3 处偏差），主控补修 examples 注释，终检 gauntlet 全绿、旧文案 grep 零残留，提交 fd14fdf；前六个阶段关闭。
+- 2026-07-30：阶段 7 双轨再进：7a 序列化（serialize 包 + nn Save/Load）+ autograd 深改（−50.55%）+ CfC 示例（3d47b4c）；7b 红队双路——序列化 7,500 变异体 0 panic 但 F1/F2 资源耗尽（修复：4GiB→33KiB）、autograd 逮住 F1 panic 回归（修复方自证又震出同族 F4-F6，52k 图四类差异归零）（154c9ca）；7c+ 模块迁移 github.com/qorm/LNN；7c 双语持久化指南 + 深改机制文档 + 7 处偏差修正（57e8bc7）。
+- 2026-07-30：**发布 https://github.com/qorm/LNN**（合并用户初始提交、LICENSE © 2026 QORM、v0.1.0 标签、CI 3/3 success、Go 代理解析实测通过）；**全部七个阶段关闭**。
