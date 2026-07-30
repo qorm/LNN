@@ -13,8 +13,8 @@ import (
 	"testing"
 	"testing/quick"
 
-	"lnn/autograd"
-	"lnn/tensor"
+	"github.com/qorm/LNN/autograd"
+	"github.com/qorm/LNN/tensor"
 )
 
 // sameBits reports whether a and b have identical shapes and bit-identical

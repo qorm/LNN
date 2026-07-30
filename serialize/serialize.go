@@ -60,8 +60,8 @@ import (
 	"math"
 	"math/bits"
 
-	"lnn/autograd"
-	"lnn/tensor"
+	"github.com/qorm/LNN/autograd"
+	"github.com/qorm/LNN/tensor"
 )
 
 // Version is the format version this build writes and reads. Bump it (and

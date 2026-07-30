@@ -2,7 +2,7 @@
 
 # 陷阱、边界与残余风险
 
-**摘要：** 本库*不*替你防护的一切，从红队审计提炼为用户须知：单线程契约、`float32` 溢出、重复 `Backward` 的精确语义，以及技术债路线图。
+**摘要：** 本库*不*替你防护的一切，从红队审计提炼为用户须知：单线程契约、`float32` 溢出、重复 `Backward` 的精确语义、持久化层的不可信流契约，以及技术债路线图。
 
 **读者对象：** 在 lnn 上交付任何东西之前，请读这一篇。
 
@@ -74,7 +74,7 @@ fmt.Println(a.Grad.Data) // [4 8 12] —— 恰好翻倍
 
 ## 4. 前向与 Backward 之间不要修改数据
 
-少数反向闭包在反向时读取父节点的 `Data`（例如 `Log` 从父节点的*当前*值计算 `1/x`），而 `MatMul` 的反向使用保存的操作数张量。在前向与 `Backward` 之间修改叶节点会悄无声息地改变梯度：
+少数反向步骤在反向时读取父节点的 `Data`（例如 `Log` 从父节点的*当前*值计算 `1/x`），而 `MatMul` 的反向使用保存的操作数张量。在前向与 `Backward` 之间修改叶节点会悄无声息地改变梯度：
 
 ```go
 x := autograd.New([]float32{2}, 1)
@@ -88,7 +88,7 @@ fmt.Println(x.Grad.Data) // [0.125] = 1/8，而不是 1/2
 
 ## 5. GatherRows 会拷贝索引（已修复的隐患）
 
-`autograd.GatherRows(a, idx)` 在入口处拷贝 `idx`（`autograd/ops.go:271`），因此调用方可以在前向与反向之间随意复用或修改该切片——梯度由前向所用的索引算出：
+`autograd.GatherRows(a, idx)` 在入口处拷贝 `idx`（`autograd/ops.go:791`），因此调用方可以在前向与反向之间随意复用或修改该切片——梯度由前向所用的索引算出：
 
 ```go
 m := autograd.New([]float32{1, 2, 3, 4}, 2, 2)
@@ -117,7 +117,18 @@ fmt.Println(m.Grad.Data) // [1 0 0 1] —— 依然正确
 
 ## 9. 图就是内存模型
 
-每个中间张量都保持存活，直到 `Backward` 完成。一次 LTC step 展开 `unfolds` 轮 ODE 迭代，自阶段 6 的突触向量化起每轮是 O(units) 个向量块加两次 MatMul 收缩（从 O(units²) 个逐突触节点降下来——见 [ltc.md](ltc.md)）；`T` 步的序列会把这一切再乘以 `T`。内存随每次迭代的算子数增长，而不仅仅随参数增长——`units`、`unfolds` 和序列长度都要保持适度；或者改用 `CfC` 细胞（[cfc.md](cfc.md)），它的闭式步进没有 `unfolds` 因子。
+每个中间张量都保持存活，直到 `Backward` 完成。一次 LTC step 展开 `unfolds` 轮 ODE 迭代，自阶段 6 的突触向量化起每轮是 O(units) 个向量块加两次 MatMul 收缩（从 O(units²) 个逐突触节点降下来——见 [ltc.md](ltc.md)），而阶段 7 的反向深改又把逐节点分配数砍掉一半（`UnrollBackward` 33,963 allocs/op，较最初循环累计 −72%——见 [architecture.md](architecture.md)）；`T` 步的序列会把这一切再乘以 `T`。内存随每次迭代的算子数增长，而不仅仅随参数增长——`units`、`unfolds` 和序列长度都要保持适度；或者改用 `CfC` 细胞（[cfc.md](cfc.md)），它的闭式步进没有 `unfolds` 因子。
+
+## 10. 持久化把模型文件当作不可信输入
+
+`nn.SaveLTC`/`LoadLTC`、`SaveCfC`/`LoadCfC`、`SaveLinear`/`LoadLinear` 及其底层的 `serialize` 包，是本库"误用即 panic"契约的公开例外：检查点（checkpoint）恰是程序自己控制不了的输入，因此**加载路径上的一切失败都是 error，绝不 panic**，且恶意流的分配量只与它实际送达的字节数成正比。契约简述：
+
+- **固定限额，先校验后分配：** 单个张量 ≤ `2^30` 个 float32（4 GiB 载荷），单条流 ≤ `2^20` 个张量，秩 ≤ `8` 轴，且 `LoadLTC` 在 blob 解析*之前*就拒绝 `unfolds > 1024`。元素计数用溢出安全乘法，因此声称维度宽达 `1<<62` 的流是一个 error，而不是一个 PB 级的 `make()`。
+- **已知长度读端**（`bytes.Reader` 等）先拿每个载荷声明与剩余字节比对；**未知长度读端**（`io.Pipe`、`net.Conn`、`gzip.Reader`）采用渐进分配（progressive allocation）——一条声称 `2^30` 个元素却在 18 字节后停止的流，峰值约 33 KiB，以 `io.ErrUnexpectedEOF` 失败。
+- **模型级校验：** kind 字节精确匹配（跨 kind 互载是指名道姓的错误）、掩码恰为 `{0, 1}`、反转电位恰为 `±1`（`NaN`/`±Inf`/`0`/小数一律拒绝）、张量数量精确，且一切形状在任何值被拷贝之前完成校验——失败的加载让目标分毫不动。
+- **`serialize.LoadParameters` 保留陈旧 `Grad`：** 它原位覆写 `Data`（变量身份、从而图边得以存活），且刻意不动 `Grad`。在新图中复用加载后的变量之前先调用 `ZeroGrad`——与任何训练步之前完全一样。
+
+格式规格、API 指南与完整契约——包括版本规则（只读 version 1；未知版本报错而非误解析）——见 [persistence.md](persistence.md)。
 
 ## 路线图与技术债
 
@@ -125,13 +136,15 @@ fmt.Println(m.Grad.Data) // [1 0 0 1] —— 依然正确
 
 | 条目 | 状态 |
 |---|---|
-| `autograd.Div` 闭式化 | **已完成：** 单图节点 + 商法则反向（`da = g/b`、`db = −g·a/b²`，`autograd/ops.go:171-194`）。注意小除数固有的 `1/b²` 梯度放大依然存在——以 LTC 的 `eps = 1e-8` 下限计，最高约 `1e16` 倍——因此仍建议梯度裁剪 |
+| `autograd.Div` 闭式化 | **已完成：** 单图节点 + 商法则反向（`da = g/b`、`db = −g·a/b²`，`autograd/ops.go:725-742`）。注意小除数固有的 `1/b²` 梯度放大依然存在——以 LTC 的 `eps = 1e-8` 下限计，最高约 `1e16` 倍——因此仍建议梯度裁剪 |
 | LTC 突触向量化 | **已完成（阶段 6）：** 掩码折叠出热路径；逐突触前神经元向量块 + 两次构造期指示矩阵（indicator matrix）MatMul 收缩（[ltc.md](ltc.md)）。`LTCStep` 7,360 → 3,440 allocs/op（−53.3%）、`UnrollBackward` 120,163 → 68,688（−42.8%）。整 `Step` 与重写前循环为 ULP 级等价（前向 ≤ 1.79e-7、梯度 ≤ 1.19e-7，红队独立 oracle）；逐位一致仅对孤立的 `synapses()` 驱动成立 |
-| `UnrollBackward` 的进一步压缩（autograd 层融合） | 后续方向：剖析显示剩余分配约 80% 是逐节点固定开销（`tensor.New`/`Clone`/广播闭包）；融合 Sigmoid–Hadamard 反向、`addGrad` 原地写入、去闭包都需要改动 `autograd` |
+| autograd 反向深改（闭包、融合、`addGrad` 克隆） | **已完成（阶段 7）：** 逐节点反向闭包改为 opKind 标签派发；`addGrad` 首次贡献所有权移交（所有权移交，ownership transfer；Clone 占比约 20% → 约 1%）；一元反向链融合（Sigmoid/Tanh 4→1 节点）、MatMul 转置缓冲消除、乘积-归约融合——全部以对重写前 oracle 的 52k 差分图逐位门禁，arm64 FMA 转换屏障保证融合循环保持两次舍入精确（[architecture.md](architecture.md)）。`UnrollBackward` 68,688 → 33,963 allocs/op（−50.55%）；另外四项基准 −23%…−58%，零回归。剩余的逐节点开销由下面两项追踪 |
+| `tensor.New` 的逐节点固定开销 | 后续方向：剖析显示剩余分配的 64.9% 是每个节点的前向输出及其 `Shape`/`Data` 双分配；进一步压缩需要 parents 定长槽化（受阻于既有结构断言测试）与 Tensor 定秩 Shape（公共 API 破坏） |
+| Sigmoid–Hadamard 融合反向（LTC 热路径模式） | 后续方向：需要在 `tensor` 增设新算子层；收益/脆弱性之比待评估 |
 | CfC 的 `erev` 死梯度 | 信息级：CfC 的反转电位以 `Var` 叶入图，反向计算花在无人读取的梯度上（`Parameters()` 将其排除，优化器不可达）。LTC 分文不付——它把 ±1 焙入 `Const` 指示矩阵——CfC 也可照搬同一手法 |
 | 统一归约形状约定（`SumRows`/`SumCols`、1D 提升） | 单独评估；API 破坏性 |
 | `tensor.Stack` | 实验性：产出没有其他算子消费的 3D 张量（`tensor/tensor.go:165`）；为兼容保留 |
 | CfC（Closed-form Continuous-time）细胞 | **已完成（阶段 6）：** `nn.CfC`（`nn/cfc.go`）——与 LTC 同一 ODE、同一套突触参数化，以 Lemma 1 闭式解驱动；论文↔代码对照与验证留痕见 [cfc.md](cfc.md)。新 API：仍可能演进 |
 | 内置优化器 | **已完成（阶段 6）：** `optimizer` 包（SGD/Momentum/Adam，覆盖率 100%）；手写循环依然是理解引擎以及实现该包未覆盖规则的受支持范式——[training.md](training.md) 覆盖两种形态 |
-| 序列化（Save/Load） | 未实现；参数就是朴素的 `[]float32` 缓冲区——请自行快照 `p.Data.Data` |
+| 序列化（Save/Load） | **已完成（阶段 7）：** `serialize` 包（带版本的 `"LNNS"` 张量流）外加 `nn` 的六个 Save/Load 函数（LTC/CfC/Linear）；对恶意流安全——只有 error 绝不 panic、固定限额先校验后分配、未知长度读端渐进分配（4 GiB 声明在 18 字节后停止仅峰值约 33 KiB）。红队变异模糊：7,500 个变异体 0 panic，资源耗尽加固后再测 1,200 个变异体，依然 0 panic。格式规格、API 指南与完整安全契约见 [persistence.md](persistence.md) |
 | 基准/CI 工具 | **已完成：** `make bench`（13 项基准）+ GitHub Actions CI（gofmt 门禁、vet、build、`test -race`、example 冒烟） |

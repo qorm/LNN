@@ -34,8 +34,8 @@ import (
 	"fmt"
 	"math/rand"
 
-	"lnn/autograd"
-	"lnn/tensor"
+	"github.com/qorm/LNN/autograd"
+	"github.com/qorm/LNN/tensor"
 )
 
 func main() {
@@ -97,7 +97,7 @@ Three disciplines that the engine does not enforce for you:
 - **`ZeroGrad` before, never after, `Backward`** — gradients accumulate
   into leaves across calls and across graphs by design.
 - **Do not mutate parameter `Data` between forward and `Backward`:** a
-  few backward closures read parent data at backward time, so in-place
+  few backward steps read parent data at backward time, so in-place
   updates belong strictly after the backward pass.
 
 ## Aggregating parameters from nn modules

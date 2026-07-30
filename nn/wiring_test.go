@@ -5,7 +5,7 @@ import (
 	"math/rand"
 	"testing"
 
-	"lnn/tensor"
+	"github.com/qorm/LNN/tensor"
 )
 
 func maskSum(t *tensor.Tensor) float32 {

@@ -1,5 +1,5 @@
 // Package optimizer provides small, explicit parameter-update rules over
-// lnn/autograd: plain SGD, classical heavy-ball momentum, and Adam. Each
+// github.com/qorm/LNN/autograd: plain SGD, classical heavy-ball momentum, and Adam. Each
 // optimizer packages exactly the hand-rolled update loop that
 // doc/training.md builds by hand — same float32 arithmetic, same in-place
 // writes to p.Data — so a training loop's update phase becomes one

@@ -9,7 +9,7 @@ import (
 	"math/rand"
 	"testing"
 
-	"lnn/tensor"
+	"github.com/qorm/LNN/tensor"
 )
 
 // TestHadamardReduce1DLiftShapeContract is the red team's minimal F1 repro:

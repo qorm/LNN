@@ -8,7 +8,7 @@ package autograd
 import (
 	"fmt"
 
-	"lnn/tensor"
+	"github.com/qorm/LNN/tensor"
 )
 
 // Variable is a node in the computation graph: a tensor value plus its

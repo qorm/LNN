@@ -1,6 +1,6 @@
 package optimizer
 
-import "lnn/autograd"
+import "github.com/qorm/LNN/autograd"
 
 // Optimizer applies an in-place update to params using each variable's
 // accumulated Grad. Callers own the training loop: build a fresh graph,

@@ -7,7 +7,7 @@
 // The task needs cross-step memory, so it genuinely exercises the liquid
 // dynamics rather than a static input/output map. Training is hand-rolled
 // SGD (kept hand-rolled deliberately as the readable baseline; the
-// lnn/optimizer package offers SGD/Momentum/Adam for production loops)
+// github.com/qorm/LNN/optimizer package offers SGD/Momentum/Adam for production loops)
 // with global gradient-norm clipping, and the program doubles as an
 // end-to-end integration smoke test: fixed seed, deterministic output,
 // loss printed as it falls.
@@ -18,9 +18,9 @@ import (
 	"math"
 	"math/rand"
 
-	"lnn/autograd"
-	"lnn/nn"
-	"lnn/tensor"
+	"github.com/qorm/LNN/autograd"
+	"github.com/qorm/LNN/nn"
+	"github.com/qorm/LNN/tensor"
 )
 
 func main() {

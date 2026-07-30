@@ -4,7 +4,8 @@
 
 **Summary:** everything the library does *not* protect you from, distilled
 from the red-team audit into user-facing caveats: the single-threaded
-contract, `float32` overflow, exact repeated-`Backward` semantics, and the
+contract, `float32` overflow, exact repeated-`Backward` semantics, the
+untrusted-stream contract of the persistence layer, and the
 technical-debt roadmap.
 
 **Audience:** read this before shipping anything on lnn.
@@ -102,7 +103,7 @@ until you `ZeroGrad` — that is the feature the training loop relies on.
 
 ## 4. Do not mutate data between forward and Backward
 
-A few backward closures read parent `Data` at backward time (e.g. `Log`
+A few backward steps read parent `Data` at backward time (e.g. `Log`
 computes `1/x` from the parent's *current* values), and `MatMul`'s
 backward uses the saved operand tensors. Mutating a leaf between the
 forward pass and `Backward` silently changes the gradient:
@@ -120,7 +121,7 @@ In-place parameter updates therefore belong strictly *after* `Backward`.
 ## 5. GatherRows copies its indices (fixed hazard)
 
 `autograd.GatherRows(a, idx)` copies `idx` on entry
-(`autograd/ops.go:271`), so the caller may freely reuse or mutate the
+(`autograd/ops.go:791`), so the caller may freely reuse or mutate the
 slice between forward and backward — the gradient is computed from the
 indices used in the forward pass:
 
@@ -172,11 +173,49 @@ separately (roadmap). Full tables and workarounds in
 Every intermediate tensor stays alive until `Backward` completes. One LTC
 step unrolls `unfolds` ODE iterations, each O(units) vector blocks plus
 two MatMul contractions since the phase-6 synapse vectorization (down
-from O(units²) per-synapse nodes — see [ltc.md](ltc.md)); a sequence of
+from O(units²) per-synapse nodes — see [ltc.md](ltc.md)), and the
+phase-7 backward overhaul halved the per-node allocation count again
+(`UnrollBackward` 33,963 allocs/op, −72% cumulative from the original
+loop — see [architecture.md](architecture.md)); a sequence of
 `T` steps multiplies that by `T`. Memory grows with ops per iteration,
 not just parameters — keep `units`, `unfolds` and sequence length
 modest, or use the `CfC` cell ([cfc.md](cfc.md)), whose closed-form
 step has no `unfolds` factor.
+
+## 10. Persistence treats model files as untrusted input
+
+`nn.SaveLTC`/`LoadLTC`, `SaveCfC`/`LoadCfC`, `SaveLinear`/`LoadLinear`
+and the `serialize` package underneath are the library's documented
+exception to panic-on-misuse: a checkpoint is exactly the kind of input
+the program does not control, so **every failure on the load path is an
+error, never a panic**, and a hostile stream can allocate only in
+proportion to the bytes it actually delivers. The contract in brief:
+
+- **Fixed limits, validated before any allocation:** one tensor ≤
+  `2^30` float32s (4 GiB payload), one stream ≤ `2^20` tensors, rank ≤
+  `8` axes, and `LoadLTC` refuses `unfolds > 1024` before the blob is
+  even parsed. Element counts use overflow-safe multiplication, so a
+  stream claiming a `1<<62`-wide dimension is an error, not a
+  petabyte-sized `make()`.
+- **Known-length readers** (`bytes.Reader` etc.) get every payload
+  claim checked against the remaining bytes first; **unknown-length
+  readers** (`io.Pipe`, `net.Conn`, `gzip.Reader`) get progressive
+  allocation — a claim of `2^30` elements that stops after 18 bytes
+  peaks at ~33 KiB and fails with `io.ErrUnexpectedEOF`.
+- **Model-level checks:** exact kind byte (cross-loading is a named
+  error), masks exactly `{0, 1}`, reversal potentials exactly `±1`
+  (`NaN`/`±Inf`/`0`/fractions refused), exact tensor count, and all
+  shapes validated before any value is copied — a failing load leaves
+  the destination untouched.
+- **`serialize.LoadParameters` leaves stale `Grad` in place:** it
+  overwrites `Data` in place (variable identities, and thus graph
+  edges, survive) and deliberately does not touch `Grad`. Call
+  `ZeroGrad` before reusing loaded variables in a new graph — exactly
+  as before any training step.
+
+Format spec, API guide and the complete contract — including the
+versioning rule (version 1 only; unknown versions error out rather than
+mis-parse) — in [persistence.md](persistence.md).
 
 ## Roadmap and technical debt
 
@@ -186,13 +225,15 @@ gradients):
 
 | item | status |
 |---|---|
-| `autograd.Div` closed form | **done:** single graph node with quotient-rule backward (`da = g/b`, `db = −g·a/b²`, `autograd/ops.go:171-194`). Note the inherent `1/b²` gradient amplification for small divisors remains — with LTC's `eps = 1e-8` floor that is up to ~`1e16` — so gradient clipping stays recommended |
+| `autograd.Div` closed form | **done:** single graph node with quotient-rule backward (`da = g/b`, `db = −g·a/b²`, `autograd/ops.go:725-742`). Note the inherent `1/b²` gradient amplification for small divisors remains — with LTC's `eps = 1e-8` floor that is up to ~`1e16` — so gradient clipping stays recommended |
 | LTC synapse vectorization | **done (phase 6):** masks folded out of the hot path; per-presynaptic-neuron vector blocks + two construction-time indicator-matrix MatMul contractions ([ltc.md](ltc.md)). `LTCStep` 7,360 → 3,440 allocs/op (−53.3%), `UnrollBackward` 120,163 → 68,688 (−42.8%). The whole `Step` is ULP-equivalent to the pre-rewrite loop (forward ≤ 1.79e-7, gradients ≤ 1.19e-7, independent red-team oracle); bitwise identity holds only for the isolated `synapses()` drive |
-| Further `UnrollBackward` compression (autograd-layer fusion) | future: profiling puts ~80% of the remaining allocations in per-node fixed overhead (`tensor.New`/`Clone`/broadcast closures); fusing the Sigmoid–Hadamard backward, in-place `addGrad` and closure removal would all require `autograd` changes |
+| Autograd backward overhaul (closures, fusion, `addGrad` cloning) | **done (phase 7):** per-node backward closures replaced by op-kind tag dispatch; `addGrad` first-contribution ownership transfer (Clone share ~20% → ~1%); unary backward chains fused (Sigmoid/Tanh 4→1 nodes), MatMul transpose buffers removed, product-and-reduce fused — all gated bitwise against the pre-rewrite oracle on 52k differential graphs, with an arm64 FMA conversion barrier keeping fused loops two-rounding-exact ([architecture.md](architecture.md)). `UnrollBackward` 68,688 → 33,963 allocs/op (−50.55%); four other benchmarks −23%…−58%, zero regressions. Remaining per-node overhead is tracked in the two items below |
+| `tensor.New` fixed per-node overhead | future: profiling puts 64.9% of the remaining allocations in each node's forward output plus its `Shape`/`Data` double allocation; further compression needs fixed-capacity parent slots (blocked by existing structural-assertion tests) and a fixed-rank `Tensor` shape (public-API break) |
+| Sigmoid–Hadamard fused backward (LTC hot-path pattern) | future: would need a new operator layer in `tensor`; cost/fragility ratio still under evaluation |
 | CfC `erev` dead gradients | informational: the CfC's reversal potentials enter the graph as `Var` leaves, so backward work is spent on gradients nobody reads (`Parameters()` excludes them; optimizers cannot reach them). The LTC pays no such cost — it bakes ±1 into `Const` indicator matrices — and the CfC could adopt the same trick |
 | Unify reduction shape conventions (`SumRows`/`SumCols`, 1D promotion) | separate evaluation; API-breaking |
 | `tensor.Stack` | experimental: yields 3D tensors that no other op consumes (`tensor/tensor.go:165`); kept for compatibility |
 | CfC (Closed-form Continuous-time) cell | **done (phase 6):** `nn.CfC` (`nn/cfc.go`) — same ODE and synapse parameterization as the LTC, driven by the Lemma 1 closed form; paper↔code correspondence and verification trail in [cfc.md](cfc.md). New API: may still evolve |
 | Built-in optimizers | **done (phase 6):** the `optimizer` package (SGD/Momentum/Adam, 100% coverage); the hand-rolled loop remains the supported pattern for understanding and for rules the package does not cover — [training.md](training.md) covers both |
-| Serialization (Save/Load) | not implemented; parameters are plain `[]float32` buffers — snapshot `p.Data.Data` yourself |
+| Serialization (Save/Load) | **done (phase 7):** the `serialize` package (versioned `"LNNS"` tensor streams) plus six `nn` Save/Load functions for LTC/CfC/Linear; hostile-stream safe — errors never panics, fixed limits validated before allocation, progressive allocation on unknown-length readers (a 4 GiB claim that stops after 18 bytes peaks at ~33 KiB). Red-team mutation fuzzing: 7,500 mutants with 0 panics, plus 1,200 mutants after the resource-exhaustion hardening, again 0 panics. Format spec, API guide and the full safety contract in [persistence.md](persistence.md) |
 | Benchmarks/CI tooling | **done:** `make bench` (13 benchmarks) + GitHub Actions CI (gofmt gate, vet, build, `test -race`, example smoke test) |

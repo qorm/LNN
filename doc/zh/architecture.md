@@ -22,9 +22,9 @@
                 │  把可微算子组合成一张 *autograd.Variable 图
 ┌───────────────▼──────────────────────────────────────────────┐
 │  autograd — 动态图 + 反向模式自动微分                        │
-│  Variable{Data, Grad, parents, backward 闭包}                │
-│  前向：即时执行；每个算子记录自己的反向闭包                  │
-│  Backward：逆拓扑序遍历，梯度累加进叶节点                    │
+│  Variable{Data, Grad, parents, opKind 标签 + 载荷字段}       │
+│  前向：即时执行；每个算子给输出打上算子种类标签              │
+│  Backward：逆拓扑序遍历，按标签派发反向传播                  │
 └───────────────┬──────────────────────────────────────────────┘
                 │  所有前向与反向计算都是普通的张量算子
 ┌───────────────▼──────────────────────────────────────────────┐
@@ -34,27 +34,28 @@
 └──────────────────────────────────────────────────────────────┘
 ```
 
-导入方向严格向下（`nn → autograd → tensor`）；没有环，也没有跨层捷径——唯一的例外是 `nn` 会直接调用 `tensor` 来构造不需要梯度的常量（接线掩码（mask）、epsilon、稀疏归约指示矩阵（indicator matrix））。`optimizer` 包（SGD、Momentum、Adam）与 `nn` 并列坐在 `autograd` 之上——它只导入 `autograd`，写的就是手写循环会写的朴素 Go 原地更新（[training.md](training.md)）。
+导入方向严格向下（`nn → autograd → tensor`）；没有环，也没有跨层捷径——唯一的例外是 `nn` 会直接调用 `tensor` 来构造不需要梯度的常量（接线掩码（mask）、epsilon、稀疏归约指示矩阵（indicator matrix））。`optimizer` 包（SGD、Momentum、Adam）与 `nn` 并列坐在 `autograd` 之上——它只导入 `autograd`，写的就是手写循环会写的朴素 Go 原地更新（[training.md](training.md)）。`serialize` 包（持久化）与它们并列，坐在 `tensor` 与 `autograd` 之上——它是 `nn` 六个 Save/Load 函数背后的存储层，单独暴露是为了让线上格式（wire format）及其不可信流（untrusted stream）安全契约可以被独立审计（[persistence.md](persistence.md)）。
 
 | 层 | 职责 | 刻意不具备的东西 |
 |---|---|---|
 | `tensor` | 稠密缓冲与数值内核；以 panic 做校验 | stride、视图、原地算子、枚举子集之外的广播 |
-| `autograd` | 即时前向 + 记录反向闭包；反向模式 `Backward` | tape/session 对象、图优化、高阶导数 |
-| `nn` | 层、细胞（LTC 与 CfC）、接线、序列展开（unroll）、参数聚合 | 序列化（路线图）；内置优化器位于独立的 `optimizer` 包 |
+| `autograd` | 即时前向 + 按算子种类（op kind）标签派发的反向传播；反向模式 `Backward` | tape/session 对象、逐节点反向闭包（已被标签取代）、图优化、高阶导数 |
+| `nn` | 层、细胞（LTC 与 CfC）、接线、序列展开（unroll）、参数聚合、六个 Save/Load 函数 | 自己的线上格式——持久化是独立的 `serialize` 包；内置优化器位于独立的 `optimizer` 包 |
 | `optimizer` | 作用于 `autograd` 叶节点的 SGD/Momentum/Adam，显式 struct | 每参数速度/矩以外的状态；学习率调度（由调用方持有的字段） |
+| `serialize` | 带版本的 `"LNNS"` 张量流与模型流；只返回 error 的加载路径，对恶意流安全 | 版本协商（只读 version 1，未知版本直接拒绝）；压缩、加密 |
 
 ## 一次训练迭代的数据流
 
 ```
 ZeroGrad(所有参数)              // 清空叶节点的 Grad 缓冲区
         │
-前向：算子即时执行              // 每个算子分配一个新张量，并把一个
-        │                       // 反向闭包挂到它的输出上
+前向：算子即时执行              // 每个算子分配一个新张量，并给它的
+        │                       // 输出打上算子种类标签
         ▼
    loss（图的标量叶节点）
         │
-loss.Backward()                 // 对图做拓扑排序，逆序执行闭包；
-        │                       // 叶节点梯度累加
+loss.Backward()                 // 对图做拓扑排序，逆序派发每个节点
+        │                       // 的反向传播；叶节点梯度累加
         ▼
 你的更新规则                    // p.Data.Data[i] -= lr * p.Grad.Data[i]
 ```
@@ -67,7 +68,7 @@ loss.Backward()                 // 对图做拓扑排序，逆序执行闭包；
 
 对这个体量的库来说，这个取舍是刻意为之的：
 
-- **别名（aliasing）在构造上不可能。** 除非用户显式共享 `Data` 切片，两个张量永远不会共享存储，因此不存在需要文档化或防御的写后读风险类别，每个反向闭包都可以直接捕获前向张量而无需生命周期记账。
+- **别名（aliasing）在构造上不可能。** 除非用户显式共享 `Data` 切片，两个张量永远不会共享存储，因此不存在需要文档化或防御的写后读风险类别，每个反向步骤都可以直接读取本节点的前向张量而无需生命周期记账。
 - **已构造对象的不可变性是真实的。** `Wiring` 的掩码只通过拷贝型访问器暴露，红队审计确认：篡改返回的掩码不会影响细胞（指针型访问器就不具备这个性质）。
 - **代价是显式且可预期的：** 每个算子 O(元素数) 的拷贝，以及随计算图增长（见下文）的内存。本库面向 CPU 上小而可审计的模型，在这里清晰性胜过吞吐量；一个带 stride 的视图层将是另一个库。
 
@@ -83,13 +84,41 @@ type Variable struct {
     Grad *tensor.Tensor   // 累积的梯度（首次反向之前为 nil）
 
     parents  []*Variable  // 产生该节点的算子的输入
-    backward func()       // 闭包：把 Grad 推给 parents
+    kind     opKind       // 标签：runBackward 据此派发梯度公式
+    scalar   float32      // 载荷：Scale 系数 / Pow 指数
+    from, to int          // 载荷：SliceCol 列区间 / SliceRow 行下标
+    aux      *tensor.Tensor // 载荷：Div 捕获的分母倒数
+    idx      []int        // 载荷：GatherRows 索引（构造时已拷贝）
 }
 ```
 
-- **叶节点**（`Var`、`New`、`Const`）没有 parents，也没有闭包。它们是参数和输入；梯度传播到它们为止。
-- **算子**通过 `tensor` 即时执行前向计算，然后在输出节点上记录一个闭包。该闭包在反向时读取 `out.Grad`，并为每个输入调用 `parent.addGrad(...)`；发生过广播的地方，用 `tensor.SumToShape` 把形状归约回去。少数闭包（例如 `Log`）在反向时读取*父节点*的 `Data`，因此叶节点数据在前向和反向之间不得被修改（细节见 [pitfalls.md](pitfalls.md)）。
-- **Backward** 用后序 DFS 构建拓扑序，逆序执行闭包，然后把除接收者之外所有非叶节点的 `Grad` 清零。
+- **叶节点**（`Var`、`New`、`Const`）没有 parents，种类为零值（`opLeaf`）——没有反向步骤。它们是参数和输入；梯度传播到它们为止。
+- **算子**通过 `tensor` 即时执行前向计算，然后给输出节点打上算子种类（op kind）标签及其载荷——**没有逐节点闭包**。反向步骤曾经是闭包，而闭包捕获会为每个图节点分配一个堆对象：这是深度展开图中最大的分配来源之一。阶段 7 深改以标签派发取而代之：一个 `uint8` 种类加 struct 上的几个载荷字段；`runBackward` 是一个 21 路 switch，其 case 体恰是原来闭包承载的梯度公式。少数 case（例如 `opLog`）在反向时读取*父节点*的 `Data`，因此叶节点数据在前向和反向之间不得被修改（细节见 [pitfalls.md](pitfalls.md)）。
+- **Backward** 用后序 DFS 构建拓扑序，逆序对每个节点执行 `runBackward`，然后把除接收者之外所有非叶节点的 `Grad` 清零。
+
+### 梯度缓冲区是移交的，不是克隆的
+
+`addGrad` 在形状不符时 panic（与从前一样）——而在*首次*贡献时，它直接取得传入缓冲区的所有权（ownership transfer，所有权移交），不做克隆。每个反向 case 传入的要么是全新分配的张量，要么是专门为这次调用准备的缓冲区，因此没有其他引用能观察到后续对它的累加。`Add` 的 case 把这一设计展示得最锋利：a 支经由取得所有权的 `tensor.SumToShapeTake` 把 `v.Grad` 本体交给 `a`（安全性由逆拓扑序保证：运行到这一步时 `v` 的所有消费者都已贡献完毕），而 b 支刻意走*克隆版*的 `SumToShape`——当两个操作数都与 `v` 同形时，它必须交给 `b` 一块独立的缓冲区，否则 `a.Grad` 与 `b.Grad` 就会别名（alias），之后向任何一方累加都会腐蚀另一方（设想 `Add(x, y)` 且两个叶都在下游被复用）。根种子在集中处受到同样待遇：`Backward` 从一份私有克隆开始传播，这样自动播种的全 1 缓冲区就可以交给某个叶，而不会别名接收者的 `Grad`——正是这一点让重复 `Backward` 保持严格线性、让手设种子保持完好。逐 case 的所有权审计就在 `autograd/ops.go` 的注释里，别名设计由专项探测钉住（`autograd/alias_probe_test.go`，外加 `autograd/f1_regress_test.go` 的形状契约回归）——反向分配中 Clone 的占比从约 20% 降到约 1%。
+
+### 融合反向——以及 FMA 屏障
+
+同一次深改把多节点梯度链融合（fused backward，融合反向）成单循环：一元激活（Sigmoid、Tanh 从 4 个图节点 → 1 个；Log、Pow 从 3 → 1；……）、MatMul 反向改经新的转置感知内核 `MatMulTransA`/`MatMulTransB`（乘积与累加次序与显式 `Transpose` 之上的 MatMul 逐字相同，只省掉两块转置缓冲）、以及 `hadamardReduce` 对 Hadamard 与 Div 操作数的「乘积或归约后乘积」融合。
+
+其中值得讲给读者的工程决策是 **FMA 屏障**。朴素的融合乘加循环——`r[j] += g[j] * x[j]`——会被 arm64 的 SSA 后端编译成 `FMADD` 指令：一次舍入；而历史上的两步路径舍入两次（乘积先存进张量元素，再累加）。漂移是每元素约 1 ULP——单个算子层面不可见，但作为十万节点图上的逐位等价宣称则是灾难性的。屏障就是 `mul32`：
+
+```go
+func mul32(a, b float32) float32 {
+    if math.Float32bits(a)&0x7F800000 == 0x7F800000 ||
+        math.Float32bits(b)&0x7F800000 == 0x7F800000 {
+        return a * b
+    }
+    return float32(float64(a) * float64(b))
+}
+```
+
+对有限操作数，精确乘积装得进 48 位尾数，`float64` 能精确表示，因此舍入回 `float32` 与硬件乘法逐位相同——而这个转换在 SSA 图中留下一个显式舍入节点，FMA 成形规则无法跨越它。非有限操作数（NaN 或 ±Inf）改走**原生** `a * b` 路径：float64 往返会把 NaN 载荷重新规范化（recanonicalize），偏离旧链的硬件 float32 传播行为。原生乘积在其表达式中是孤立的乘法、邻接不到加减，且该分支在 SSA 图中留下 FMA 规则匹配不到的 If/Phi 结构，因此融合同样够不着它——以 `go tool compile -S` 验证：全包 `FMADD` 族指令为零，而裸循环对照探针仍然发射它们（屏障是承重的，不是拜物仪式）。相关的细节：负号融合乘以包级*变量* `negOne`（存 −1），因为编译器会把乘以常量 −1 折叠成符号翻转（`FNEGS`），那会翻转 NaN 的符号位，而旧链的硬件乘法不会。
+
+处处是忠实优先于修正：历史上 1D→`[1, n]` 的叶梯度形状怪癖被忠实复刻（`elemwiseGradShape`）；异形的手设梯度形状回退到字面的旧组合（`gradMatchesElemwise` 守卫）——panic 契约一并保留。整个深改以对 git 历史中提取的重写前实现做差分模糊测试为门禁：52,000 张图，四类差异（有限值、形状、panic 有无、NaN 位）全零，负对照确认门禁确实能侦测注入的变异。本机实测（`-benchtime=100x`）：`UnrollBackward` 68,688 → **33,963 allocs/op（−50.55%）**，字节数 −50.1%、耗时 −24%——另外四项基准全降、零回归：`ChainForwardBackward` −57.7%、`DivDenLoop` −56.7%、`LTCStep` −29.0%、`GatherRowsBackward` −23.5%。
 
 ### 非叶节点的梯度在每次遍历后被置 nil——以及为什么
 
@@ -97,7 +126,7 @@ type Variable struct {
 
 ### 图就是内存模型
 
-每个中间张量都保持存活——被其节点的闭包引用——直到 `Backward` 完成。因此内存随每次迭代的算子数量扩展，而不仅仅随参数规模。一次 LTC `Step` 会把 `unfolds` 轮 ODE 迭代展开进图；自阶段 6 的突触向量化起，每轮是 O(units) 个向量块加两次对构造期指示矩阵的 MatMul 收缩（见 [ltc.md](ltc.md)）——从 O(units²) 个逐突触节点降下来（实测：`LTCStep` 3,440 allocs/op，较原循环 −53%；`UnrollBackward` 68,688，−43%）。内存仍然随 `units · unfolds · 序列长度` 增长，所以在这个引擎上三者都要保持适度；`CfC` 细胞（[cfc.md](cfc.md)）的闭式步进则完全没有 `unfolds` 因子。
+每个中间张量都保持存活——被其节点引用——直到 `Backward` 完成。因此内存随每次迭代的算子数量扩展，而不仅仅随参数规模。一次 LTC `Step` 会把 `unfolds` 轮 ODE 迭代展开进图；自阶段 6 的突触向量化起，每轮是 O(units) 个向量块加两次对构造期指示矩阵（indicator matrix）的 MatMul 收缩（见 [ltc.md](ltc.md)）——从 O(units²) 个逐突触节点降下来，而阶段 7 的反向深改（见上）又把逐节点分配数砍掉一半。当前实测：`LTCStep` 2,442 allocs/op、`UnrollBackward` 33,963——较最初的逐突触循环（7,360 / 120,163）累计 −67% 与 −72%。内存仍然随 `units · unfolds · 序列长度` 增长，所以在这个引擎上三者都要保持适度；`CfC` 细胞（[cfc.md](cfc.md)）的闭式步进则完全没有 `unfolds` 因子。
 
 ## float32 是全局约束
 

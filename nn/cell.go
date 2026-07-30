@@ -1,6 +1,6 @@
 package nn
 
-import "lnn/autograd"
+import "github.com/qorm/LNN/autograd"
 
 // Cell is a recurrent cell that can be stepped over time. Step advances the
 // cell by one RNN step spanning ts time units: x is the [batch, inDim]

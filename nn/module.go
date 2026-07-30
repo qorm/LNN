@@ -16,7 +16,7 @@
 // share a Variable, Tensor, or computation graph across goroutines.
 package nn
 
-import "lnn/autograd"
+import "github.com/qorm/LNN/autograd"
 
 // Module is anything that owns trainable parameters.
 type Module interface {

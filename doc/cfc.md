@@ -211,10 +211,10 @@ import (
 	"math"
 	"math/rand"
 
-	"lnn/autograd"
-	"lnn/nn"
-	"lnn/optimizer"
-	"lnn/tensor"
+	"github.com/qorm/LNN/autograd"
+	"github.com/qorm/LNN/nn"
+	"github.com/qorm/LNN/optimizer"
+	"github.com/qorm/LNN/tensor"
 )
 
 func main() {

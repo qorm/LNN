@@ -115,12 +115,16 @@ git history, differential-tested on 13 randomized configurations —
 measures a maximum difference of **1.79e-7** forward and **1.19e-7** on
 all-parameter BPTT gradients: ULP-level, benign, but not "bitwise".
 
-Measured cost reduction (same machine, `-benchtime=100x`, re-verified):
+Measured cost reduction of the vectorization itself (same machine,
+`-benchtime=100x`, re-verified):
 `LTCStep` 7,360 → **3,440 allocs/op (−53.3%)**; `UnrollBackward`
 120,163 → **68,688 allocs/op (−42.8%)**. Graph nodes per unfold drop
 from O(units²) per-synapse nodes to O(units) vector blocks plus the two
 contractions; the example's first-iteration loss remains `0.690761`,
-bit-identical to the pre-rewrite value.
+bit-identical to the pre-rewrite value. (The phase-7 autograd backward
+overhaul — [architecture.md](architecture.md) — then roughly halved the
+backward count again without changing the graph shape: current values
+are `LTCStep` **2,442** and `UnrollBackward` **33,963** allocs/op.)
 
 ## The semi-implicit Euler, derived
 

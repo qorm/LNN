@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"lnn/tensor"
+	"github.com/qorm/LNN/tensor"
 )
 
 // opFunc maps input variables to an output variable.

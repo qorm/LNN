@@ -3,7 +3,7 @@ package autograd
 import (
 	"testing"
 
-	"lnn/tensor"
+	"github.com/qorm/LNN/tensor"
 )
 
 // These tests probe the ownership-transfer regime of addGrad (clone-free

@@ -3,7 +3,7 @@ package optimizer
 import (
 	"fmt"
 
-	"lnn/autograd"
+	"github.com/qorm/LNN/autograd"
 )
 
 // SGD is plain gradient descent: p -= LR * p.Grad for every element of

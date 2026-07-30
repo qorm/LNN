@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"math"
 
-	"lnn/tensor"
+	"github.com/qorm/LNN/tensor"
 )
 
 // opKind tags a node's operation so runBackward can dispatch the gradient

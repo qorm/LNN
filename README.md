@@ -17,10 +17,11 @@ no code generation, no GPU backend, no operator overloading tricks — just Go.
 
 | Package | Purpose |
 |---|---|
-| `lnn/tensor` | Dense row-major `float32` tensors with a 1D/2D-focused op set: matmul, elementwise math with limited broadcasting, activations, reductions, slicing, random initialization. |
-| `lnn/autograd` | A dynamic computation-graph engine. Each op records a backward closure on its output `Variable`; `Backward` walks the graph in reverse topological order and accumulates gradients into leaves. |
-| `lnn/nn` | Neural-network building blocks: `Linear` layers, `Wiring` synapse topologies, the `LTC` liquid cell and its closed-form sibling `CfC`, and the `Cell`/`Unroll` abstractions for driving recurrent cells over sequences. |
-| `lnn/optimizer` | Explicit parameter-update rules over `autograd`: SGD, heavy-ball Momentum, and Adam (Kingma & Ba, bias-corrected). One `Step(params)` call replaces the hand-rolled update loop. |
+| `github.com/qorm/LNN/tensor` | Dense row-major `float32` tensors with a 1D/2D-focused op set: matmul, elementwise math with limited broadcasting, activations, reductions, slicing, random initialization. |
+| `github.com/qorm/LNN/autograd` | A dynamic computation-graph engine. Each op tags its output `Variable` with an op kind; `Backward` walks the graph in reverse topological order, dispatches each node's gradient propagation, and accumulates gradients into leaves. |
+| `github.com/qorm/LNN/nn` | Neural-network building blocks: `Linear` layers, `Wiring` synapse topologies, the `LTC` liquid cell and its closed-form sibling `CfC`, and the `Cell`/`Unroll` abstractions for driving recurrent cells over sequences. |
+| `github.com/qorm/LNN/optimizer` | Explicit parameter-update rules over `autograd`: SGD, heavy-ball Momentum, and Adam (Kingma & Ba, bias-corrected). One `Step(params)` call replaces the hand-rolled update loop. |
+| `github.com/qorm/LNN/serialize` | Versioned binary persistence: a compact little-endian tensor stream (`"LNNS"`, version 1) whose load path treats input as untrusted — every failure an error (never a panic), size claims validated before allocation, progressive allocation on unknown-length readers. The storage layer behind `nn`'s six Save/Load functions. |
 
 ## Documentation
 
@@ -29,6 +30,7 @@ Guides for building on the library live in [`doc/`](doc/):
 | Guide | Covers |
 |---|---|
 | [doc/training.md](doc/training.md) | Hand-rolled training loops and the `optimizer` package (SGD/Momentum/Adam), gradient clipping, a divergence checklist |
+| [doc/persistence.md](doc/persistence.md) | The `"LNNS"` wire format spec, the six Save/Load functions, the untrusted-stream safety contract, a runnable train→save→load→resume example |
 | [doc/shapes-and-broadcasting.md](doc/shapes-and-broadcasting.md) | The broadcasting rule table, reduction output shapes, asymmetric conventions |
 | [doc/ltc.md](doc/ltc.md) | The LTC paper↔code correspondence, parameter table, `ts` contract, wiring |
 | [doc/cfc.md](doc/cfc.md) | The CfC closed-form cell: Lemma 1 paper correspondence, exprel stabilization, relation to the LTC |
@@ -36,17 +38,22 @@ Guides for building on the library live in [`doc/`](doc/):
 | [doc/pitfalls.md](doc/pitfalls.md) | Concurrency contract, overflow scenarios, residual risks, roadmap |
 
 Start with [doc/README.md](doc/README.md) for a suggested reading order.
-Per-package API reference is available via godoc: `go doc lnn/tensor`,
-`go doc lnn/autograd`, `go doc lnn/nn`.
+Per-package API reference is available via godoc: `go doc github.com/qorm/LNN/tensor`,
+`go doc github.com/qorm/LNN/autograd`, `go doc github.com/qorm/LNN/nn`.
 
 ## Installation
 
-The module path is the bare name `lnn` and there is no vanity import URL, so
-`go get` over the network does not resolve it. Until the module is published,
-vendor it with a `replace` directive:
+The module path is `github.com/qorm/LNN`; fetch it with:
 
 ```
-git clone <this repository> LNN
+go get github.com/qorm/LNN@latest
+```
+
+To work from source instead, clone the repository and point your app's
+`go.mod` at the checkout with a `replace` directive:
+
+```
+git clone https://github.com/qorm/LNN.git
 ```
 
 ```go
@@ -55,9 +62,9 @@ module myapp
 
 go 1.26
 
-require lnn v0.0.0
+require github.com/qorm/LNN v0.0.0
 
-replace lnn => ../LNN
+replace github.com/qorm/LNN => ../LNN
 ```
 
 Inside the repository itself, `make build` / `make test` work as-is.
@@ -83,8 +90,8 @@ import (
 	"fmt"
 	"math/rand"
 
-	"lnn/autograd"
-	"lnn/tensor"
+	"github.com/qorm/LNN/autograd"
+	"github.com/qorm/LNN/tensor"
 )
 
 func main() {
@@ -174,6 +181,10 @@ out2, h2 := cfc.Step(x, nil, 0.1)
 `examples/ltc-sequence` puts this together into a complete training loop
 (hand-rolled SGD over `nn.ParametersOf(cell, readout)`) on a toy sequence
 task — run it with `go run ./examples/ltc-sequence`.
+`examples/cfc-sequence` runs the same task with the CfC cell and the
+recommended production form — caller-owned gradient-norm clipping plus
+`optimizer.NewSGD` + `Step` — with the loss falling from `0.620651` to
+`0.029091`.
 
 ## Numerics and scale
 
@@ -198,10 +209,12 @@ task — run it with `go run ./examples/ltc-sequence`.
   kept alive by the computation graph, so memory grows with the number of
   ops. An LTC step unrolls `unfolds` ODE iterations into the graph, each
   `O(units)` vector blocks plus two MatMul contractions — down from
-  `O(units²)` per-synapse nodes since the synapse vectorization
-  (`LTCStep` 3,440 allocs/op, −53%; `UnrollBackward` 68,688, −43%). Keep
-  `units`, `unfolds` and sequence length modest on this engine; the `CfC`
-  cell ([doc/cfc.md](doc/cfc.md)) has no `unfolds` factor at all.
+  `O(units²)` per-synapse nodes since the synapse vectorization, and the
+  phase-7 backward overhaul halved the per-node allocations again
+  (measured: `LTCStep` 2,442 allocs/op, `UnrollBackward` 33,963 —
+  cumulative −67%/−72% from the original loop). Keep `units`, `unfolds`
+  and sequence length modest on this engine; the `CfC` cell
+  ([doc/cfc.md](doc/cfc.md)) has no `unfolds` factor at all.
 
 ## Concurrency contract
 
@@ -220,24 +233,32 @@ goroutines.
 
 ## Status and roadmap
 
-Honest maturity assessment as of this commit:
+Honest maturity assessment as of this commit (coverage measured with
+`go test -cover`, in-package):
 
 | Package | Status |
 |---|---|
-| `tensor` | Core is stable and well tested (~90% line coverage). Some defensive checks (overflow-safe sizing, empty-input edge cases) are being hardened. |
-| `autograd` | Stable and well tested (~98% line coverage); gradients pass finite-difference checks on the covered paths. |
+| `tensor` | Core is stable and well tested (~82% line coverage). Some defensive checks (overflow-safe sizing, empty-input edge cases) are being hardened. The transpose-aware MatMul kernels added in phase 7 are exercised through the `autograd` package's tests rather than `tensor`'s own, which is most of the gap to the ~90% measured before that rework. |
+| `autograd` | Stable and well tested (~87% line coverage); gradients pass finite-difference and bitwise-differential checks on the covered paths. The phase-7 backward overhaul added defensive legacy-composition fallback branches for irregular manually seeded gradients, and those fallbacks account for most of the uncovered statements. |
 | `nn` | Functional and well tested (~99% line coverage): the LTC and CfC forward/backward paths are regression-tested, including closed-form degenerate-case checks, tiny/NaN `ts` guards, and wiring validation. Reversal potentials are fixed ±1 constants in both cells, not trainable. CfC is a phase-6 feature and its API may still evolve. |
 | `optimizer` | Stable, 100% line coverage: the three update rules are verified against independent reference implementations (SGD bit-for-bit, Adam ~1.6e-6 vs a float64 reference), and the pointer-keyed state semantics are regression-tested. |
+| `serialize` | Stable, 97.8% line coverage: round-trip bit-exactness (NaN and −0 included) is regression-tested; the hostile-stream contract — fixed limits validated before allocation, progressive allocation on unknown-length readers — is pinned by allocation-count tests; and red-team mutation fuzzing produced zero panics across 7,500 mutants, plus a further 1,200 after the resource-exhaustion hardening. The resource bounds are documented in [doc/persistence.md](doc/persistence.md). |
 
 The CfC (Closed-form Continuous-time) cell and built-in optimizers
-shipped in phase 6: `nn.CfC` ([doc/cfc.md](doc/cfc.md)) is a new
-feature whose API may still evolve, and the `optimizer` package
-(SGD/Momentum/Adam) is stable — the hand-rolled loop remains valid and
-is still the basis for understanding the engine. Sequence unrolling is
-covered by the generic `nn.Unroll` helper, and `examples/ltc-sequence`
-shows the end-to-end training pattern. Remaining roadmap:
-serialization (Save/Load) — the full technical-debt table is tracked in
-[doc/pitfalls.md](doc/pitfalls.md).
+shipped in phase 6, and serialization plus the autograd backward
+overhaul in phase 7: `nn.CfC` ([doc/cfc.md](doc/cfc.md)) is a feature
+whose API may still evolve; the `optimizer` package
+(SGD/Momentum/Adam) and the `serialize` package plus the six `nn`
+Save/Load functions ([doc/persistence.md](doc/persistence.md)) are
+stable. The hand-rolled loop remains valid and is still the basis for
+understanding the engine. Sequence unrolling is covered by the generic
+`nn.Unroll` helper; `examples/ltc-sequence` shows the end-to-end
+training pattern with hand-rolled SGD, and `examples/cfc-sequence` the
+same task with the CfC cell and the recommended optimizer form (loss
+`0.621 → 0.029`). The remaining roadmap is the technical-debt table in
+[doc/pitfalls.md](doc/pitfalls.md) — headlined by the Sigmoid–Hadamard
+fused backward (#13), `tensor.New`'s fixed per-node overhead (#12) and
+the CfC's `erev` dead gradients (#10).
 
 Track the remediation plan and progress in `PLAN.md` and `PROGRESS.md`.
 

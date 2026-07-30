@@ -5,8 +5,8 @@ import (
 	"math/rand"
 	"testing"
 
-	"lnn/autograd"
-	"lnn/tensor"
+	"github.com/qorm/LNN/autograd"
+	"github.com/qorm/LNN/tensor"
 )
 
 // Compile-time interface checks.

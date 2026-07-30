@@ -3,7 +3,7 @@ package optimizer
 import (
 	"fmt"
 
-	"lnn/autograd"
+	"github.com/qorm/LNN/autograd"
 )
 
 // Momentum is classical heavy-ball SGD with one velocity buffer per

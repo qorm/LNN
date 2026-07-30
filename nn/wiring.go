@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"math/rand"
 
-	"lnn/tensor"
+	"github.com/qorm/LNN/tensor"
 )
 
 // Wiring describes the synapse topology of an LTC cell as binary masks.

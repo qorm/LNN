@@ -7,9 +7,9 @@ import (
 	"math"
 	"math/rand"
 
-	"lnn/autograd"
-	"lnn/serialize"
-	"lnn/tensor"
+	"github.com/qorm/LNN/autograd"
+	"github.com/qorm/LNN/serialize"
+	"github.com/qorm/LNN/tensor"
 )
 
 // This file adds model-level persistence (Save/Load) for the LTC and CfC

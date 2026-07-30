@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"lnn/autograd"
-	"lnn/tensor"
+	"github.com/qorm/LNN/autograd"
+	"github.com/qorm/LNN/tensor"
 )
 
 // TestCfCForwardSmoke is the forward-pass regression: the closed-form cell

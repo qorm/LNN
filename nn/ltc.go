@@ -5,8 +5,8 @@ import (
 	"math"
 	"math/rand"
 
-	"lnn/autograd"
-	"lnn/tensor"
+	"github.com/qorm/LNN/autograd"
+	"github.com/qorm/LNN/tensor"
 )
 
 // ltcEps is the membrane-update epsilon guarding the num/den division.

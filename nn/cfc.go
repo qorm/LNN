@@ -5,8 +5,8 @@ import (
 	"math"
 	"math/rand"
 
-	"lnn/autograd"
-	"lnn/tensor"
+	"github.com/qorm/LNN/autograd"
+	"github.com/qorm/LNN/tensor"
 )
 
 // CfC is a Closed-form Continuous-time cell, the successor to the LTC of

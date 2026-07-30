@@ -14,7 +14,7 @@
 | 4 | 红队复审 + 全量验证 | ✅ 完成（裁决：生产就绪，置信度 ~90%） |
 | 5 | 技术债清扫 + 工程成熟度（Benchmark/CI/双语文档） | ✅ 完成 |
 | 6 | 双轨扩展：特性（optimizer/CfC）+ 性能（热路径向量化） | ✅ 完成 |
-| 7 | 双轨再进：序列化特性 + autograd 深改 | 🔄 进行中（7a/7b ✅，7c+ 迁移中 → 7c 文档 → 发布） |
+| 7 | 双轨再进：序列化特性 + autograd 深改 + 发布 | ✅ 完成 |
 
 ## 阶段 1：并行分析（已完成）
 
@@ -207,6 +207,10 @@
 **⚠️ 主控更正**：前条 P-B 摘要中"96,000 图严格 == 零失败（含 ±0）"的表述**仅在实施方生成器覆盖域内成立**——红队以异源生成器在 1D 怪癖×广播组合与 NaN 梯域发现 F1-F3。P-B 的门禁机制本身有效（负对照可侦测、确曾拦截 FMA 与升维两缺陷），短板在覆盖域；教训：差分 fuzz 的裁决力不超过生成器的想象力，异源生成器交叉是必需而非可选
 
 **红队·序列化组（已完成）**：7,500 变异体（位翻转/删除/插入/块交换，25% 叠连击）**0 panic / 0 静默错乱**（黑盒 oracle 重序列化核验掩码二值/形状/Step 健全；7 例"ok 垃圾入参"均为参数含 NaN/Inf 的忠实复现）；语义攻击全挡（张量顺序偷换/掩码注入 0.5/−1/2/NaN/跨 kind/未知 kind/version 0·2·99·255/UTF-16/大端伪流）；错误全透传（写端每个截断点、读端多偏移）；round-trip **训练动力学逐位等价**（加载后再训练 3 步的参数轨迹与同步训练锁死、种子无关）。**资源耗尽维度不安全**：F1 Medium——**无 Len() 读端**（网络/管道/gzip）绕过剩余字节守卫，~20 字节截断流逼出 64MiB～**4GiB** 分配（make 在读之前）；F2 Medium——`unfolds` 无上限，1<<20 展开 2.26s、1<<30 外推单次 Step ~38 分钟 CPU 耗尽（CfC 免疫）；F3 Low——count=maxCount−1 强分 8MiB 指针切片；F4 Low——加载不校验 erev∈{±1}（可造 NewLTC 永不能产生的细胞）；F5 Info——LoadParameters 保留陈旧 Grad 未文档化；F6 Info——限额私有且包注释"绝不无界分配"措辞掩盖 F1。**裁决：panic/语义维度安全，资源耗尽维度需补防——已派发修复（发布前置条件）**
+
+**7c 双语文档同步（已完成）**：7 工单全部落地。新建 **doc/persistence.md 双语篇**（LNNS 格式规格表 + 六 API + 不可信流安全契约逐条回源 + 训练→保存→加载→续训示例 /tmp 实测逐字入文：60 轮训练→SaveCfC 1859B+WriteParameters 71B→异 seed 加载 Step 逐位相同→续训与无中断同迭代打印逐位吻合→恶意流三连全 error）；architecture.md 双语新增「梯度缓冲区移交非克隆」与「融合反向+FMA 屏障」两节、五基准数字刷新；README 双版加 serialize 行、**删除过时的序列化路线图句**、补 cfc-sequence；pitfalls 路线图表刷新 + 新增§10 持久化安全边界；doc 索引阅读顺序改 training→persistence→ltc→cfc→…；30+ 条 ltc/cfc 行号回源**零偏差**。**回源反查修正 7 处偏差**：覆盖率实测改写——serialize 97.4%→**97.8%**（加固新增测试），**tensor 89.5%→81.7% / autograd 97.8%→87.1%**（深改新增 MatMulTransA/B 跨包代码与防御性回退分支未覆盖，README 如实注明降幅成因不掩饰）；pitfalls 两处旧行号（Div 171-194→725-742、GatherRows 271→791）；6 处"反向闭包"过时措辞；全文档 allocs 旧值刷新（3,440/68,688→2,442/33,963，基线统一 7,360/120,163）；"少于 50 次分配"措辞修正为"不超过 50 次"（与测试断言方向一致）。终检：gauntlet 全绿、18 篇 md 零断链、中英九对同构、非文档文件零触碰
+
+**模块路径迁移（7c+，已完成）**：`module lnn` → **`module github.com/qorm/LNN`**，37 文件 187 行纯路径替换（go.mod + 27 .go 文件 45 对 import + 8 篇文档代码块 + 双版 Installation 重写为 `go get github.com/qorm/LNN@latest` 正式写法、replace 降级为源码备选）。核查：`grep '"lnn/'` 残留 **0**、活文档路径残留 **0**、五包 `-race` 全绿（包名已为 github.com/qorm/LNN/*）、两 example 输出**逐字节不变**、/tmp 下游消费者模拟五包 API 调用通过、外部 URL（ncps/CfC/DOI）零误伤、PLAN/PROGRESS 历史档案保留裸名。6 项判断性取舍留档（错误串 "not an lnn tensor stream"、表头自称、Makefile 注释等名字语境不改）
 
 **用户指示（阶段 7 期间追加）**：①README 致谢 LNN 相关团队——**主控已双语落地**（Hasani/Lechner/Amini/Rus/Grosu 两位论文、mlech26l/ncps、raminmh/CfC、MIT CSAIL/TU Wien/IST Austria/Liquid AI）；②项目发布至 **github.com/qorm/LNN**——`gh auth` 确认 qorm 账号已登录；发布编排纳入 7c+：**模块路径迁移 `lnn` → `github.com/qorm/LNN`**（go.mod + 全仓 import + 双语文档代码块 + godoc 交叉引用，API 破坏性但发布必需，等 7a/7b 代码定型后统一执行）→ Installation 段改 `go get` → 仓库创建/推送/tag/CI 徽章
 

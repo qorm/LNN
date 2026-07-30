@@ -26,8 +26,8 @@ import (
 	"fmt"
 	"math/rand"
 
-	"lnn/autograd"
-	"lnn/tensor"
+	"github.com/qorm/LNN/autograd"
+	"github.com/qorm/LNN/tensor"
 )
 
 func main() {
@@ -85,7 +85,7 @@ epoch 199  loss=0.000000  w=2.0000  b=1.0000
 
 - **每轮迭代都构建新图**（上面的循环每轮重跑前向算子）。对*同一张*图调用两次 `Backward` 是有定义的，但会让叶梯度翻倍——见 [pitfalls.md](pitfalls.md)。
 - **`ZeroGrad` 要在 `Backward` 之前，绝不在之后**——梯度按设计会跨调用、跨图地累加进叶节点。
-- **前向与 `Backward` 之间不要修改参数的 `Data`：** 少数反向闭包在反向时读取父节点数据，因此原地更新必须严格放在反向传播（backpropagation）之后。
+- **前向与 `Backward` 之间不要修改参数的 `Data`：** 少数反向步骤在反向时读取父节点数据，因此原地更新必须严格放在反向传播（backpropagation）之后。
 
 ## 从 nn 模块聚合参数
 

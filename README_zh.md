@@ -12,10 +12,11 @@ lnn 小而显式。它宁可牺牲覆盖面，也要保证内核可读、可审�
 
 | 包 | 职责 |
 |---|---|
-| `lnn/tensor` | 稠密行主序 `float32` 张量，聚焦 1D/2D 的算子集：矩阵乘、带有限广播（broadcasting）的逐元素运算、激活、归约、切片、随机初始化。 |
-| `lnn/autograd` | 动态计算图（computation graph）引擎。每个算子在其输出 `Variable` 上记录一个反向闭包；`Backward` 按逆拓扑序遍历计算图，将梯度累加（gradient accumulation）到叶节点（leaf）。 |
-| `lnn/nn` | 神经网络构件：`Linear` 层、`Wiring` 突触（synapse）拓扑、`LTC` 液态细胞及其闭式（closed-form）兄弟细胞 `CfC`，以及在序列上驱动循环细胞的 `Cell`/`Unroll` 抽象。 |
-| `lnn/optimizer` | 作用于 `autograd` 的显式参数更新规则：SGD、经典重球动量（momentum）Momentum、Adam（Kingma & Ba，含偏差校正（bias correction））。一次 `Step(params)` 调用替换手写更新循环。 |
+| `github.com/qorm/LNN/tensor` | 稠密行主序 `float32` 张量，聚焦 1D/2D 的算子集：矩阵乘、带有限广播（broadcasting）的逐元素运算、激活、归约、切片、随机初始化。 |
+| `github.com/qorm/LNN/autograd` | 动态计算图（computation graph）引擎。每个算子给其输出 `Variable` 打上算子种类（op kind）标签；`Backward` 按逆拓扑序遍历计算图，派发每个节点的梯度传播，将梯度累加（gradient accumulation）到叶节点（leaf）。 |
+| `github.com/qorm/LNN/nn` | 神经网络构件：`Linear` 层、`Wiring` 突触（synapse）拓扑、`LTC` 液态细胞及其闭式（closed-form）兄弟细胞 `CfC`，以及在序列上驱动循环细胞的 `Cell`/`Unroll` 抽象。 |
+| `github.com/qorm/LNN/optimizer` | 作用于 `autograd` 的显式参数更新规则：SGD、经典重球动量（momentum）Momentum、Adam（Kingma & Ba，含偏差校正（bias correction））。一次 `Step(params)` 调用替换手写更新循环。 |
+| `github.com/qorm/LNN/serialize` | 带版本的二进制持久化：紧凑的小端序张量流（`"LNNS"`，version 1），其加载路径把输入视为不可信——一切失败都是 error（绝不 panic），尺寸声明先校验后分配，未知长度读端渐进分配。它是 `nn` 六个 Save/Load 函数背后的存储层。 |
 
 ## 文档
 
@@ -24,6 +25,7 @@ lnn 小而显式。它宁可牺牲覆盖面，也要保证内核可读、可审�
 | 指南 | 内容 |
 |---|---|
 | [doc/zh/training.md](doc/zh/training.md) | 手写训练循环与 `optimizer` 包（SGD/Momentum/Adam）、梯度裁剪（gradient clipping）、发散排查清单 |
+| [doc/zh/persistence.md](doc/zh/persistence.md) | `"LNNS"` 线上格式规格、六个 Save/Load 函数、不可信流安全契约、可运行的「训练→保存→加载→续训」示例 |
 | [doc/zh/shapes-and-broadcasting.md](doc/zh/shapes-and-broadcasting.md) | 广播规则表、归约输出形状、非对称约定 |
 | [doc/zh/ltc.md](doc/zh/ltc.md) | LTC 论文↔代码对照、参数表、`ts` 契约、接线（wiring） |
 | [doc/zh/cfc.md](doc/zh/cfc.md) | CfC 闭式细胞：Lemma 1 论文对照、exprel 稳定化、与 LTC 的关系 |
@@ -31,15 +33,21 @@ lnn 小而显式。它宁可牺牲覆盖面，也要保证内核可读、可审�
 | [doc/zh/pitfalls.md](doc/zh/pitfalls.md) | 并发契约、溢出场景、残余风险、路线图 |
 
 建议的阅读顺序见 [doc/zh/README.md](doc/zh/README.md)。
-各包的 API 参考以 godoc 为准：`go doc lnn/tensor`、`go doc lnn/autograd`、`go doc lnn/nn`。
+各包的 API 参考以 godoc 为准：`go doc github.com/qorm/LNN/tensor`、`go doc github.com/qorm/LNN/autograd`、`go doc github.com/qorm/LNN/nn`。
 按 Go 社区惯例，godoc 注释（包括三个 `doc.go`）保持英文；本中文版文档与英文 `doc/` 一一对应，可交叉查阅。
 
 ## 安装
 
-模块路径就是裸名 `lnn`，没有 vanity import URL，因此 `go get` 无法通过网络解析它。在模块正式发布之前，请用 `replace` 指令就地引用：
+模块路径为 `github.com/qorm/LNN`，直接获取：
 
 ```
-git clone <this repository> LNN
+go get github.com/qorm/LNN@latest
+```
+
+若要从源码工作，克隆仓库并用 `replace` 指令引用本地检出：
+
+```
+git clone https://github.com/qorm/LNN.git
 ```
 
 ```go
@@ -48,9 +56,9 @@ module myapp
 
 go 1.26
 
-require lnn v0.0.0
+require github.com/qorm/LNN v0.0.0
 
-replace lnn => ../LNN
+replace github.com/qorm/LNN => ../LNN
 ```
 
 在仓库内部，`make build` / `make test` 开箱即用。
@@ -68,8 +76,8 @@ import (
 	"fmt"
 	"math/rand"
 
-	"lnn/autograd"
-	"lnn/tensor"
+	"github.com/qorm/LNN/autograd"
+	"github.com/qorm/LNN/tensor"
 )
 
 func main() {
@@ -155,7 +163,7 @@ cfc := nn.NewCfC(4, 8, nil, rng)
 out2, h2 := cfc.Step(x, nil, 0.1)
 ```
 
-`examples/ltc-sequence` 把这些拼成了一个完整的训练循环（对 `nn.ParametersOf(cell, readout)` 做手写 SGD），任务是一个玩具序列任务——运行方式：`go run ./examples/ltc-sequence`。
+`examples/ltc-sequence` 把这些拼成了一个完整的训练循环（对 `nn.ParametersOf(cell, readout)` 做手写 SGD），任务是一个玩具序列任务——运行方式：`go run ./examples/ltc-sequence`。`examples/cfc-sequence` 在同一任务上换用 CfC 细胞与推荐的生产形态——调用方负责的全局梯度范数裁剪加 `optimizer.NewSGD` + `Step`——损失从 `0.620651` 降到 `0.029091`。
 
 ## 数值与规模
 
@@ -170,7 +178,7 @@ out2, h2 := cfc.Step(x, nil, 0.1)
 
   其他任何组合都会 panic，并附说明性消息。
 - **形状约定并非完全对称**（例如 `SumRows` 返回 `[1,n]` 而 `SumCols` 返回 `[m]`，1D⊕1D 的结果会被提升为 `[1,n]`）。依赖某个归约的输出形状之前，请先读 `tensor/ops.go` 里的文档注释。
-- **计算图保留到 `Backward` 为止。** 每个中间张量都被计算图持有，因此内存随算子数量增长。一次 LTC step 会把 `unfolds` 轮 ODE 迭代展开进图，自突触向量化起每轮是 O(units) 个向量块加两次 MatMul 收缩——从 O(units²) 个逐突触节点降下来（`LTCStep` 3,440 allocs/op，−53%；`UnrollBackward` 68,688，−43%）。在这个引擎上，`units`、`unfolds` 和序列长度请保持适度；`CfC` 细胞（[doc/zh/cfc.md](doc/zh/cfc.md)）则完全没有 `unfolds` 因子。
+- **计算图保留到 `Backward` 为止。** 每个中间张量都被计算图持有，因此内存随算子数量增长。一次 LTC step 会把 `unfolds` 轮 ODE 迭代展开进图，自突触向量化起每轮是 O(units) 个向量块加两次 MatMul 收缩——从 O(units²) 个逐突触节点降下来，而阶段 7 的反向深改又把逐节点分配数砍掉一半（实测：`LTCStep` 2,442 allocs/op、`UnrollBackward` 33,963——较最初循环累计 −67%/−72%）。在这个引擎上，`units`、`unfolds` 和序列长度请保持适度；`CfC` 细胞（[doc/zh/cfc.md](doc/zh/cfc.md)）则完全没有 `unfolds` 因子。
 
 ## 并发契约
 
@@ -184,16 +192,17 @@ out2, h2 := cfc.Step(x, nil, 0.1)
 
 ## 状态与路线图
 
-截至本提交的诚实成熟度评估（覆盖率为 `go test -cover` 实测）：
+截至本提交的诚实成熟度评估（覆盖率为 `go test -cover` 包内实测）：
 
 | 包 | 状态 |
 |---|---|
-| `tensor` | 核心稳定、测试充分（约 90% 行覆盖率）。部分防御性检查（溢出安全的尺寸计算、空输入边界情形）仍在加固中。 |
-| `autograd` | 稳定、测试充分（约 98% 行覆盖率）；已覆盖路径上的梯度均通过有限差分检验。 |
+| `tensor` | 核心稳定、测试充分（约 82% 行覆盖率）。部分防御性检查（溢出安全的尺寸计算、空输入边界情形）仍在加固中。阶段 7 新增的转置感知 MatMul 内核是由 `autograd` 包的测试（而非 `tensor` 自己的测试）覆盖的，与深改前约 90% 实测值的差距主要来自这里。 |
+| `autograd` | 稳定、测试充分（约 87% 行覆盖率）；已覆盖路径上的梯度均通过有限差分与逐位差分检验。阶段 7 的反向深改为异形手设梯度新增了防御性的旧组合回退分支，未覆盖语句大多在这些回退上。 |
 | `nn` | 可用、测试充分（约 99% 行覆盖率）：LTC 与 CfC 的前向/反向路径有回归测试，包括闭式退化情形检验、微小/NaN `ts` 防护和接线校验。两个细胞的反转电位都是固定的 ±1 常量，不可训练。CfC 是阶段 6 的新特性，API 仍可能演进。 |
 | `optimizer` | 稳定，100% 行覆盖率：三条更新规则均与独立参考实现对照验证（SGD 逐位一致，Adam 对 float64 参考最大偏差约 1.6e-6），指针键状态语义有回归测试。 |
+| `serialize` | 稳定，97.8% 行覆盖率：round-trip 逐位精确性（含 NaN 与 −0）有回归测试；不可信流契约——固定限额先校验后分配、未知长度读端渐进分配——以分配计数测试钉住；红队变异模糊 7,500 个变异体 0 panic，资源耗尽加固后再测 1,200 个依然 0 panic。资源边界文档见 [doc/zh/persistence.md](doc/zh/persistence.md)。 |
 
-CfC（Closed-form Continuous-time）细胞与内置优化器已在阶段 6 落地：`nn.CfC`（[doc/zh/cfc.md](doc/zh/cfc.md)）是 API 仍可能演进的新特性，`optimizer` 包（SGD/Momentum/Adam）已稳定——手写循环依然有效，也仍是理解引擎的基础。序列展开由通用的 `nn.Unroll` 助手覆盖，`examples/ltc-sequence` 展示了端到端训练范式。剩余路线图：序列化（Save/Load）——完整的技术债表追踪于 [doc/zh/pitfalls.md](doc/zh/pitfalls.md)。
+CfC（Closed-form Continuous-time）细胞与内置优化器在阶段 6 落地，序列化与 autograd 反向深改在阶段 7 落地：`nn.CfC`（[doc/zh/cfc.md](doc/zh/cfc.md)）是 API 仍可能演进的特性；`optimizer` 包（SGD/Momentum/Adam）与 `serialize` 包加 `nn` 的六个 Save/Load 函数（[doc/zh/persistence.md](doc/zh/persistence.md)）已稳定。手写循环依然有效，也仍是理解引擎的基础。序列展开由通用的 `nn.Unroll` 助手覆盖；`examples/ltc-sequence` 以手写 SGD 展示端到端训练范式，`examples/cfc-sequence` 在同一任务上展示 CfC 细胞加推荐 optimizer 形态（损失 `0.621 → 0.029`）。剩余路线图即 [doc/zh/pitfalls.md](doc/zh/pitfalls.md) 的技术债表——领衔的是 Sigmoid–Hadamard 融合反向（#13）、`tensor.New` 的逐节点固定开销（#12）与 CfC 的 `erev` 死梯度（#10）。
 
 修复计划与进展追踪见 `PLAN.md` 和 `PROGRESS.md`。
 

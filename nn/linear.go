@@ -4,8 +4,8 @@ import (
 	"math"
 	"math/rand"
 
-	"lnn/autograd"
-	"lnn/tensor"
+	"github.com/qorm/LNN/autograd"
+	"github.com/qorm/LNN/tensor"
 )
 
 // Linear is a fully connected layer: y = x @ W + b.

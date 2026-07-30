@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"math"
 
-	"lnn/autograd"
+	"github.com/qorm/LNN/autograd"
 )
 
 // Adam implements the Adam update of Kingma & Ba, "Adam: A Method for

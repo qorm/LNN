@@ -77,7 +77,7 @@ num = MatMul(flat, numReduce)                      // num[:,j] = Σᵢ blocksᵢ
 
 **等价性在 Step 层面是 ULP 级的——不是逐位。** 孤立的向量化驱动与旧的逐突触循环逐位相同（`nn/ltc_test.go` 的 `TestLTCSynapsesVectorizedEquivalence` 以严格 `==` 回归测试：mask ∈ {0,1} 加上升序收缩次序精确复现旧的 `Add` 链，舍入次序无任何变化）。但整个 `Step` 把 `eps` 和 Step 常量项（`gleak⊙vleak`、感知电流）提升到展开循环之外，改变了 `float32` 的结合次序。红队的独立 oracle——从 git 历史提取重写前的 `ltc.go`，在 13 组随机化配置上差分测试——实测最大差：前向 **1.79e-7**、全参数 BPTT 梯度 **1.19e-7**：ULP 级、良性，但不是"逐位"。
 
-实测的开销降幅（同机，`-benchtime=100x`，复验过）：`LTCStep` 7,360 → **3,440 allocs/op（−53.3%）**；`UnrollBackward` 120,163 → **68,688 allocs/op（−42.8%）**。每个 unfold 的图节点从 O(units²) 个逐突触节点降为 O(units) 个向量块加两次收缩；example 的首轮 loss 仍是 `0.690761`，与重写前逐位一致。
+向量化本身的实测开销降幅（同机，`-benchtime=100x`，复验过）：`LTCStep` 7,360 → **3,440 allocs/op（−53.3%）**；`UnrollBackward` 120,163 → **68,688 allocs/op（−42.8%）**。每个 unfold 的图节点从 O(units²) 个逐突触节点降为 O(units) 个向量块加两次收缩；example 的首轮 loss 仍是 `0.690761`，与重写前逐位一致。（阶段 7 的 autograd 反向深改——见 [architecture.md](architecture.md)——在不改变图形态的前提下又把反向分配数砍掉约一半：当前值为 `LTCStep` **2,442**、`UnrollBackward` **33,963** allocs/op。）
 
 ## 半隐式欧拉的推导
 

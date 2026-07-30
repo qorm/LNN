@@ -4,7 +4,7 @@ import (
 	"math/rand"
 	"testing"
 
-	"lnn/tensor"
+	"github.com/qorm/LNN/tensor"
 )
 
 // benchSink keeps the compiler from optimizing benchmark results away.
