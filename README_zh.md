@@ -197,6 +197,17 @@ CfC（Closed-form Continuous-time）细胞与内置优化器已在阶段 6 落�
 
 修复计划与进展追踪见 `PLAN.md` 和 `PROGRESS.md`。
 
+## 致谢
+
+lnn 是在液态神经网络（Liquid Neural Networks）研究成果之上独立重写的 Go 实现。诚挚感谢：
+
+- **Ramin Hasani、Mathias Lechner、Alexander Amini、Daniela Rus、Radu Grosu**——液态时间常数网络（AAAI 2021）与闭式连续时间神经网络（《自然·机器智能》4, 992–1003, 2022）的作者，本库实现的方程即出自这两篇论文；
+- **Mathias Lechner** 与 [`mlech26l/ncps`](https://github.com/mlech26l/ncps) 参考实现——本库 LTC 与接线语义的对照基准；
+- [`raminmh/CfC`](https://github.com/raminmh/CfC) 官方 CfC 代码的作者——闭式细胞的交叉验证来源；
+- **MIT CSAIL、TU Wien、IST Austria 与 Liquid AI** 团队——液态神经网络的推进与开源。
+
+本 Go 移植版的一切错误与设计取舍均由我们自行承担。
+
 ## 开发
 
 ```

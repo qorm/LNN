@@ -14,6 +14,7 @@
 | 4 | 红队复审 + 全量验证 | ✅ 完成（裁决：生产就绪，置信度 ~90%） |
 | 5 | 技术债清扫 + 工程成熟度（Benchmark/CI/双语文档） | ✅ 完成 |
 | 6 | 双轨扩展：特性（optimizer/CfC）+ 性能（热路径向量化） | ✅ 完成 |
+| 7 | 双轨再进：序列化特性 + autograd 深改 | 🔄 进行中（7a 三路实施已派发） |
 
 ## 阶段 1：并行分析（已完成）
 
@@ -161,6 +162,20 @@
 | 实施 P-A | 性能 | `nn/ltc.go` synapses 向量化 + 掩码出热路径；门禁：allocs −50% 且三重正确性验证 | ✅ 已回报 |
 | 红队验证 | 验证 | CfC 论文符合度 + optimizer 更新式 + P-A 等价性（等 6a 落地） | ✅ 3/3 全部回报（三裁决皆 ✅） |
 | 文档同步 | 双语 | doc/ 与 doc/zh/ 全量同步 + README 路线图改写（等红队后，代码定型） | ✅ 已回报（8 工单全清，20 文件双语同构） |
+| 实施 F-C | 特性 | `serialize/` 二进制流包 + `nn/save.go`（LTC/CfC/Linear Save/Load，先校验后分配） | ✅ 已回报 |
+| 实施 F-D | 特性 | `examples/cfc-sequence`（CfC + optimizer 范式） | ✅ 已回报（loss 0.621→0.029，与 doc/cfc.md 六打印点逐值吻合） |
+| 实施 P-B | 性能 | autograd 反向分配深改（addGrad 去克隆 / broadcast 去闭包），零数值变化逐位门禁 | ✅ 已回报（−50.55%，门禁两度拦截真实缺陷） |
+
+**F-C（序列化，已完成）**：新建 4 文件（serialize 367+531 行 / nn/save 378+572 行），覆盖率 **serialize 97.4% / nn 99.2%**。格式：`"LNNS"` 魔数 + version=1 + 小端张量流（rank≤8、int64 形状、float32 LE、自定界拒尾字节）；模型流 kind 字节（0=LTC/1=CfC/2=Linear）+ header + 17 张量 blob（掩码×2 + 13 参数 + erev×2，顺序单点定义）。**V-05 纪律制度化**：`bits.Mul64` 溢出安全乘法 + maxElems/maxCount/maxRank 限额 + **先校验后分配**——`TestHostileDimDoesNotAllocate`/`TestHostileCountDoesNotAllocate` 以 `AllocsPerRun` 断言 1<<62 维与 0xFFFFFFFF 计数恶意流全程 <50 次小分配、不 OOM；恶意流十一连（bad magic/version=99/截断×2/尾字节/负维/rank=200/乘积溢出/掩码非二值/layout 偷换 [6]→[2,3]）全部语义化 error。**逐位复现保证**：round-trip 经 `Float32bits` 比对（NaN/−0 自等），加载后细胞 Step 输出 + 梯度与原细胞逐位相等（LTC 原位重建 erev 焙入的 numReduce 指示阵是关键一步）；Load 与 rng 种子无关。26 个测试含 quick.Check 200 轮随机 round-trip、跨 kind 互载 7 例、稀疏 wiring 保留、多步 Unroll 逐位。零反射零依赖、未碰任何既有文件——**README 路线图最后一项功能缺口闭合**
+
+**P-B（autograd 深改，已完成）**：留档 #9 销账。七步结构改造（每步独立可回退、过逐位门禁方进入下一步）：A. `addGrad` 首次贡献所有权移交（Clone 占比 19.8%→1.05%，含逐分支别名穷举——Add a 支 `SumToShapeTake` 直通、**b 支保留克隆**防两叶别名腐蚀、根种子在 `Backward()` 集中克隆/归还保 V-09 线性累加与手设种子完整性）；B. broadcastGetter 去闭包（14.2%→0，步长描述+特化内循环）；C. 一元反向链融合（Sigmoid/Tanh 4→1、Log/Pow 3→1 等，**忠实复刻 [1,n] 升维怪癖而非修正**）；D. MatMul 反向去 Transpose（新增 MatMulTransA/TransB，循环形态逐字同构）；E. 乘积-归约融合（hadamardReduce 直累）；F. 反向闭包→opKind 标签派发（~3,168 allocs/op，21 case 逐句等价）；G. 外积形状新鲜度直接采纳。
+- **逐位门禁（唯一正当性来源）**：差分 fuzz 96,000 图 × ~160 万节点（4 协议×8 种子×3,000 图，oracle 提取自 git 历史 1aab2de），前向+全叶梯度严格 `==` 且 `Float32bits` 相等（含 ±0），**0 失败**；**负对照**（篡改 oracle Sub 符号）200 图内 42 处差异即 FAIL——fuzz 非空转；example 11 个打印点与基线 **diff 逐字一致**（0.690761→0.041996）；既有数值断言一字未动全绿；新增 8 个别名专项探测
+- **门禁两度拦截真实缺陷并当场修复**：①arm64 FMA 融合漂移——融合循环被 SSA 匹配 FMADD/FNMS（单次舍入）vs 旧两步路径（两次舍入）→ 末位 1 ULP 漂移，以 `float32(float64(a)*float64(b))` 转换屏障修复（精确积 ≤48 位尾数在 float64 精确，舍入与硬件 float32 乘法逐位相同）；②1D 升维形状怪癖未复刻 → `elemwiseGradShape` 忠实复刻
+- **基准（−benchtime=100x −count=3）**：`UnrollBackward` 68,688→**33,963 allocs/op（−50.55% ✅ 越过 −50% 门禁）**、B/op −50.1%、ns −24%；ChainForwardBackward −57.7%、DivDenLoop −56.7%、LTCStep −29.0%、GatherRowsBackward −23.5%——**五基准全降零回归**。剩余剖析：tensor.New 64.9%（每节点前向输出+Shape/Data 双分配）为下一阶段候选（受阻于公共 API 禁区，留档#12）；Sigmoid-Hadamard 融合反向需新算子层（留档#13）
+
+**F-D（CfC 示例，已完成）**：`examples/cfc-sequence/main.go`——有界累加器任务，CfC(1→8)+Linear、`optimizer.NewSGD` + 手动范数裁剪组合范式（原地缩放梯度后 Step，数学等价于手搓 scale 写法）、显式 ZeroGrad 纪律；loss **0.620651→0.029091（−95.3%）**，两次运行 diff 为空（确定性），六个打印点与 doc/cfc.md 记录**逐值吻合**（双向锁定）
+
+**用户指示（阶段 7 期间追加）**：①README 致谢 LNN 相关团队——**主控已双语落地**（Hasani/Lechner/Amini/Rus/Grosu 两位论文、mlech26l/ncps、raminmh/CfC、MIT CSAIL/TU Wien/IST Austria/Liquid AI）；②项目发布至 **github.com/qorm/LNN**——`gh auth` 确认 qorm 账号已登录；发布编排纳入 7c+：**模块路径迁移 `lnn` → `github.com/qorm/LNN`**（go.mod + 全仓 import + 双语文档代码块 + godoc 交叉引用，API 破坏性但发布必需，等 7a/7b 代码定型后统一执行）→ Installation 段改 `go get` → 仓库创建/推送/tag/CI 徽章
 
 **文档同步（6c，已完成）**：8 工单全部落地，20 文件（18 改 2 新）双语同构：①7+ 处"无优化器"旧文案清零（全仓 grep 仅剩序列化一项真实未实现）；②training.md 双语新增 optimizer 用法节（Step 契约/梯度累积/超参热改/指针键语义/别名耦合警示）；③**新建 cfc.md 双语篇**（NMI 2022 正确出处 + "liquid cubic 非官方来源"命名警示 + Lemma 1 逐项对照 + exprel 稳定化 + 与 LTC 同 ODE 收敛阶 + 可运行示例实测 loss 0.621→0.029）；④ltc.md 行号表 18 行按重写后源码全量刷新 + 向量化小节 + **ULP 级等价诚实表述**；⑤架构/README 性能数字更新（O(units²)→O(units)）；⑥optimizer/doc.go 别名警示 + sgd.go 信任模型注释（纯注释，git diff 非注释行变更为空）；⑦双语索引与互链（126 条相对链接零断链）；⑧状态表更新（optimizer 行、CfC 行、nn 覆盖率 ~99%）。示例实测 7 组（含 SGD 与手写循环输出逐字一致、CfC vs LTC 收敛阶复测）。**反查新偏差 3 处并修正**：examples/main.go 注释旧文案（主控已补修）、英文版 training.md 裁剪段与中文版漂移（源码 seqLen=12，中文版正确，已统一）、nn 覆盖率 ~98%→~99%
 
@@ -223,7 +238,9 @@ Git 历史：`87ccf77` 基线 → `08aba45` 阶段3a → `102af40` 阶段3b → 
 | 8 | 三份源码内旧包注释与 doc.go 并存 | D3 发现 | 🟢 | go 1.26 下 doc.go 胜出、用户无感，未来可清理 |
 | 9 | Backward 阶段逐节点固定开销（tensor.New 46%/Clone 20%/broadcast 闭包 14%） | P-A pprof | 🟢 | UnrollBackward 再压缩需 autograd 层改动（Sigmoid-Hadamard 融合反向、addGrad 原地写入、去闭包），独立工单候选 |
 | 10 | CfC 的 erev/sErev 以 Var 叶入图产生死梯度 | CfC 红队 | Info | LTC 已焙入 Const 指示阵；CfC 可同法优化，正确性无碍（Parameters 排除⇒优化器不可达），微量浪费 |
-| 11 | `NewSGD(+Inf)` 被字面校验放行；构造后字段可改非法值 | optimizer 红队 | Info | 信任模型自洽且已文档化，sgd.go 拟补注释（6c 工单） |
+| 11 | `NewSGD(+Inf)` 被字面校验放行；构造后字段可改非法值 | optimizer 红队 | Info | 信任模型自洽且已文档化，sgd.go 注释已补（6c） |
+| 12 | tensor.New 每节点前向输出 + Shape/Data 双分配（终态 pprof 64.9%） | P-B | 🟢 | 进一步压缩需 parents 定长槽化（受阻既有结构断言测试）与 Tensor 定秩 Shape（公共 API 禁区），独立工单候选 |
+| 13 | Sigmoid-Hadamard 融合反向（LTC 热路径模式） | P-B | 🟢 | 需新算子层，收益/脆弱性比待评估，独立工单候选 |
 
 ## 变更日志
 

@@ -1,7 +1,8 @@
 // Package autograd implements a small dynamic computation-graph engine.
-// Every operation records a backward closure on its output Variable, and
-// Backward walks the graph in reverse topological order accumulating
-// gradients into leaf Variables (typically model parameters).
+// Every operation tags its output Variable with an op kind (plus any scalar
+// payload), and Backward walks the graph in reverse topological order,
+// dispatching each node's gradient propagation and accumulating gradients
+// into leaf Variables (typically model parameters).
 package autograd
 
 import (
@@ -11,13 +12,23 @@ import (
 )
 
 // Variable is a node in the computation graph: a tensor value plus its
-// accumulated gradient and the backward closure that propagates it.
+// accumulated gradient and the backward step that propagates it.
+//
+// Backward steps are dispatched on the op kind tag instead of a per-node
+// closure: a closure capture allocated a heap object per graph node (one of
+// the largest allocation sources in deep unrolled graphs), while the tag
+// adds a few bytes to this struct. The payload fields (scalar, from/to,
+// aux, idx) carry exactly the constants the former closures captured.
 type Variable struct {
 	Data *tensor.Tensor
 	Grad *tensor.Tensor
 
 	parents  []*Variable
-	backward func()
+	kind     opKind
+	scalar   float32        // Scale factor / Pow exponent
+	from, to int            // SliceCol column range / SliceRow row index
+	aux      *tensor.Tensor // Div's captured inverse of the denominator
+	idx      []int          // GatherRows indices (copied at construction)
 }
 
 // Var wraps a tensor as a graph leaf (e.g. a parameter or an input).
@@ -36,18 +47,24 @@ func New(data []float32, shape ...int) *Variable {
 func Const(t *tensor.Tensor) *Variable { return Var(t) }
 
 // newOp creates the output Variable of an operation and records its parents
-// and backward closure.
-func newOp(data *tensor.Tensor, parents []*Variable, backward func()) *Variable {
-	return &Variable{Data: data, parents: parents, backward: backward}
+// and op kind; runBackward dispatches the gradient propagation on the kind.
+func newOp(data *tensor.Tensor, parents []*Variable, kind opKind) *Variable {
+	return &Variable{Data: data, parents: parents, kind: kind}
 }
 
 // addGrad accumulates g into the variable's gradient buffer. It panics if the
 // incoming gradient's shape differs from the accumulated one: two tensors can
 // have the same element count yet incompatible layouts (e.g. [1, 6] vs [2,
 // 3]), and silently adding them elementwise would hide upstream shape bugs.
+//
+// On the first contribution addGrad takes ownership of g without cloning:
+// every backward closure passes either a freshly allocated tensor or a buffer
+// it dedicates to this call (see the per-op audit in ops.go), so no other
+// reference can observe later accumulation into it. Backward protects the
+// root seed the same way, handing the traversal a private buffer.
 func (v *Variable) addGrad(g *tensor.Tensor) {
 	if v.Grad == nil {
-		v.Grad = g.Clone()
+		v.Grad = g
 		return
 	}
 	if !tensor.SameShape(v.Grad, g) {
@@ -72,11 +89,18 @@ func (v *Variable) ZeroGrad() { v.Grad = nil }
 // gradients in place would make each rerun propagate through already-seeded
 // buffers and accumulate super-linearly.
 func (v *Variable) Backward() {
-	if v.Grad == nil {
+	seed := v.Grad
+	if seed == nil {
 		if !v.Data.IsScalar() {
 			panic(fmt.Sprintf("autograd.Backward: non-scalar output of shape %v needs a seeded Grad", v.Data.Shape))
 		}
 		v.Grad = v.Data.OnesLike()
+	} else {
+		// Propagate from a private copy. Backward closures may transfer
+		// ownership of the root's gradient buffer to a leaf (addGrad's
+		// clone-free first contribution), which would alias — and then
+		// corrupt — the caller-visible seed during later accumulation.
+		v.Grad = seed.Clone()
 	}
 	topo := make([]*Variable, 0, 16)
 	visited := make(map[*Variable]bool)
@@ -93,14 +117,22 @@ func (v *Variable) Backward() {
 	}
 	build(v)
 	for i := len(topo) - 1; i >= 0; i-- {
-		if topo[i].backward != nil {
-			topo[i].backward()
-		}
+		topo[i].runBackward()
 	}
 	for _, n := range topo {
 		if n != v && len(n.parents) > 0 {
 			n.Grad = nil
 		}
+	}
+	if seed == nil {
+		// The traversal may have handed the auto-seeded buffer to a leaf.
+		// Leave a fresh pristine seed behind so repeated Backward calls
+		// accumulate linearly (each run propagates ones again) and v.Grad
+		// stays inspectable, exactly as when addGrad cloned on arrival.
+		v.Grad = v.Data.OnesLike()
+	} else {
+		// Restore the caller's (never-propagated, never-mutated) seed.
+		v.Grad = seed
 	}
 }
 

@@ -241,6 +241,26 @@ serialization (Save/Load) — the full technical-debt table is tracked in
 
 Track the remediation plan and progress in `PLAN.md` and `PROGRESS.md`.
 
+## Acknowledgments
+
+lnn is an independent, from-scratch Go implementation built on the Liquid
+Neural Networks research. We gratefully acknowledge:
+
+- **Ramin Hasani, Mathias Lechner, Alexander Amini, Daniela Rus, and
+  Radu Grosu** for Liquid Time-constant Networks (AAAI 2021) and
+  Closed-form Continuous-time neural networks
+  (*Nature Machine Intelligence* 4, 992–1003, 2022) — the equations this
+  library implements;
+- **Mathias Lechner** for [`mlech26l/ncps`](https://github.com/mlech26l/ncps),
+  the reference implementation our LTC and wiring semantics were verified
+  against;
+- the authors of [`raminmh/CfC`](https://github.com/raminmh/CfC), the
+  official CfC code used to cross-check the closed-form cell;
+- the teams at **MIT CSAIL**, **TU Wien**, **IST Austria**, and
+  **Liquid AI** for advancing and open-sourcing liquid neural networks.
+
+All errors and design trade-offs in this Go port are our own.
+
 ## Development
 
 ```

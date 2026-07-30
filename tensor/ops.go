@@ -41,20 +41,85 @@ func Transpose(a *Tensor) *Tensor {
 	return out
 }
 
-// elemGetter resolves broadcasting: a tensor provides its value for output
-// position (i, j) of a 2D result with the given column count.
-type elemGetter func(i, j int) float32
+// MatMulTransA multiplies the transpose of a 2D tensor by another: a is
+// [m, k] and b is [m, n], and the result is aᵀ·b with shape [k, n]. It
+// evaluates exactly the same products and accumulation order as
+// MatMul(Transpose(a), b) — the transposed entries are read in place in the
+// same zero-skipping loop — without allocating the transpose. Used by the
+// autograd backward of MatMul.
+func MatMulTransA(a, b *Tensor) *Tensor {
+	if a.Dims() != 2 || b.Dims() != 2 || a.Rows() != b.Rows() {
+		panic(fmt.Sprintf("tensor.MatMulTransA: shapes %v and %v are incompatible", a.Shape, b.Shape))
+	}
+	m, k, n := a.Rows(), a.Cols(), b.Cols()
+	out := New(k, n)
+	for i := 0; i < k; i++ {
+		orow := out.Data[i*n : (i+1)*n]
+		for kk := 0; kk < m; kk++ {
+			av := a.Data[kk*k+i]
+			if av == 0 {
+				continue
+			}
+			brow := b.Data[kk*n : (kk+1)*n]
+			for j := 0; j < n; j++ {
+				orow[j] += av * brow[j]
+			}
+		}
+	}
+	return out
+}
 
-func broadcastGetter(t *Tensor, outCols int) elemGetter {
+// MatMulTransB multiplies a 2D tensor by the transpose of another: a is
+// [m, k] and b is [n, k], and the result is a·bᵀ with shape [m, n]. It
+// evaluates exactly the same products and accumulation order as
+// MatMul(a, Transpose(b)) — the transposed entries are read in place in the
+// same zero-skipping loop — without allocating the transpose. Used by the
+// autograd backward of MatMul.
+func MatMulTransB(a, b *Tensor) *Tensor {
+	if a.Dims() != 2 || b.Dims() != 2 || a.Cols() != b.Cols() {
+		panic(fmt.Sprintf("tensor.MatMulTransB: shapes %v and %v are incompatible", a.Shape, b.Shape))
+	}
+	m, k, n := a.Rows(), a.Cols(), b.Rows()
+	out := New(m, n)
+	for i := 0; i < m; i++ {
+		arow := a.Data[i*k : (i+1)*k]
+		orow := out.Data[i*n : (i+1)*n]
+		for kk := 0; kk < k; kk++ {
+			av := arow[kk]
+			if av == 0 {
+				continue
+			}
+			for j := 0; j < n; j++ {
+				orow[j] += av * b.Data[j*k+kk]
+			}
+		}
+	}
+	return out
+}
+
+// Broadcast participation modes. For output row i, an operand's element at
+// column j lives at Data[base+stride*j] with (base, stride) determined by its
+// mode: scalar (0, 0), column vector (i, 0), full matrix (i*cols, 1), row
+// vector (0, 1). The stride description replaces the former per-call closure
+// pair — pure data movement, so evaluation order and values are unchanged.
+// The classification order mirrors the historical dispatch exactly.
+const (
+	bcastScalar = iota
+	bcastCol
+	bcastFull
+	bcastRow
+)
+
+func bcastMode(t *Tensor) int {
 	switch {
 	case t.IsScalar():
-		return func(i, j int) float32 { return t.Data[0] }
+		return bcastScalar
 	case t.Dims() == 2 && t.Shape[1] == 1 && t.Shape[0] > 1: // column vector [m, 1]
-		return func(i, j int) float32 { return t.Data[i] }
+		return bcastCol
 	case t.Dims() == 2 && t.Shape[0] > 1: // full 2D, same shape as output
-		return func(i, j int) float32 { return t.Data[i*outCols+j] }
+		return bcastFull
 	case t.IsRowVec(): // [n] or [1, n]
-		return func(i, j int) float32 { return t.Data[j] }
+		return bcastRow
 	default:
 		panic(fmt.Sprintf("tensor: cannot broadcast shape %v", t.Shape))
 	}
@@ -65,47 +130,119 @@ func broadcastGetter(t *Tensor, outCols int) elemGetter {
 // 2D tensor, or size-1 dimensions (a [m, 1] column vector broadcasts against
 // [m, n], and [m, 1] x [1, n] produces the outer product [m, n]).
 func broadcastShape(a, b *Tensor) []int {
+	s, _ := broadcastShapeFresh(a, b)
+	return s
+}
+
+// broadcastShapeFresh is broadcastShape with a freshness flag: fresh is true
+// exactly when the returned slice was newly allocated (the outer-product
+// cases) and may therefore be adopted as a result tensor's Shape without a
+// defensive copy. The other cases return an operand's Shape, which must
+// never be shared with the output.
+func broadcastShapeFresh(a, b *Tensor) (shape []int, fresh bool) {
 	switch {
 	case SameShape(a, b):
-		return a.Shape
+		return a.Shape, false
 	case a.IsScalar():
-		return b.Shape
+		return b.Shape, false
 	case b.IsScalar():
-		return a.Shape
+		return a.Shape, false
 	case a.Dims() == 2 && b.IsRowVec() && a.Cols() == b.Size():
-		return a.Shape
+		return a.Shape, false
 	case b.Dims() == 2 && a.IsRowVec() && b.Cols() == a.Size():
-		return b.Shape
+		return b.Shape, false
 	case a.Dims() == 2 && a.Cols() == 1 && b.Dims() == 2 && b.Shape[0] == a.Shape[0]:
-		return b.Shape
+		return b.Shape, false
 	case b.Dims() == 2 && b.Cols() == 1 && a.Dims() == 2 && a.Shape[0] == b.Shape[0]:
-		return a.Shape
+		return a.Shape, false
 	case a.Dims() == 2 && a.Cols() == 1 && b.IsRowVec():
-		return []int{a.Shape[0], b.Size()}
+		return []int{a.Shape[0], b.Size()}, true
 	case b.Dims() == 2 && b.Cols() == 1 && a.IsRowVec():
-		return []int{b.Shape[0], a.Size()}
+		return []int{b.Shape[0], a.Size()}, true
 	default:
 		panic(fmt.Sprintf("tensor: shapes %v and %v are not broadcastable", a.Shape, b.Shape))
 	}
 }
 
+// newAdopting builds a zero-filled tensor that adopts shape as its Shape
+// field without copying. Only for freshly allocated shape slices that no
+// other tensor references (see broadcastShapeFresh).
+func newAdopting(shape []int) *Tensor {
+	t := &Tensor{Shape: shape}
+	t.Data = make([]float32, t.Size())
+	return t
+}
+
 func broadcastBinary(a, b *Tensor, f func(x, y float32) float32) *Tensor {
-	shape := broadcastShape(a, b)
+	shape, fresh := broadcastShapeFresh(a, b)
 	if len(shape) == 1 {
-		shape = []int{1, shape[0]}
+		shape, fresh = []int{1, shape[0]}, true
 	}
 	if len(shape) == 0 { // scalar x scalar
 		return FromData([]float32{f(a.Data[0], b.Data[0])}, 1)
 	}
-	out := New(shape...)
-	cols := shape[1]
-	ga, gb := broadcastGetter(a, cols), broadcastGetter(b, cols)
-	for i := 0; i < shape[0]; i++ {
-		for j := 0; j < cols; j++ {
-			out.Data[i*cols+j] = f(ga(i, j), gb(i, j))
+	// A fresh shape slice is adopted directly as the output's Shape; an
+	// operand-owned shape goes through New, which copies it.
+	var out *Tensor
+	if fresh {
+		out = newAdopting(shape)
+	} else {
+		out = New(shape...)
+	}
+	rows, cols := shape[0], shape[1]
+	ad, bd, od := a.Data, b.Data, out.Data
+	if SameShape(a, b) && a.Dims() == 2 {
+		// Fast path: both operands already have the output layout. The
+		// general loop below would index i*cols+j in exactly this order,
+		// so the flat walk evaluates f on the identical pair sequence.
+		for i := range od {
+			od[i] = f(ad[i], bd[i])
+		}
+		return out
+	}
+	ma, mb := bcastMode(a), bcastMode(b)
+	for i := 0; i < rows; i++ {
+		orow := od[i*cols : (i+1)*cols]
+		ab, as := bcastRowAccess(ma, i, cols)
+		bb, bs := bcastRowAccess(mb, i, cols)
+		switch {
+		case as == 1 && bs == 1:
+			for j := range orow {
+				orow[j] = f(ad[ab+j], bd[bb+j])
+			}
+		case as == 1: // b constant across the row
+			bv := bd[bb]
+			for j := range orow {
+				orow[j] = f(ad[ab+j], bv)
+			}
+		case bs == 1: // a constant across the row
+			av := ad[ab]
+			for j := range orow {
+				orow[j] = f(av, bd[bb+j])
+			}
+		default: // both constant across the row
+			orow[0] = f(ad[ab], bd[bb])
+			for j := 1; j < cols; j++ {
+				orow[j] = orow[0]
+			}
 		}
 	}
 	return out
+}
+
+// bcastRowAccess returns the (base, stride) describing where output row i
+// reads its operand values: Data[base+stride*j] for column j.
+func bcastRowAccess(mode, i, cols int) (base, stride int) {
+	switch mode {
+	case bcastScalar:
+		return 0, 0
+	case bcastCol:
+		return i, 0
+	case bcastFull:
+		return i * cols, 1
+	default: // bcastRow
+		return 0, 1
+	}
 }
 
 // Add computes a + b with broadcasting.
@@ -295,12 +432,27 @@ func SumCols(a *Tensor) *Tensor {
 // SumToShape reduces a broadcast-produced gradient back to a target shape:
 // identical shape passes through, scalars get the total sum, row vectors get
 // column sums, column vectors get row sums. It panics on any other
-// combination.
+// combination. The result never aliases grad.
 func SumToShape(grad *Tensor, shape []int) *Tensor {
+	r := SumToShapeTake(grad, shape)
+	if r == grad {
+		return grad.Clone()
+	}
+	return r
+}
+
+// SumToShapeTake reduces grad to shape exactly like SumToShape, but takes
+// ownership of grad: when the shapes already match, grad itself is returned
+// without a defensive clone, and the caller must not use grad afterwards.
+// The autograd backward path uses this to hand fresh, exclusively-owned
+// gradient temporaries straight to leaves; every reduction branch still
+// allocates a new tensor. SumToShape keeps the alias-free contract for all
+// other callers.
+func SumToShapeTake(grad *Tensor, shape []int) *Tensor {
 	target := &Tensor{Shape: shape}
 	switch {
 	case SameShape(grad, target):
-		return grad.Clone()
+		return grad
 	case target.IsScalar():
 		return SumAll(grad)
 	case grad.Dims() == 2 && target.IsRowVec() && grad.Cols() == target.Size():
