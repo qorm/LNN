@@ -511,19 +511,21 @@ roles, and the freeze they enforce is **graded by platform**:
   — FMA contraction, which rounds once where a non-fused path rounds per
   operation. An arm64 build and an amd64 build can therefore disagree
   by ≤ 1 ULP per contraction (exactly what CI measured: `0xbe8aa433` vs
-  `0xbe8aa430`). The vectors were generated on arm64 (Apple Silicon), so
-  on `GOARCH=arm64` the assertions below are strict — bit for bit and
-  byte for byte — while on any other architecture the skeleton stays
-  byte-frozen and every payload element is asserted within a **4 ULP**
-  window (four times the measured drift, still tight enough to reject
-  real corruption; `TestGoldenULPToleranceDiscriminates` pins that
-  teeth — 8 ULP fails, shape and count drift fail).
+  `0xbe8aa430`), and chains of contractions accumulate — CI measured up to
+  6 ULPs on CfC construction parameters, whose Box-Muller initialization
+  runs log/sqrt/sin/cos in sequence. The vectors were generated on arm64
+  (Apple Silicon), so on `GOARCH=arm64` the assertions below are strict —
+  bit for bit and byte for byte — while on any other architecture the
+  skeleton stays byte-frozen and every payload element is asserted within
+  a **16 ULP** window (~2.7× the observed maximum, still tight enough to
+  reject real corruption; `TestGoldenULPToleranceDiscriminates` pins that
+  teeth — 32 ULP fails, shape and count drift fail).
 
 - **`TestGoldenStreamsLoadBitExact` — the behavioral freeze.** Each
   committed stream loads, and the loaded cell's output matches the
   expected bit patterns exactly on the generating architecture
   (compared with `Float32bits`, so `NaN` and `−0` compare equal to
-  themselves), within the 4 ULP window elsewhere.
+  themselves), within the 16 ULP window elsewhere.
 - **`TestGoldenWriterStability` — the byte-level freeze.** Rebuilding
   each cell from its documented seed and re-saving yields a stream that is
   byte-for-byte identical to the committed one (`bytes.Equal`) on the

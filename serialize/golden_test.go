@@ -46,9 +46,11 @@
 //   - any other architecture: the format skeleton — magic, version, tensor
 //     count, ranks and shapes — is STILL asserted byte for byte, while
 //     each float32 payload element is asserted within goldenULPTolerance
-//     (4) ULPs: four times the measured drift, leaving headroom for FMA
-//     chains without losing teeth (a corrupted payload is still rejected,
-//     pinned by TestGoldenULPToleranceDiscriminates).
+//     (16) ULPs: the measured cross-architecture maximum is 6 ULPs (CfC
+//     Box-Muller construction chain; a Linear forward output drifted 1),
+//     so 16 bounds it with headroom for chained contractions without losing
+//     teeth (a corrupted payload is still rejected, pinned by
+//     TestGoldenULPToleranceDiscriminates).
 //
 // Self-checks that never leave the platform under test keep full
 // bit-exactness everywhere: FMA choices are fixed at compile time, so one
@@ -91,11 +93,14 @@ var writeGolden = flag.Bool("write-golden", false, "regenerate the committed gol
 const goldenStrictArch = runtime.GOARCH == "arm64"
 
 // goldenULPTolerance is the float32 payload window applied off the
-// generating architecture: 4 ULPs. CI measured a cross-architecture drift
-// of exactly 1 ULP; 4 leaves headroom for chained fused operations while
-// still rejecting real payload corruption (twice the window fails, pinned
-// by TestGoldenULPToleranceDiscriminates).
-const goldenULPTolerance uint32 = 4
+// generating architecture: 16 ULPs. CI measured cross-architecture drifts
+// of 1 ULP on a Linear forward output and up to 6 ULPs on CfC construction
+// parameters (the Box-Muller chain — log/sqrt/sin/cos — accumulates one
+// contraction per transcendental); 16 bounds that observed maximum with
+// ~2.7x headroom while still rejecting real payload corruption (twice the
+// window fails, pinned by TestGoldenULPToleranceDiscriminates — byte-level
+// corruption is orders of magnitude beyond 16 ULPs almost by definition).
+const goldenULPTolerance uint32 = 16
 
 // The documented construction seeds (see the file comment for the full
 // parameter list of each cell).
@@ -605,8 +610,8 @@ func TestGoldenWriterStability(t *testing.T) {
 // TestGoldenULPToleranceDiscriminates guards the guard: the graded window
 // must stay tight enough to reject real corruption. It drives the same
 // comparison core the platform-graded assertions use (goldenPayloadError)
-// with synthetic drift: ±(1-2) ULP and the exact boundary (4 ULP) must
-// pass; 8 ULP — twice the window — and tolerance+1 must fail; shape drift
+// with synthetic drift: ±(1-2) ULP and the exact boundary (16 ULP) must
+// pass; 32 ULP — twice the window — and tolerance+1 must fail; shape drift
 // and tensor-count drift must fail even with undisturbed payloads. It runs
 // on every platform, so the window's teeth are exercised on arm64 too,
 // where the golden assertions themselves stay bit-exact.
@@ -625,14 +630,14 @@ func TestGoldenULPToleranceDiscriminates(t *testing.T) {
 			t.Errorf("%+d ULP drift should be within tolerance %d: %v", ulps, goldenULPTolerance, err)
 		}
 	}
-	for _, ulps := range []int32{-8, 8, int32(goldenULPTolerance) + 1} {
+	for _, ulps := range []int32{-32, 32, int32(goldenULPTolerance) + 1} {
 		if err := goldenPayloadError("outside-window", nudged(0, ulps), want, goldenULPTolerance); err == nil {
 			t.Errorf("%+d ULP drift should be rejected by tolerance %d", ulps, goldenULPTolerance)
 		}
 	}
 	// Drifting a negative element crosses the ±0 fold correctly too.
-	if err := goldenPayloadError("negative fold", nudged(1, -8), want, goldenULPTolerance); err == nil {
-		t.Errorf("-8 ULP drift on a negative element should be rejected by tolerance %d", goldenULPTolerance)
+	if err := goldenPayloadError("negative fold", nudged(1, -32), want, goldenULPTolerance); err == nil {
+		t.Errorf("-32 ULP drift on a negative element should be rejected by tolerance %d", goldenULPTolerance)
 	}
 	if err := goldenPayloadError("shape", []namedTensor{{"out", tensor.FromData(append([]float32(nil), base...), 3, 2)}}, want, goldenULPTolerance); err == nil {
 		t.Errorf("shape drift should be rejected even with identical payloads")
@@ -640,8 +645,8 @@ func TestGoldenULPToleranceDiscriminates(t *testing.T) {
 	if err := goldenPayloadError("count", append(append([]namedTensor{}, want...), want...), want, goldenULPTolerance); err == nil {
 		t.Errorf("tensor-count drift should be rejected")
 	}
-	// And the window has meaning only against the strict path's zero: an
-	// 8 ULP drift must fail tolerance 0 too (sanity of the shared core).
+	// And the window has meaning only against the strict path's zero: a
+	// 1 ULP drift must fail tolerance 0 too (sanity of the shared core).
 	if err := goldenPayloadError("strict", nudged(0, 1), want, 0); err == nil {
 		t.Errorf("tolerance 0 must reject a 1 ULP drift")
 	}

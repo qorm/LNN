@@ -92,8 +92,10 @@
 // for byte, and load exactness requires the loaded cells to reproduce the
 // recorded outputs bit for bit. On any other architecture the format
 // skeleton — magic, version, tensor count, ranks and shapes — is still
-// pinned byte for byte, while float32 payloads are pinned within a 4 ULP
-// window (measured cross-architecture drift: 1 ULP). On every platform,
+// pinned byte for byte, while float32 payloads are pinned within a 16 ULP
+// window (measured cross-architecture drift: 1 ULP on a Linear forward
+// output, up to 6 ULPs on CfC Box-Muller construction parameters). On
+// every platform,
 // reader-class agreement requires bit-identical loads on known- and
 // unknown-length readers — a same-binary self-check, so it stays strict
 // everywhere. Any unintended change to the wire format or to cell semantics

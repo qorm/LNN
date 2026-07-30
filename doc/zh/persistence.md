@@ -367,9 +367,9 @@ Linear 承载两个张量：`W` `[in, out]` 与 `B` `[out]`（层的维度就在
 v1 冻结是被强制执行的，而不只是被文档声明。`serialize/testdata/` 保存着提交的黄金字节流——`golden_v1_ltc.lnns`、`golden_v1_cfc.lnns`、`golden_v1_linear.lnns`（1607、1603、120 字节）——各由一个固定的、全文档化的细胞构建（`nn.NewLTC(4, 6, nil, 6, …101)`、`nn.NewCfC(4, 6, nil, …202)`、`nn.NewLinear(6, 3, …303)`）；配套的 `golden_v1_<kind>.expected.txt` 则以 `%08x` 的 float32 位模式记录加载后的细胞必须复现的精确 `Step`/`Forward` 输出，人可以逐字节审计。三个测试扮演三种不同角色，而它们执行的冻结是**按平台分级**的：
 
 - **格式布局**——magic、version、张量计数、张量序、rank、shape 以及小端 float32 编码——在**一切平台上逐字节冻结**。写端在任何平台上对相同数值发射相同字节。
-- **浮点载荷的逐位复现**是**平台与工具链内部**的保证，跨架构则不然——这是 Go 语言的行为，而非本库的缺陷：语言规范允许实现"将多个浮点运算合并为单次舍入的融合运算"（FMA 缩合），即把逐步舍入的非融合路径压成一次舍入。因此 arm64 构建与 amd64 构建之间可以合法地相差每次缩合 ≤ 1 ULP（CI 实测恰为 1 ULP：`0xbe8aa433` 对 `0xbe8aa430`）。黄金向量在 arm64（Apple Silicon）上生成，故在 `GOARCH=arm64` 上以下断言保持严格——逐位、逐字节——而在其他任何架构上，骨架仍逐字节冻结，每个载荷元素的断言窗口为 **4 ULP**（实测漂移的四倍；仍紧到足以拒绝真实损坏——`TestGoldenULPToleranceDiscriminates` 钉死了它的鉴别力：8 ULP 必败，形状与计数不符必败）。
+- **浮点载荷的逐位复现**是**平台与工具链内部**的保证，跨架构则不然——这是 Go 语言的行为，而非本库的缺陷：语言规范允许实现"将多个浮点运算合并为单次舍入的融合运算"（FMA 缩合），即把逐步舍入的非融合路径压成一次舍入。因此 arm64 构建与 amd64 构建之间可以合法地相差每次缩合 ≤ 1 ULP（CI 实测恰为 1 ULP：`0xbe8aa433` 对 `0xbe8aa430`），而缩合链会逐级累积——CfC 的构造参数经 Box-Muller 初始化依次执行 log/sqrt/sin/cos，CI 实测最大漂移达 6 ULP。黄金向量在 arm64（Apple Silicon）上生成，故在 `GOARCH=arm64` 上以下断言保持严格——逐位、逐字节——而在其他任何架构上，骨架仍逐字节冻结，每个载荷元素的断言窗口为 **16 ULP**（约为实测最大值的 2.7 倍；仍紧到足以拒绝真实损坏——`TestGoldenULPToleranceDiscriminates` 钉死了它的鉴别力：32 ULP 必败，形状与计数不符必败）。
 
-- **`TestGoldenStreamsLoadBitExact`——行为冻结。** 每条提交的流都能加载，且加载后细胞的输出在生成平台上与期望位模式精确吻合（以 `Float32bits` 比对，因此 `NaN` 与 `−0` 各自与自身相等），在其他平台上落入 4 ULP 窗口。
+- **`TestGoldenStreamsLoadBitExact`——行为冻结。** 每条提交的流都能加载，且加载后细胞的输出在生成平台上与期望位模式精确吻合（以 `Float32bits` 比对，因此 `NaN` 与 `−0` 各自与自身相等），在其他平台上落入 16 ULP 窗口。
 - **`TestGoldenWriterStability`——字节级冻结。** 从文档化 seed 重建每个细胞再重新保存，在生成平台上得到的流与提交版本逐字节相同（`bytes.Equal`）；在其他平台上，封装头与线上骨架（magic、version、count、rank、shape）仍逐字节比对，仅浮点载荷按 ULP 窗口比对。
 - **`TestGoldenStreamsLoadOnBothReaderClasses`——读端一致。** 已知长度快路径与渐进流式路径加载同一条黄金流，得到逐位相同的细胞——这是同一二进制内的自洽对照，因此在一切平台上保持逐位严格。
 
