@@ -11,7 +11,7 @@
 | 层 | 包 | 职责 |
 |---|---|---|
 | 张量流 | `github.com/qorm/LNN/serialize` | 线上格式本体：写入/读取一片 `*tensor.Tensor`，或一片参数的 `Data`。单独暴露，是为了让格式本身可以被独立审计。 |
-| 模型持久化 | `github.com/qorm/LNN/nn` | `SaveLTC`/`LoadLTC`、`SaveCfC`/`LoadCfC`、`SaveLinear`/`LoadLinear`——一个 kind 字节 + 一段小头部 + 一条张量流，外加模型级校验（掩码、反转电位（reversal potential）、`unfolds` 上限）。 |
+| 模型持久化 | `github.com/qorm/LNN/nn` | `SaveLTC`/`LoadLTC`、`SaveCfC`/`LoadCfC`、`SaveLinear`/`LoadLinear`——一个 kind 字节 + 一段小头部 + 一条张量流，外加模型级校验（掩码、反转电位（reversal potential）、`unfolds`/`units`/`inDim` 上限）。 |
 
 ## API 总览
 
@@ -309,7 +309,7 @@ unknown format version     -> serialize: unsupported format version 99 (this bui
 | 头部 | 若干 `int32` | LTC：`inDim, units, unfolds`；CfC：`inDim, units`；Linear：无 |
 | blob | — | 上述张量流（`"LNNS"`、版本、数量、数据） |
 
-头部数值在写入端必须装得进 `int32`，在读取端必须 `≥ 1`；`unfolds` 在读取端另受上限 `1024` 约束（见下）。
+头部数值在写入端必须装得进 `int32`，在读取端必须 `≥ 1`；`unfolds` 在读取端另受上限 `1024`、`units`/`inDim` 各受上限 `256` 约束（均见下）。
 
 ### 模型 blob 内的张量次序
 
@@ -337,15 +337,18 @@ Linear 承载两个张量：`W` `[in, out]` 与 `B` `[out]`（层的维度就在
 | `maxCount` | `2^20` 个张量 | 每条流的张量数 |
 | `maxRank` | `8` | 每个张量的轴数（本库算子聚焦 1D/2D） |
 | `maxUnfolds` | `1024` | **仅加载路径**，`LoadLTC`：在 blob 解析*之前*检查，因此恶意 `unfolds` 连解析与构造的账都记不上。`NewLTC` 的运行时契约不变（仍只要求 `unfolds >= 1`）：构造器的输入来自你自己的代码，而加载的输入是不可信字节流，对自己的资源预算没有表决权 |
+| `maxUnits` / `maxInDim` | 各 `256` | **仅加载路径**，`LoadLTC`/`LoadCfC`：基于与 `maxUnfolds` 相同的理由、相同的不对称性（见下），在头部、blob 解析之前检查。`LoadLinear` 没有指示阵，不受影响 |
 
 声称维度宽达 `1<<62` 的流会被以 error 拒绝，而不是用一个 PB 级的 `make()` 去伺候——并以分配次数做了回归测试（`TestHostileDimDoesNotAllocate`、`TestHostileCountDoesNotAllocate`：整个恶意解码过程不超过 50 次小分配）。
+
+**为什么 `units`/`inDim` 也要封顶。** 构造器把突触归约指示矩阵实体化为稠密的 `[pre·units, units]` 矩阵（`sumIndicator`/`reversalIndicator`）：循环侧两个 `units³` 个 float32，感知侧两个 `inDim·units²` 个。因此加载期内存是 **O(units³)**，而控制它的头部只有 9–13 字节——这正是 `maxUnfolds` 已经为时间轴覆盖的那个孪生面。在上限处（`units = inDim = 256`），持久指示阵恰为 `2·(256³ + 256·256²)·4 B = 256 MiB` 每加载细胞；而 Load 在按流内极性重新焙入指示阵时做的那一次重建，最多多占 `max(units³, inDim·units²)·4 B = 64 MiB` 瞬时内存——有界的最坏峰值约 320 MiB。封顶之前，v0.2.0 红队总扫加载一条*合法*的 `units = 512` 流（送达 5 MB）却分配了 1,560 MB（放大 311 倍）；一条 13 字节、`units = 4096` 的最小攻击流则让进程尝试 `2·4096³·4 B ≈ 550 GB` 指示阵，直到操作系统直接强杀——比 panic 更糟。封顶之后，同一条流是一个带值的 error（`nn: LTC header has units=4096, exceeding the load limit 256`），只花寥寥数次分配。与 `maxUnfolds` 一样，这个上限刻意做成**仅加载侧**：`NewLTC`/`NewCfC` 仍接受任何 `≥ 1` 的维度，因为构造器的输入是调用方自知的分配决策，而加载的输入是不可信流。根因级修复——以稀疏收缩彻底不实体化 `[units², units]` 指示阵（构造器侧亦然）——作为技术债（#14）追踪；这些上限在此期间封堵加载侧。
 
 **按读端能力二选一的分配策略。**
 
 - *能报告剩余长度的读端*（`bytes.Buffer`、`bytes.Reader`、`strings.Reader` 的 `Len()` 方法）：每个载荷声明都与实际剩余字节比对，因此过大或截断的声明在其缓冲区分配**之前**就被拒绝；装得下的声明由一次全尺寸的 `make` 伺候（快路径）。
 - *没有长度的读端*（`io.Pipe`、`net.Conn`、`gzip.Reader`）：事先无从证明任何事，因此载荷缓冲采用渐进分配（progressive allocation）——从小处起步（至多一个 4,096 个 float32 的块，16 KiB），只随字节到达增长。一条声称 `2^30` 个元素却在 18 字节头部后停止的流，峰值内存只有几个块（约 33 KiB——加固之前是 4 GiB 的 `make`），并以 `io.ErrUnexpectedEOF` 失败。峰值分配与实际送达的字节数保持正比；完整的流最终仍是单个切片承载全部元素。
 
-**模型级校验，按序执行。** 加载函数在构造任何细胞之前检查：kind 字节（精确匹配——跨 kind 互载是一个指名道姓的错误）；头部维度 `≥ 1` 且 `unfolds` 落在 `[1, 1024]`；张量数量（细胞恰为 17，Linear 为 2）；掩码形状与头部一致且每个掩码表项恰为 `0` 或 `1`；以及反转电位——每个 `erev`/`sErev` 表项必须**恰为 `+1` 或 `−1`**（按位比较，因此 `NaN`、`±Inf`、`0` 和 `2.5` 之类的小数全部被拒）。构造器固定这些符号，训练又把电位排除在 `Parameters()` 之外，因此承载其他值的流描述的是 `NewLTC`/`NewCfC` 永远不可能产生的细胞，一律拒绝。对已有模型的形状不符（`LoadParameters`、`copyFields`）在**任何值被拷贝之前**完成校验，因此失败的加载让目标保持原样。
+**模型级校验，按序执行。** 加载函数在构造任何细胞之前检查：kind 字节（精确匹配——跨 kind 互载是一个指名道姓的错误）；头部维度 `≥ 1`、`unfolds` 落在 `[1, 1024]`、`units`/`inDim` 落在 `[1, 256]`（即上面的仅加载侧上限）；张量数量（细胞恰为 17，Linear 为 2）；掩码形状与头部一致且每个掩码表项恰为 `0` 或 `1`；以及反转电位——每个 `erev`/`sErev` 表项必须**恰为 `+1` 或 `−1`**（按位比较，因此 `NaN`、`±Inf`、`0` 和 `2.5` 之类的小数全部被拒）。构造器固定这些符号，训练又把电位排除在 `Parameters()` 之外，因此承载其他值的流描述的是 `NewLTC`/`NewCfC` 永远不可能产生的细胞，一律拒绝。对已有模型的形状不符（`LoadParameters`、`copyFields`）在**任何值被拷贝之前**完成校验，因此失败的加载让目标保持原样。
 
 **已模糊测试。** 变异模糊（mutation fuzz）钉住了契约：`TestMutatedTensorStreamsNeverPanic` 与 `TestMutatedModelStreamsNeverPanic`（位翻转、删除、插入、块交换）。红队对初版实现跑了 7,500 个变异体（0 panic、0 静默错乱），资源耗尽加固之后又跑了 1,200 个变异体 × 双读端类别（依然 0 panic）。
 
@@ -358,6 +361,16 @@ Linear 承载两个张量：`W` `[in, out]` 与 `B` `[out]`（层的维度就在
 ## 版本演进：对未来诚实
 
 `version = 1` 是本构建唯一读取的布局。带有其他版本字节的流会以 `unsupported format version N (this build reads version 1)` 失败——未来版本会**报错而非误解析**未知布局。如果线上格式有任何变更，版本号递增，`ReadTensors` 增加对旧布局的显式支持；不存在悄无声息的尽力解码。格式版本导出为 `serialize.Version`，正是为了调用方做这类检查。
+
+## 黄金向量：被字节钉死的冻结格式
+
+v1 冻结是被强制执行的，而不只是被文档声明。`serialize/testdata/` 保存着提交的黄金字节流——`golden_v1_ltc.lnns`、`golden_v1_cfc.lnns`、`golden_v1_linear.lnns`（1607、1603、120 字节）——各由一个固定的、全文档化的细胞构建（`nn.NewLTC(4, 6, nil, 6, …101)`、`nn.NewCfC(4, 6, nil, …202)`、`nn.NewLinear(6, 3, …303)`）；配套的 `golden_v1_<kind>.expected.txt` 则以 `%08x` 的 float32 位模式记录加载后的细胞必须复现的精确 `Step`/`Forward` 输出，人可以逐字节审计。三个测试扮演三种不同角色：
+
+- **`TestGoldenStreamsLoadBitExact`——行为冻结。** 每条提交的流都能加载，且加载后细胞的输出与期望位模式精确吻合（以 `Float32bits` 比对，因此 `NaN` 与 `−0` 各自与自身相等）。
+- **`TestGoldenWriterStability`——字节级冻结。** 从文档化 seed 重建每个细胞再重新保存，得到的流与提交版本逐字节相同（`bytes.Equal`）——写端是确定性的，因此编码的任何改动都会触发它。
+- **`TestGoldenStreamsLoadOnBothReaderClasses`——读端一致。** 已知长度快路径与渐进流式路径加载同一条黄金流，得到逐位相同的细胞。
+
+再生成是门禁式的：`TestWriteGoldenFiles` **默认跳过**，除非运行显式传入 `-write-golden`（`go test ./serialize -write-golden`），因此黄金向量只能通过一次刻意的、可见的测试运行来变更——绝不偶然发生，也绝不作为某个无关改动的副作用。CfC 黄金流反映的是阶段 8 `erev` 焙入*之后*的细胞：其加载后的 `Step` 输出与原细胞逐位相同，而这恰是那次焙入被要求保持的等价性。
 
 ---
 

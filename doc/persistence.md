@@ -18,7 +18,7 @@ the wire format and its safety contract spelled out byte by byte.
 | layer | package | role |
 |---|---|---|
 | tensor streams | `github.com/qorm/LNN/serialize` | the wire format itself: write/read a slice of `*tensor.Tensor`, or the `Data` of a parameter slice. Exposed separately so the format can be audited on its own. |
-| model persistence | `github.com/qorm/LNN/nn` | `SaveLTC`/`LoadLTC`, `SaveCfC`/`LoadCfC`, `SaveLinear`/`LoadLinear` — a kind byte + a small header + one tensor stream, with model-level validation (masks, reversal potentials, `unfolds` bound). |
+| model persistence | `github.com/qorm/LNN/nn` | `SaveLTC`/`LoadLTC`, `SaveCfC`/`LoadCfC`, `SaveLinear`/`LoadLinear` — a kind byte + a small header + one tensor stream, with model-level validation (masks, reversal potentials, `unfolds`/`units`/`inDim` bounds). |
 
 ## API overview
 
@@ -342,7 +342,8 @@ stream blob:
 | blob | — | the tensor stream above (`"LNNS"`, version, count, data) |
 
 Header values must fit `int32` on the write side and be `≥ 1` on the read
-side; `unfolds` is additionally bounded by the load limit `1024` (below).
+side; `unfolds` is additionally bounded by the load limit `1024`, and
+`units`/`inDim` by the load limit `256` each (both below).
 
 ### Tensor order inside a model blob
 
@@ -383,12 +384,38 @@ multiplication (`math/bits.Mul64`, the same discipline as
 | `maxCount` | `2^20` tensors | tensors per stream |
 | `maxRank` | `8` | axes per tensor (the library's ops are 1D/2D-focused) |
 | `maxUnfolds` | `1024` | **load-path only**, `LoadLTC`: checked before the blob is even parsed, so a hostile `unfolds` cannot bill any construction or stepping work. `NewLTC`'s runtime contract is unchanged (it still requires only `unfolds >= 1`): a constructor's inputs come from your own code, a load's input is an untrusted byte stream that gets no vote on its own resource budget |
+| `maxUnits` / `maxInDim` | `256` each | **load-path only**, `LoadLTC`/`LoadCfC`: checked in the header, before the blob is parsed, for the same reason as `maxUnfolds` and on the same asymmetry (below). `LoadLinear` has no indicators and is unaffected |
 
 A stream claiming a `1<<62`-wide dimension is rejected with an error,
 not serviced with a petabyte-sized `make()` — regression-tested with
 allocation counts (`TestHostileDimDoesNotAllocate`,
 `TestHostileCountDoesNotAllocate`: no more than 50 small allocations
 for the whole hostile decode).
+
+**Why `units`/`inDim` are capped too.** The constructors materialize the
+synaptic reduction indicators as dense `[pre·units, units]` matrices
+(`sumIndicator`/`reversalIndicator`): two of `units³` float32s on the
+recurrent side plus two of `inDim·units²` on the sensory side. Load-time
+memory is therefore **O(units³)** while the header that controls it is
+only 9–13 bytes — the twin face `maxUnfolds` already covered for the time
+axis. At the caps (`units = inDim = 256`) the persistent indicators are
+exactly `2·(256³ + 256·256²)·4 B = 256 MiB` per loaded cell, and the one
+indicator rebuild Load performs while re-baking the streamed polarities
+adds at most `max(units³, inDim·units²)·4 B = 64 MiB` transiently — a
+bounded worst-case peak of ~320 MiB. Before the caps, the v0.2.0 red-team
+sweep loaded a *legal* `units = 512` stream (5 MB delivered) at the cost
+of 1,560 MB of allocations (311× amplification), and a minimal
+13-byte `units = 4096` attack stream made the process attempt
+`2·4096³·4 B ≈ 550 GB` of indicators until the operating system killed it
+outright — worse than a panic. With the caps that same stream is a
+valued error (`nn: LTC header has units=4096, exceeding the load limit
+256`) costing a handful of allocations. Like `maxUnfolds`, the caps are
+deliberately **load-only**: `NewLTC`/`NewCfC` still accept any dims `≥ 1`,
+because a constructor's inputs are the caller's own, self-aware allocation
+decision, while a load's input is an untrusted stream. The root-level fix
+— sparse contractions that never materialize the `[units², units]`
+indicators, on the constructor side as well — is tracked as technical debt
+(#14); these caps close the load side in the meantime.
 
 **Two allocation strategies by reader capability.**
 
@@ -410,7 +437,8 @@ for the whole hostile decode).
 
 **Model-level validation, in order.** The load functions check, all
 before constructing any cell: the kind byte (exact match — cross-loading
-is a named error); header dims `≥ 1` and `unfolds` within `[1, 1024]`;
+is a named error); header dims `≥ 1`, `unfolds` within `[1, 1024]`, and
+`units`/`inDim` within `[1, 256]` (the load-only caps above);
 tensor count (exactly 17 for cells, 2 for Linear); mask shapes matching
 the header and every mask entry exactly `0` or `1`; and the reversal
 potentials — every `erev`/`sErev` entry must be **exactly `+1` or `−1`**
@@ -458,6 +486,38 @@ mis-parse** an unknown layout. If the wire format ever changes, the
 version bumps and `ReadTensors` grows explicit old-layout support; there
 is no silent best-effort decoding. The format version is exported as
 `serialize.Version` for exactly this kind of check on the caller side.
+
+## Golden vectors: the frozen format, byte-pinned
+
+The v1 freeze is enforced, not merely documented. `serialize/testdata/`
+holds committed golden byte streams — `golden_v1_ltc.lnns`,
+`golden_v1_cfc.lnns`, `golden_v1_linear.lnns` (1607, 1603 and 120 bytes) —
+each built from a fixed, documented cell (`nn.NewLTC(4, 6, nil, 6, …101)`,
+`nn.NewCfC(4, 6, nil, …202)`, `nn.NewLinear(6, 3, …303)`), alongside a
+`golden_v1_<kind>.expected.txt` recording the exact `Step`/`Forward`
+outputs the loaded cell must reproduce, as `%08x` float32 bit patterns
+that a human can audit byte by byte. Three tests play three distinct
+roles:
+
+- **`TestGoldenStreamsLoadBitExact` — the behavioral freeze.** Each
+  committed stream loads, and the loaded cell's output matches the
+  expected bit patterns exactly (compared with `Float32bits`, so `NaN`
+  and `−0` compare equal to themselves).
+- **`TestGoldenWriterStability` — the byte-level freeze.** Rebuilding
+  each cell from its documented seed and re-saving yields a stream that is
+  byte-for-byte identical to the committed one (`bytes.Equal`) — the
+  writer is deterministic, so any change to the encoding trips this.
+- **`TestGoldenStreamsLoadOnBothReaderClasses` — reader agreement.** The
+  known-length fast path and the progressive streaming path load the same
+  golden stream to bit-identical cells.
+
+Regeneration is gated: `TestWriteGoldenFiles` **skips unless** the run
+passes `-write-golden` (`go test ./serialize -write-golden`), so the
+golden vectors can change only through a deliberate, visible test run —
+never by accident, and never as a side effect of an unrelated change. The
+CfC golden stream reflects the cell *after* the phase-8 `erev` bake: its
+loaded `Step` output is bit-identical to the original cell's, which is
+exactly the equivalence that bake was required to preserve.
 
 ---
 

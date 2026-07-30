@@ -72,7 +72,7 @@ loss.Backward()                 // 对图做拓扑排序，逆序派发每个节
 - **已构造对象的不可变性是真实的。** `Wiring` 的掩码只通过拷贝型访问器暴露，红队审计确认：篡改返回的掩码不会影响细胞（指针型访问器就不具备这个性质）。
 - **代价是显式且可预期的：** 每个算子 O(元素数) 的拷贝，以及随计算图增长（见下文）的内存。本库面向 CPU 上小而可审计的模型，在这里清晰性胜过吞吐量；一个带 stride 的视图层将是另一个库。
 
-MatMul 确实在内层循环里跳过零乘数，这是唯一一处可观测行为与朴素数学不同的地方：`0 * NaN` 贡献 `0` 而不是毒化整个结果（见 [pitfalls.md](pitfalls.md)）。
+MatMul 确实在内层循环里跳过零乘数，这是唯一一处可观测行为与朴素数学不同的地方——而且该跳过只检查**左**操作数，因此是有方向性的：`0 * NaN` 贡献 `0`（零乘数被跳过），而 `NaN * 0` 仍得 `NaN`（见 [pitfalls.md](pitfalls.md)）。
 
 ## 计算图
 
@@ -87,13 +87,13 @@ type Variable struct {
     kind     opKind       // 标签：runBackward 据此派发梯度公式
     scalar   float32      // 载荷：Scale 系数 / Pow 指数
     from, to int          // 载荷：SliceCol 列区间 / SliceRow 行下标
-    aux      *tensor.Tensor // 载荷：Div 捕获的分母倒数
+    aux      *tensor.Tensor // 载荷：Div 的分母倒数 / SigmoidHadamard 的 sigmoid 缓冲
     idx      []int        // 载荷：GatherRows 索引（构造时已拷贝）
 }
 ```
 
 - **叶节点**（`Var`、`New`、`Const`）没有 parents，种类为零值（`opLeaf`）——没有反向步骤。它们是参数和输入；梯度传播到它们为止。
-- **算子**通过 `tensor` 即时执行前向计算，然后给输出节点打上算子种类（op kind）标签及其载荷——**没有逐节点闭包**。反向步骤曾经是闭包，而闭包捕获会为每个图节点分配一个堆对象：这是深度展开图中最大的分配来源之一。阶段 7 深改以标签派发取而代之：一个 `uint8` 种类加 struct 上的几个载荷字段；`runBackward` 是一个 21 路 switch，其 case 体恰是原来闭包承载的梯度公式。少数 case（例如 `opLog`）在反向时读取*父节点*的 `Data`，因此叶节点数据在前向和反向之间不得被修改（细节见 [pitfalls.md](pitfalls.md)）。
+- **算子**通过 `tensor` 即时执行前向计算，然后给输出节点打上算子种类（op kind）标签及其载荷——**没有逐节点闭包**。反向步骤曾经是闭包，而闭包捕获会为每个图节点分配一个堆对象：这是深度展开图中最大的分配来源之一。阶段 7 深改以标签派发取而代之：一个 `uint8` 种类加 struct 上的几个载荷字段；`runBackward` 是一个 23 路 switch（每个 `opKind` 一个 case，含空操作的 `opLeaf`），其 case 体恰是原来闭包承载的梯度公式。少数 case（例如 `opLog`）在反向时读取*父节点*的 `Data`，因此叶节点数据在前向和反向之间不得被修改（细节见 [pitfalls.md](pitfalls.md)）。
 - **Backward** 用后序 DFS 构建拓扑序，逆序对每个节点执行 `runBackward`，然后把除接收者之外所有非叶节点的 `Grad` 清零。
 
 ### 梯度缓冲区是移交的，不是克隆的
@@ -120,13 +120,23 @@ func mul32(a, b float32) float32 {
 
 处处是忠实优先于修正：历史上 1D→`[1, n]` 的叶梯度形状怪癖被忠实复刻（`elemwiseGradShape`）；异形的手设梯度形状回退到字面的旧组合（`gradMatchesElemwise` 守卫）——panic 契约一并保留。整个深改以对 git 历史中提取的重写前实现做差分模糊测试为门禁：52,000 张图，四类差异（有限值、形状、panic 有无、NaN 位）全零，负对照确认门禁确实能侦测注入的变异。本机实测（`-benchtime=100x`）：`UnrollBackward` 68,688 → **33,963 allocs/op（−50.55%）**，字节数 −50.1%、耗时 −24%——另外四项基准全降、零回归：`ChainForwardBackward` −57.7%、`DivDenLoop` −56.7%、`LTCStep` −29.0%、`GatherRowsBackward` −23.5%。
 
+### Sigmoid–Hadamard 融合：阶段 8 的收尾
+
+阶段 8 的 `autograd.SigmoidHadamard(z, w)`（`autograd/ops.go`）把 LTC 热路径模式 `Hadamard(Sigmoid(z), w)`——两个图节点——融合为一个，采纳于 `synapsesRows` 感知/循环共用的唯一入口（`nn/ltc.go:347`）。它是反向深改的收尾之作，因为它是唯一一个需要*新算子*而非既有算子重组的融合，其等价性叙事有三段彼此不同：
+
+- **前向逐位为构造性。** 它逐字调用旧组合所跑的同一批 tensor 算子——先 `tensor.Sigmoid`，再 `tensor.Hadamard`——因此形状、广播与数值按定义相同，而非靠测量得出。sigmoid 缓冲被保存在节点的 `aux` 槽里，反向直接复用而不重算。
+- **常规反向以舍入位点对齐达成逐位。** 在 2D 路径（LTC 热路径）上，反向以一个融合循环传播 `dz = g⊙w⊙s⊙(1−s)`，并以 Hadamard 反向所用的同一个 `hadamardReduce` 传播 `dw = g⊙s`。这*并非*设计成逐位的——设计书预期的是一个容差门禁——但结果却是逐位的：把 `g⊙w` 乘积恰在旧 Hadamard 反向把中间张量交给 sigmoid 节点的那个位点经 `mul32` 舍入，便复刻了旧中间张量的舍入；外层 `mul32(gw, s⊙(1−s))` 的分组则复刻了 opSigmoid 的融合循环。结果在常规路径上与旧双节点链逐位相同（由测试钉住），这也正是两个 example 的训练轨迹一位都不曾漂移的原因。
+- **回退路径是逐字复刻。** 非 2D 操作数或异形手设梯度会逐字复刻旧的 `opHadamard`+`opSigmoid` 对——两条 `hadamardReduce` 分支，再接 opSigmoid 自己的派发——因此数值、形状、1D→`[1,n]` 升维怪癖与 panic 契约全部原样保留。
+
+同一 A/B 时间窗实测（`-benchtime=100x`）：`LTCStep` 2,442 → **2,306 allocs/op（−5.6%）**、`UnrollBackward` 33,963 → **31,983（−5.8%）**。这个收益被刻意如实报告为它实际所在的个位数：每个融合点位恰好省一个图节点加一个反向中间张量，且结构核算精确闭合（`LTCStep` 68 点位 × 2 次分配 = 136 = 差值；`UnrollBackward` 396 点位 × 5 = 1,980）。剩下的就是 `tensor.New` 的逐节点固定开销（上一路线图条目）——这是本引擎上融合所能触及的实测结构上限，也正是早先那个"收益/脆弱性"之问一直在等的答案。
+
 ### 非叶节点的梯度在每次遍历后被置 nil——以及为什么
 
 中间梯度在设计上是瞬态的。如果过期的中间 `Grad` 缓冲区在一次遍历后存活下来，对同一张图的第二次 `Backward` 就会穿过已被播种的节点继续传播，叶节点梯度将超线性增长（红队在修复前的代码上实测两次调用得到 3 倍）。清零之后，重复运行变成严格线性：对同一张图调用 N 次，得到单次的 N 倍叶梯度。受支持的范式仍然是每张新图一次 `Backward`；线性的重复运行行为是一个定义好的安全网，而不是用来依赖的特性（[pitfalls.md](pitfalls.md)）。
 
 ### 图就是内存模型
 
-每个中间张量都保持存活——被其节点引用——直到 `Backward` 完成。因此内存随每次迭代的算子数量扩展，而不仅仅随参数规模。一次 LTC `Step` 会把 `unfolds` 轮 ODE 迭代展开进图；自阶段 6 的突触向量化起，每轮是 O(units) 个向量块加两次对构造期指示矩阵（indicator matrix）的 MatMul 收缩（见 [ltc.md](ltc.md)）——从 O(units²) 个逐突触节点降下来，而阶段 7 的反向深改（见上）又把逐节点分配数砍掉一半。当前实测：`LTCStep` 2,442 allocs/op、`UnrollBackward` 33,963——较最初的逐突触循环（7,360 / 120,163）累计 −67% 与 −72%。内存仍然随 `units · unfolds · 序列长度` 增长，所以在这个引擎上三者都要保持适度；`CfC` 细胞（[cfc.md](cfc.md)）的闭式步进则完全没有 `unfolds` 因子。
+每个中间张量都保持存活——被其节点引用——直到 `Backward` 完成。因此内存随每次迭代的算子数量扩展，而不仅仅随参数规模。一次 LTC `Step` 会把 `unfolds` 轮 ODE 迭代展开进图；自阶段 6 的突触向量化起，每轮是 O(units) 个向量块加两次对构造期指示矩阵（indicator matrix）的 MatMul 收缩（见 [ltc.md](ltc.md)）——从 O(units²) 个逐突触节点降下来，阶段 7 的反向深改（见上）又把逐节点分配数砍掉一半，阶段 8 的 Sigmoid–Hadamard 融合再进一步。当前实测：`LTCStep` 2,306 allocs/op、`UnrollBackward` 31,983——较最初的逐突触循环（7,360 / 120,163）累计 −69% 与 −73%。内存仍然随 `units · unfolds · 序列长度` 增长，所以在这个引擎上三者都要保持适度；`CfC` 细胞（[cfc.md](cfc.md)）的闭式步进则完全没有 `unfolds` 因子。
 
 ## float32 是全局约束
 

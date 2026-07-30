@@ -103,9 +103,10 @@ The trade-off is deliberate for a library of this size:
   view layer would be a different library.
 
 MatMul does skip zero multipliers in its inner loop, which is the one
-place where observable behavior differs from naive math: `0 * NaN`
-contributes `0` rather than poisoning the result (see
-[pitfalls.md](pitfalls.md)).
+place where observable behavior differs from naive math — and the skip
+tests only the **left** operand, so it is directional: `0 * NaN`
+contributes `0` (the zero multiplier is skipped), while `NaN * 0` still
+yields `NaN` (see [pitfalls.md](pitfalls.md)).
 
 ## The computation graph
 
@@ -120,7 +121,7 @@ type Variable struct {
     kind     opKind       // tag: which gradient formula runBackward dispatches
     scalar   float32      // payload: Scale factor / Pow exponent
     from, to int          // payload: SliceCol range / SliceRow index
-    aux      *tensor.Tensor // payload: Div's captured inverse denominator
+    aux      *tensor.Tensor // payload: Div's inverse denominator / SigmoidHadamard's sigmoid buffer
     idx      []int        // payload: GatherRows indices (copied at construction)
 }
 ```
@@ -134,8 +135,9 @@ type Variable struct {
   heap object per graph node: one of the largest allocation sources in
   deep unrolled graphs. The tag dispatch of the phase-7 overhaul replaces
   that with a `uint8` kind and a few payload fields on the struct;
-  `runBackward` is a 21-case switch whose case bodies are exactly the
-  gradient formulas the closures used to carry. A few cases (e.g.
+  `runBackward` is a 23-case switch (one case per `opKind`, including the
+  no-op `opLeaf`) whose case bodies are exactly the gradient formulas the
+  closures used to carry. A few cases (e.g.
   `opLog`) read a *parent's* `Data` at backward time, so leaf data must
   not be mutated between forward and backward ([pitfalls.md](pitfalls.md)
   has the details).
@@ -227,6 +229,50 @@ benchmarks all down with zero regressions: `ChainForwardBackward`
 −57.7%, `DivDenLoop` −56.7%, `LTCStep` −29.0%, `GatherRowsBackward`
 −23.5%.
 
+### Sigmoid–Hadamard fusion: the phase-8 capstone
+
+The phase-8 `autograd.SigmoidHadamard(z, w)` (`autograd/ops.go`) fuses
+the LTC hot-path pattern `Hadamard(Sigmoid(z), w)` — two graph nodes —
+into one, and is adopted at the single shared sensory/recurrent entry of
+`synapsesRows` (`nn/ltc.go:347`). It is the capstone of the backward
+overhaul because it is the one fusion that needed a new operator rather
+than a reorganization of existing ones, and its equivalence story has
+three distinct parts:
+
+- **The forward is bitwise by construction.** It runs the very same two
+  tensor operations the composition ran — `tensor.Sigmoid`, then
+  `tensor.Hadamard` — so shapes, broadcasting and values are identical
+  by definition, not by measurement. The sigmoid buffer is kept on the
+  node's `aux` slot so the backward reuses it instead of recomputing.
+- **The regular backward is bitwise by rounding-site alignment.** On the
+  2D path (the LTC hot path) the backward propagates
+  `dz = g⊙w⊙s⊙(1−s)` in one fused loop and `dw = g⊙s` through the same
+  `hadamardReduce` the Hadamard backward used. This was *not* designed to
+  be bitwise — the design book expected a tolerance gate — but it turned
+  out to be: rounding the `g⊙w` product through `mul32` at exactly the
+  spot the legacy Hadamard backward handed the sigmoid node reproduces
+  the legacy intermediate's rounding, and the outer `mul32(gw, s⊙(1−s))`
+  grouping reproduces opSigmoid's fused loop. The result is bit-identical
+  to the legacy two-node chain on the regular path (pinned by tests),
+  which is also why the examples' training trajectories did not drift by
+  a single bit.
+- **The fallback is a verbatim replay.** Non-2D operands or an irregular
+  manually seeded gradient reproduce the legacy `opHadamard`+`opSigmoid`
+  pair verbatim — both `hadamardReduce` branches, then opSigmoid's own
+  dispatch — so the values, shapes, the 1D→`[1,n]` lift quirk and the
+  panic contract are all preserved exactly.
+
+Measured in the same A/B window (`-benchtime=100x`): `LTCStep`
+2,442 → **2,306 allocs/op (−5.6%)** and `UnrollBackward`
+33,963 → **31,983 (−5.8%)**. The gain is deliberately reported as the
+single-digit number it is: each fused site saves exactly one graph node
+plus one backward intermediate tensor, and the structure accounts close
+exactly (`LTCStep` 68 sites × 2 allocations = 136 = the difference;
+`UnrollBackward` 396 sites × 5 = 1,980). What remains is `tensor.New`'s
+fixed per-node overhead (the roadmap item above) — this is the measured
+structural ceiling for fusion on this engine, the answer the earlier
+"cost/fragility" question was waiting for.
+
 ### Non-leaf gradients are set to nil after each traversal — and why
 
 Intermediate gradients are transient by design. If stale intermediate
@@ -247,10 +293,11 @@ per iteration, not just with parameter size. One LTC `Step` unrolls
 `unfolds` ODE iterations into the graph; since the phase-6 synapse
 vectorization each iteration is O(units) vector blocks plus two MatMul
 contractions against construction-time indicator matrices
-([ltc.md](ltc.md)) — down from O(units²) per-synapse nodes, and the
+([ltc.md](ltc.md)) — down from O(units²) per-synapse nodes, the
 phase-7 backward overhaul (above) halved the per-node allocation count
-again. Measured now: `LTCStep` 2,442 allocs/op and `UnrollBackward`
-33,963 — cumulative −67% and −72% from the original per-synapse loop
+again, and the phase-8 Sigmoid–Hadamard fusion took it further still.
+Measured now: `LTCStep` 2,306 allocs/op and `UnrollBackward`
+31,983 — cumulative −69% and −73% from the original per-synapse loop
 (7,360 / 120,163). Memory still grows with `units · unfolds · sequence
 length`, so keep all three modest on this engine; a `CfC` step
 ([cfc.md](cfc.md)) avoids the `unfolds` factor entirely.

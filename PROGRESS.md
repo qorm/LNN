@@ -15,7 +15,7 @@
 | 5 | 技术债清扫 + 工程成熟度（Benchmark/CI/双语文档） | ✅ 完成 |
 | 6 | 双轨扩展：特性（optimizer/CfC）+ 性能（热路径向量化） | ✅ 完成 |
 | 7 | 双轨再进：序列化特性 + autograd 深改 + 发布 | ✅ 完成 |
-| 8 | v0.2 双轨：融合反向 + 序列化版本化 → 覆盖率收复 → 红队总扫 → v0.2.0 | 🔄 进行中（8a/8b/8c ✅，8d 文档同步+发布中） |
+| 8 | v0.2 双轨：融合反向 + 序列化版本化 → 覆盖率收复 → 红队总扫 → v0.2.0 | ✅ 完成（v0.2.0 已发布） |
 
 ## 阶段 1：并行分析（已完成）
 
@@ -209,6 +209,15 @@
 
 **红队·序列化组（已完成）**：7,500 变异体（位翻转/删除/插入/块交换，25% 叠连击）**0 panic / 0 静默错乱**（黑盒 oracle 重序列化核验掩码二值/形状/Step 健全；7 例"ok 垃圾入参"均为参数含 NaN/Inf 的忠实复现）；语义攻击全挡（张量顺序偷换/掩码注入 0.5/−1/2/NaN/跨 kind/未知 kind/version 0·2·99·255/UTF-16/大端伪流）；错误全透传（写端每个截断点、读端多偏移）；round-trip **训练动力学逐位等价**（加载后再训练 3 步的参数轨迹与同步训练锁死、种子无关）。**资源耗尽维度不安全**：F1 Medium——**无 Len() 读端**（网络/管道/gzip）绕过剩余字节守卫，~20 字节截断流逼出 64MiB～**4GiB** 分配（make 在读之前）；F2 Medium——`unfolds` 无上限，1<<20 展开 2.26s、1<<30 外推单次 Step ~38 分钟 CPU 耗尽（CfC 免疫）；F3 Low——count=maxCount−1 强分 8MiB 指针切片；F4 Low——加载不校验 erev∈{±1}（可造 NewLTC 永不能产生的细胞）；F5 Info——LoadParameters 保留陈旧 Grad 未文档化；F6 Info——限额私有且包注释"绝不无界分配"措辞掩盖 F1。**裁决：panic/语义维度安全，资源耗尽维度需补防——已派发修复（发布前置条件）**
 
+**8d 双语文档同步（已完成）**：12 个 .md 文件（+292/−104），五工单全双语落地经回源+/tmp 实测双重核验：
+- **F2**：pitfalls §2 补 NaN 对 Momentum/Adam 矩估计**永久毒化**（ZeroGrad 无效——毒在优化器缓冲不在 Grad；须重建优化器，引红队 60 轮实测）；MatMul 跳零补方向性（只测左操作数：0×NaN→0 而 NaN×0→NaN，回源 tensor/ops.go:20 确认）——pitfalls 与 architecture 双处
+- **F3**：5 处 erev #10 陈旧"开放问题"→"已完成（阶段 8）"（pitfalls/README×2/cfc.md×2 逐处检索修正）；runBackward 21→**23** case（grep 实证含 opLeaf/opSigmoidHadamard）；ltc.md 示例改 SigmoidHadamard（回源 ltc.go:347 唯一采纳点，cfc.go:279 旧式未误融合已核对）
+- **F-RT1**：ltc.md/cfc.md（双版）"逐位等价"宣称补诚实角落——全掩蔽突触后列 ±0 符号位（/tmp 实测 (−1)·(+0)=0x80000000 vs MatMul +0，(±0)²=+0 下游不可观测）；persistence/architecture 回源核对判定**无需**限定（round-trip 同用收缩仍真、复杂度叙述非等价宣称）——不虚改
+- **v0.2.0 新内容**：persistence 补 maxUnits/maxInDim=256 限额表 + 量化段（256 MiB 封顶/~320 MiB 峰值/13 字节攻击流 ~550GB→带值 error/load-only 不对称论证/根因见 #14，错误串 /tmp 逐字核对）+ 黄金向量节（-write-golden 门禁 + 三测试角色）；architecture 新增 SigmoidHadamard 小节（三段等价叙事 + 结构核算 68×2=136/396×5=1,980 + aux 双语义）+ 性能刷新 LTCStep 2,306 / UnrollBackward 31,983（本机复测逐字吻合）；README 双版 Status 表覆盖率 100/99.7/100/97.8（go test -cover 实测）+ serialize 行封顶说明 + Roadmap #13/#10 销账 #14 领衔
+- **行号终检**：ltc.go（345 行后整体 +2）、cfc.go（drive 重写后 +20~26，12 处引用全刷新）、ops.go Div 793-810/GatherRows 855、tensor.go Stack 170；累计降幅重算 −69%/−73% 保内部自洽
+- **回源额外偏差 4 处并修**：cfc.md Algorithm 1 节机制描述陈旧（8a 已重写 drive 为向量块+双 MatMul 收缩）据 cfc.go:246-294 重写；pitfalls "两"项→"一项"（#13 销账后）；architecture aux 注释补 SigmoidHadamard 语义（P-C 遗留闭合）；累计百分比重算
+- 收尾：build/test-race 全绿、18 篇 md 零断链、中英 8 对同构、非文档零触碰
+
 **8c 覆盖率收复（已完成，全面超目标）**：以 `go tool cover -func` 实测缺口为唯一选题依据（工单建议中已被既有用例覆盖的项核对后**不凑数重复**），三个新增测试文件 32 个测试（全部值/形状/位模式/panic 消息实质断言，禁凑行式）：**autograd 87.3%→100.0%、tensor 81.7%→99.7%、nn 99.0%→100.0%**（目标 ≥95/≥88/≥99）。回退类测试以 tensor 级旧组合链逐位重建期望（分支"忠实复刻旧链"的存在性契约本身即断言）。
 - **变异致死抽样 18 处 / 17 致死 / 1 逃逸（94.4%）**：逃逸项 M17（`if n>1`→`if n>0`）经论证为**等价变异体**——n=1 时 denReduce 退化单位阵，MatMul(flat,I) 与捷径 den=flat **逐位恒等**，任何断言原理上不可杀；其存活反向确证了源码设计声称，且同断言下 M16（den→numReduce）被同一测试立即致死证明监视有效（逃逸非盲区）
 - **唯一残余语句论证为真不可达**：broadcastBinary 双常量填充循环体（cols≡1 ⇒ `for j:=1;j<cols` 永不执行，[1,1]×[1,1] 被同形快路径先截）——列明不强凑
@@ -339,4 +348,6 @@ Git 历史：`87ccf77` 基线 → `08aba45` 阶段3a → `102af40` 阶段3b → 
 - 2026-07-30：6b 红队三路验证全 ✅——性能组（git 历史 oracle 差分，前向 ≤1.79e-7）/ optimizer 组（教科书参考逐位对照 + 鉴别力校验）/ CfC 组（六路取证 liquid cubic 零命中、方程级忠实裁决、10/10 数值对抗、含自我证伪留档）。
 - 2026-07-30：6c 双语文档同步（8 工单 20 文件，反查修正 3 处偏差），主控补修 examples 注释，终检 gauntlet 全绿、旧文案 grep 零残留，提交 fd14fdf；前六个阶段关闭。
 - 2026-07-30：阶段 7 双轨再进：7a 序列化（serialize 包 + nn Save/Load）+ autograd 深改（−50.55%）+ CfC 示例（3d47b4c）；7b 红队双路——序列化 7,500 变异体 0 panic 但 F1/F2 资源耗尽（修复：4GiB→33KiB）、autograd 逮住 F1 panic 回归（修复方自证又震出同族 F4-F6，52k 图四类差异归零）（154c9ca）；7c+ 模块迁移 github.com/qorm/LNN；7c 双语持久化指南 + 深改机制文档 + 7 处偏差修正（57e8bc7）。
-- 2026-07-30：**发布 https://github.com/qorm/LNN**（合并用户初始提交、LICENSE © 2026 QORM、v0.1.0 标签、CI 3/3 success、Go 代理解析实测通过）；**全部七个阶段关闭**。
+- 2026-07-30：**发布 https://github.com/qorm/LNN**（合并用户初始提交、LICENSE © 2026 QORM、v0.1.0 标签、CI 3/3 success、Go 代理解析实测通过）；前七个阶段关闭。
+- 2026-07-30：阶段 8 v0.2 双轨——8a SigmoidHadamard 融合（−5.6%/−5.8% 逐位）+ 黄金向量/版本策略 + erev 焙入（79d2eea）；8b 红队双路（新代码专项三角证据链全成立 ±0 角除外 / 总扫逮住 F1 units³ 内存悬崖）→ F1 修复 maxUnits/maxInDim=256（0ae7d02）；8c 覆盖率收复 autograd 100%/tensor 99.7%/nn 100% + 变异致死 17/18（e6ccdda）；8d 双语文档五工单 + 4 处反查修正。
+- 2026-07-30：**发布 v0.2.0**（tag + 推送 + CI + 代理解析）；**全部八个阶段关闭**。

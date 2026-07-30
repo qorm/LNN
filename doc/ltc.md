@@ -60,25 +60,25 @@ paper's alternative form `dv/dt = −(1/tau + f(v, I))·v + f(v, I)·A`.
 | `v ← num / (den + eps)` | `v = autograd.Div(num, Add(denBase, denR))` | 246 |
 | Affine output map `out = v⊙outW + outB` | `Step` | 249 |
 | `cm_t = softplus(cm)·unfolds/ts` with overflow-safe scaling | `scaledCapacitance` | 267–280 |
-| Per-presynaptic activation block + two indicator MatMul contractions | `synapses` / `synapsesRows` | 318–331 / 336–358 |
+| Per-presynaptic activation block + two indicator MatMul contractions | `synapses` / `synapsesRows` | 318–331 / 336–360 |
 
 ### Synaptic drive vectorization
 
-`synapses`/`synapsesRows` (`nn/ltc.go:318-358`) compute the currents per
+`synapses`/`synapsesRows` (`nn/ltc.go:318-360`) compute the currents per
 presynaptic neuron as one vector block each, instead of a per-synapse-pair
 loop. Row `i` of each parameter matrix still parameterizes the synapses
 *from* neuron `i`:
 
 ```go
 // One [batch, units] activation block per presynaptic neuron i
-// (synapsesRows, nn/ltc.go:341-346):
+// (synapsesRows, nn/ltc.go:341-348):
 preCol := Col(pre, i)                              // [batch, 1]
 z := Hadamard(sigRs[i], Sub(preCol, muRs[i]))      // σᵢⱼ·(v_pre,i − μᵢⱼ)
-blocks[i] = Hadamard(Sigmoid(z), wmRs[i])          // × wᵢⱼ·maskᵢⱼ
+blocks[i] = SigmoidHadamard(z, wmRs[i])            // sigmoid(z) ⊙ wᵢⱼ·maskᵢⱼ, one fused node
 
 // The blocks concatenate to [batch, pre·units]; two MatMuls against
 // sparse construction-time indicators contract the presynaptic axis
-// (nn/ltc.go:347-357):
+// (nn/ltc.go:349-358):
 den = MatMul(flat, denReduce)                      // den[:,j] = Σᵢ blocksᵢ[:,j]
 num = MatMul(flat, numReduce)                      // num[:,j] = Σᵢ blocksᵢ[:,j]·erev[i,j]
 ```
@@ -107,7 +107,15 @@ isolation, the vectorized drive is bit-for-bit identical to the old
 per-synapse loop (regression-tested with strict `==` by
 `TestLTCSynapsesVectorizedEquivalence` in `nn/ltc_test.go`: mask ∈ {0,1}
 and ascending contraction order reproduce the old `Add` chain exactly,
-with no rounding-order change). The whole `Step`, however, hoists `eps`
+with no rounding-order change) — with one honest corner: a **fully-masked
+postsynaptic column** differs in the `±0` sign bit. There every `actⱼ` is
+`+0`, so the old `Add` chain accumulates `+0 · erevⱼ`, which is `−0`
+(`0x80000000`) where `erevⱼ = −1`, while the MatMul contraction skips the
+zero entries and leaves the accumulator at `+0`. The two compare equal
+under `==` and the difference is unobservable downstream — `(±0)² = +0` in
+the squared-error loss, and the backward zero gradient carries no sign
+either — but a strict "bit-for-bit identical to the old `Add` chain" claim
+is false at exactly that sign bit, so we say it. The whole `Step`, however, hoists `eps`
 and the Step-constant terms (`gleak⊙vleak`, the sensory currents) out
 of the unfold loop, which changes `float32` association order. An
 independent red-team oracle — the pre-rewrite `ltc.go` extracted from
@@ -123,8 +131,10 @@ from O(units²) per-synapse nodes to O(units) vector blocks plus the two
 contractions; the example's first-iteration loss remains `0.690761`,
 bit-identical to the pre-rewrite value. (The phase-7 autograd backward
 overhaul — [architecture.md](architecture.md) — then roughly halved the
-backward count again without changing the graph shape: current values
-are `LTCStep` **2,442** and `UnrollBackward` **33,963** allocs/op.)
+backward count again without changing the graph shape, and the phase-8
+Sigmoid–Hadamard fusion (`synapsesRows` now calls `autograd.SigmoidHadamard`
+instead of a `Sigmoid`+`Hadamard` pair) trimmed it further: current values
+are `LTCStep` **2,306** and `UnrollBackward` **31,983** allocs/op.)
 
 ## The semi-implicit Euler, derived
 

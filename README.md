@@ -212,10 +212,11 @@ recommended production form — caller-owned gradient-norm clipping plus
   kept alive by the computation graph, so memory grows with the number of
   ops. An LTC step unrolls `unfolds` ODE iterations into the graph, each
   `O(units)` vector blocks plus two MatMul contractions — down from
-  `O(units²)` per-synapse nodes since the synapse vectorization, and the
-  phase-7 backward overhaul halved the per-node allocations again
-  (measured: `LTCStep` 2,442 allocs/op, `UnrollBackward` 33,963 —
-  cumulative −67%/−72% from the original loop). Keep `units`, `unfolds`
+  `O(units²)` per-synapse nodes since the synapse vectorization; the
+  phase-7 backward overhaul halved the per-node allocations again, and the
+  phase-8 Sigmoid–Hadamard fusion trimmed them further
+  (measured: `LTCStep` 2,306 allocs/op, `UnrollBackward` 31,983 —
+  cumulative −69%/−73% from the original loop). Keep `units`, `unfolds`
   and sequence length modest on this engine; the `CfC` cell
   ([doc/cfc.md](doc/cfc.md)) has no `unfolds` factor at all.
 
@@ -241,11 +242,11 @@ Honest maturity assessment as of this commit (coverage measured with
 
 | Package | Status |
 |---|---|
-| `tensor` | Core is stable and well tested (~82% line coverage). Some defensive checks (overflow-safe sizing, empty-input edge cases) are being hardened. The transpose-aware MatMul kernels added in phase 7 are exercised through the `autograd` package's tests rather than `tensor`'s own, which is most of the gap to the ~90% measured before that rework. |
-| `autograd` | Stable and well tested (~87% line coverage); gradients pass finite-difference and bitwise-differential checks on the covered paths. The phase-7 backward overhaul added defensive legacy-composition fallback branches for irregular manually seeded gradients, and those fallbacks account for most of the uncovered statements. |
-| `nn` | Functional and well tested (~99% line coverage): the LTC and CfC forward/backward paths are regression-tested, including closed-form degenerate-case checks, tiny/NaN `ts` guards, and wiring validation. Reversal potentials are fixed ±1 constants in both cells, not trainable. CfC is a phase-6 feature and its API may still evolve. |
+| `tensor` | Core is stable and well tested (~99.7% line coverage). The single residual uncovered statement is a double-constant fill-loop body in `broadcastBinary` that is argued unreachable (its column count is always `1` on that path, so the loop never executes, and the `[1,1]×[1,1]` case is intercepted by the same-shape fast path first); it is documented rather than padded with a contrived test. The transpose-aware MatMul kernels added in phase 7 are exercised through the `autograd` package's tests. |
+| `autograd` | Stable and well tested (100% line coverage); gradients pass finite-difference and bitwise-differential checks across the covered paths, including the phase-7 legacy-composition fallback branches for irregular manually seeded gradients and the phase-8 Sigmoid–Hadamard fusion's regular and fallback paths. |
+| `nn` | Functional and well tested (100% line coverage): the LTC and CfC forward/backward paths are regression-tested, including closed-form degenerate-case checks, tiny/NaN `ts` guards, wiring validation, and Save/Load round-trips. Reversal potentials are fixed ±1 constants in both cells, baked into construction-time indicator matrices — not trainable, and with no dead gradient. CfC is a phase-6 feature and its API may still evolve. |
 | `optimizer` | Stable, 100% line coverage: the three update rules are verified against independent reference implementations (SGD bit-for-bit, Adam ~1.6e-6 vs a float64 reference), and the pointer-keyed state semantics are regression-tested. |
-| `serialize` | Stable, 97.8% line coverage: round-trip bit-exactness (NaN and −0 included) is regression-tested; the hostile-stream contract — fixed limits validated before allocation, progressive allocation on unknown-length readers — is pinned by allocation-count tests; and red-team mutation fuzzing produced zero panics across 7,500 mutants, plus a further 1,200 after the resource-exhaustion hardening. The resource bounds are documented in [doc/persistence.md](doc/persistence.md). |
+| `serialize` | Stable, 97.8% line coverage: round-trip bit-exactness (NaN and −0 included) is regression-tested and byte-pinned by committed golden vectors; the hostile-stream contract — fixed limits validated before allocation (including the load-path `units`/`inDim` cap of 256 that bounds the O(units³) indicator matrices), progressive allocation on unknown-length readers — is pinned by allocation-count and byte-budget tests; and red-team mutation fuzzing produced zero panics across 7,500 mutants, plus a further 1,200 after the resource-exhaustion hardening. The resource bounds are documented in [doc/persistence.md](doc/persistence.md). |
 
 The CfC (Closed-form Continuous-time) cell and built-in optimizers
 shipped in phase 6, and serialization plus the autograd backward
@@ -258,10 +259,13 @@ understanding the engine. Sequence unrolling is covered by the generic
 `nn.Unroll` helper; `examples/ltc-sequence` shows the end-to-end
 training pattern with hand-rolled SGD, and `examples/cfc-sequence` the
 same task with the CfC cell and the recommended optimizer form (loss
-`0.621 → 0.029`). The remaining roadmap is the technical-debt table in
-[doc/pitfalls.md](doc/pitfalls.md) — headlined by the Sigmoid–Hadamard
-fused backward (#13), `tensor.New`'s fixed per-node overhead (#12) and
-the CfC's `erev` dead gradients (#10).
+`0.621 → 0.029`). Phase 8 closed the Sigmoid–Hadamard fused backward
+(#13) and the CfC's `erev` dead gradients (#10), and added the
+serialization golden vectors plus the load-path `units`/`inDim` caps.
+The remaining roadmap is the technical-debt table in
+[doc/pitfalls.md](doc/pitfalls.md) — headlined by the indicator-matrix
+O(units³) materialization (#14, whose load side those caps already
+close) and `tensor.New`'s fixed per-node overhead (#12).
 
 Track the remediation plan and progress in `PLAN.md` and `PROGRESS.md`.
 

@@ -69,16 +69,36 @@ keep logits bounded, clamp inputs to `Log`, and clip gradients
 ([training.md](training.md)). Once a single `NaN` exists, it propagates
 through elementwise paths for the rest of the iteration.
 
+**Worse, a `NaN` that reaches an optimizer's state is permanent.** The
+momentum/second-moment estimates of `Momentum` and `Adam` are running
+accumulators: once a single `NaN` gradient is folded into them, that
+parameter's state is `NaN` forever, and every later step multiplies the
+poison forward — a long red-team run (one injected `NaN`, 60 iterations)
+stayed all-`NaN` to the end and never recovered. Crucially, **later
+healthy gradients do not wash the state clean**, and `ZeroGrad` does not
+help either: the poison lives in the optimizer's per-parameter buffers,
+not in `Grad`. A contaminated optimizer must be discarded and rebuilt
+(fresh state), or the affected parameters reset. This is the strongest
+argument for keeping logits bounded and clipping gradients
+([training.md](training.md)) — once `NaN` enters a stateful optimizer,
+the only fix is starting that state over.
+
 **One asymmetric NaN behavior to know:** `MatMul` skips zero multipliers
-in its inner loop (`tensor/ops.go:20`), so `0 * NaN` contributes `0`
-instead of poisoning the product:
+in its inner loop, and the skip tests only the **left** operand
+(`tensor/ops.go:20`). The behavior is therefore directional: `0 * NaN`
+contributes `0` (the zero multiplier is skipped before the product is
+formed), but `NaN * 0` still yields `NaN` (the `NaN` left multiplier is
+not zero, so the product `NaN * 0 = NaN` is accumulated):
 
 ```go
 tensor.MatMul(tensor.FromData([]float32{0}, 1, 1),
 	tensor.FromData([]float32{float32(math.NaN())}, 1, 1)).Data // [0], not [NaN]
+tensor.MatMul(tensor.FromData([]float32{float32(math.NaN())}, 1, 1),
+	tensor.FromData([]float32{0}, 1, 1)).Data // [NaN] — the other order poisons
 ```
 
-Do not rely on MatMul to surface NaNs in sparse positions.
+Do not rely on MatMul to surface NaNs in sparse positions, and do not
+assume the zero-skipping is symmetric — it is not.
 
 ## 3. Repeated Backward on the same graph: exactly linear
 
@@ -121,7 +141,7 @@ In-place parameter updates therefore belong strictly *after* `Backward`.
 ## 5. GatherRows copies its indices (fixed hazard)
 
 `autograd.GatherRows(a, idx)` copies `idx` on entry
-(`autograd/ops.go:791`), so the caller may freely reuse or mutate the
+(`autograd/ops.go:855`), so the caller may freely reuse or mutate the
 slice between forward and backward — the gradient is computed from the
 indices used in the forward pass:
 
@@ -174,8 +194,9 @@ Every intermediate tensor stays alive until `Backward` completes. One LTC
 step unrolls `unfolds` ODE iterations, each O(units) vector blocks plus
 two MatMul contractions since the phase-6 synapse vectorization (down
 from O(units²) per-synapse nodes — see [ltc.md](ltc.md)), and the
-phase-7 backward overhaul halved the per-node allocation count again
-(`UnrollBackward` 33,963 allocs/op, −72% cumulative from the original
+phase-7 backward overhaul halved the per-node allocation count again,
+with the phase-8 Sigmoid–Hadamard fusion taking it further still
+(`UnrollBackward` 31,983 allocs/op, −73% cumulative from the original
 loop — see [architecture.md](architecture.md)); a sequence of
 `T` steps multiplies that by `T`. Memory grows with ops per iteration,
 not just parameters — keep `units`, `unfolds` and sequence length
@@ -225,14 +246,15 @@ gradients):
 
 | item | status |
 |---|---|
-| `autograd.Div` closed form | **done:** single graph node with quotient-rule backward (`da = g/b`, `db = −g·a/b²`, `autograd/ops.go:725-742`). Note the inherent `1/b²` gradient amplification for small divisors remains — with LTC's `eps = 1e-8` floor that is up to ~`1e16` — so gradient clipping stays recommended |
+| `autograd.Div` closed form | **done:** single graph node with quotient-rule backward (`da = g/b`, `db = −g·a/b²`, `autograd/ops.go:793-810`). Note the inherent `1/b²` gradient amplification for small divisors remains — with LTC's `eps = 1e-8` floor that is up to ~`1e16` — so gradient clipping stays recommended |
 | LTC synapse vectorization | **done (phase 6):** masks folded out of the hot path; per-presynaptic-neuron vector blocks + two construction-time indicator-matrix MatMul contractions ([ltc.md](ltc.md)). `LTCStep` 7,360 → 3,440 allocs/op (−53.3%), `UnrollBackward` 120,163 → 68,688 (−42.8%). The whole `Step` is ULP-equivalent to the pre-rewrite loop (forward ≤ 1.79e-7, gradients ≤ 1.19e-7, independent red-team oracle); bitwise identity holds only for the isolated `synapses()` drive |
-| Autograd backward overhaul (closures, fusion, `addGrad` cloning) | **done (phase 7):** per-node backward closures replaced by op-kind tag dispatch; `addGrad` first-contribution ownership transfer (Clone share ~20% → ~1%); unary backward chains fused (Sigmoid/Tanh 4→1 nodes), MatMul transpose buffers removed, product-and-reduce fused — all gated bitwise against the pre-rewrite oracle on 52k differential graphs, with an arm64 FMA conversion barrier keeping fused loops two-rounding-exact ([architecture.md](architecture.md)). `UnrollBackward` 68,688 → 33,963 allocs/op (−50.55%); four other benchmarks −23%…−58%, zero regressions. Remaining per-node overhead is tracked in the two items below |
+| Autograd backward overhaul (closures, fusion, `addGrad` cloning) | **done (phase 7):** per-node backward closures replaced by op-kind tag dispatch; `addGrad` first-contribution ownership transfer (Clone share ~20% → ~1%); unary backward chains fused (Sigmoid/Tanh 4→1 nodes), MatMul transpose buffers removed, product-and-reduce fused — all gated bitwise against the pre-rewrite oracle on 52k differential graphs, with an arm64 FMA conversion barrier keeping fused loops two-rounding-exact ([architecture.md](architecture.md)). `UnrollBackward` 68,688 → 33,963 allocs/op (−50.55%); four other benchmarks −23%…−58%, zero regressions. Remaining per-node overhead is tracked in the `tensor.New` item below |
 | `tensor.New` fixed per-node overhead | future: profiling puts 64.9% of the remaining allocations in each node's forward output plus its `Shape`/`Data` double allocation; further compression needs fixed-capacity parent slots (blocked by existing structural-assertion tests) and a fixed-rank `Tensor` shape (public-API break) |
-| Sigmoid–Hadamard fused backward (LTC hot-path pattern) | future: would need a new operator layer in `tensor`; cost/fragility ratio still under evaluation |
-| CfC `erev` dead gradients | informational: the CfC's reversal potentials enter the graph as `Var` leaves, so backward work is spent on gradients nobody reads (`Parameters()` excludes them; optimizers cannot reach them). The LTC pays no such cost — it bakes ±1 into `Const` indicator matrices — and the CfC could adopt the same trick |
+| Sigmoid–Hadamard fused backward (LTC hot-path pattern) | **done (phase 8):** `autograd.SigmoidHadamard(z, w)` fuses the hot-path `Hadamard(Sigmoid(z), w)` into one node (adopted at `nn/ltc.go:347`). The forward is bitwise by construction (it runs the same two tensor ops), and the regular 2D backward reaches bitwise equivalence with the legacy two-node chain by rounding the `g⊙w` product at the very same site; irregular shapes or manually seeded gradients fall back to the legacy composition verbatim (quirks and panic contract preserved). `LTCStep` 2,442 → **2,306** allocs/op (−5.6%), `UnrollBackward` 33,963 → **31,983** (−5.8%) — a single-digit gain, and the measured structural ceiling: each site saves exactly one graph node plus one backward intermediate, the rest being `tensor.New`'s per-node overhead (previous item). See [architecture.md](architecture.md) |
+| CfC `erev` dead gradients | **done (phase 8):** the CfC's reversal potentials are now baked into construction-time indicator matrices — the LTC's trick, adopted. The `erev`/`sErev` fields are plain `*tensor.Tensor` with no gradient to compute, so the dead gradient is *structurally impossible* rather than merely zero; `drive()` collapses to two MatMul contractions. Bitwise-equivalent to the former `Var`-leaf drive (red-team differential test), and the load path rebuilds the indicators from the streamed polarities ([persistence.md](persistence.md)) |
+| Indicator-matrix O(units³) materialization | **load side closed (phase 8), root fix open:** the dense `[pre·units, units]` reduction indicators make construction- and load-time memory O(units³) while the header that controls it is only 9–13 bytes. `LoadLTC`/`LoadCfC` now cap `units`/`inDim` at 256 (≤ 256 MiB of indicator matrices per loaded cell, ~320 MiB peak), turning a 13-byte units=4096 attack stream that used to attempt ~550 GB until the OS killed the process into a valued error. The root fix — sparse contractions that never materialize the `[units², units]` indicators, on the constructor side too — remains open ([persistence.md](persistence.md)) |
 | Unify reduction shape conventions (`SumRows`/`SumCols`, 1D promotion) | separate evaluation; API-breaking |
-| `tensor.Stack` | experimental: yields 3D tensors that no other op consumes (`tensor/tensor.go:165`); kept for compatibility |
+| `tensor.Stack` | experimental: yields 3D tensors that no other op consumes (`tensor/tensor.go:170`); kept for compatibility |
 | CfC (Closed-form Continuous-time) cell | **done (phase 6):** `nn.CfC` (`nn/cfc.go`) — same ODE and synapse parameterization as the LTC, driven by the Lemma 1 closed form; paper↔code correspondence and verification trail in [cfc.md](cfc.md). New API: may still evolve |
 | Built-in optimizers | **done (phase 6):** the `optimizer` package (SGD/Momentum/Adam, 100% coverage); the hand-rolled loop remains the supported pattern for understanding and for rules the package does not cover — [training.md](training.md) covers both |
 | Serialization (Save/Load) | **done (phase 7):** the `serialize` package (versioned `"LNNS"` tensor streams) plus six `nn` Save/Load functions for LTC/CfC/Linear; hostile-stream safe — errors never panics, fixed limits validated before allocation, progressive allocation on unknown-length readers (a 4 GiB claim that stops after 18 bytes peaks at ~33 KiB). Red-team mutation fuzzing: 7,500 mutants with 0 panics, plus 1,200 mutants after the resource-exhaustion hardening, again 0 panics. Format spec, API guide and the full safety contract in [persistence.md](persistence.md) |

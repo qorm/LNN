@@ -181,7 +181,7 @@ out2, h2 := cfc.Step(x, nil, 0.1)
 
   其他任何组合都会 panic，并附说明性消息。
 - **形状约定并非完全对称**（例如 `SumRows` 返回 `[1,n]` 而 `SumCols` 返回 `[m]`，1D⊕1D 的结果会被提升为 `[1,n]`）。依赖某个归约的输出形状之前，请先读 `tensor/ops.go` 里的文档注释。
-- **计算图保留到 `Backward` 为止。** 每个中间张量都被计算图持有，因此内存随算子数量增长。一次 LTC step 会把 `unfolds` 轮 ODE 迭代展开进图，自突触向量化起每轮是 O(units) 个向量块加两次 MatMul 收缩——从 O(units²) 个逐突触节点降下来，而阶段 7 的反向深改又把逐节点分配数砍掉一半（实测：`LTCStep` 2,442 allocs/op、`UnrollBackward` 33,963——较最初循环累计 −67%/−72%）。在这个引擎上，`units`、`unfolds` 和序列长度请保持适度；`CfC` 细胞（[doc/zh/cfc.md](doc/zh/cfc.md)）则完全没有 `unfolds` 因子。
+- **计算图保留到 `Backward` 为止。** 每个中间张量都被计算图持有，因此内存随算子数量增长。一次 LTC step 会把 `unfolds` 轮 ODE 迭代展开进图，自突触向量化起每轮是 O(units) 个向量块加两次 MatMul 收缩——从 O(units²) 个逐突触节点降下来；阶段 7 的反向深改把逐节点分配数砍掉一半，阶段 8 的 Sigmoid–Hadamard 融合再削一刀（实测：`LTCStep` 2,306 allocs/op、`UnrollBackward` 31,983——较最初循环累计 −69%/−73%）。在这个引擎上，`units`、`unfolds` 和序列长度请保持适度；`CfC` 细胞（[doc/zh/cfc.md](doc/zh/cfc.md)）则完全没有 `unfolds` 因子。
 
 ## 并发契约
 
@@ -199,13 +199,13 @@ out2, h2 := cfc.Step(x, nil, 0.1)
 
 | 包 | 状态 |
 |---|---|
-| `tensor` | 核心稳定、测试充分（约 82% 行覆盖率）。部分防御性检查（溢出安全的尺寸计算、空输入边界情形）仍在加固中。阶段 7 新增的转置感知 MatMul 内核是由 `autograd` 包的测试（而非 `tensor` 自己的测试）覆盖的，与深改前约 90% 实测值的差距主要来自这里。 |
-| `autograd` | 稳定、测试充分（约 87% 行覆盖率）；已覆盖路径上的梯度均通过有限差分与逐位差分检验。阶段 7 的反向深改为异形手设梯度新增了防御性的旧组合回退分支，未覆盖语句大多在这些回退上。 |
-| `nn` | 可用、测试充分（约 99% 行覆盖率）：LTC 与 CfC 的前向/反向路径有回归测试，包括闭式退化情形检验、微小/NaN `ts` 防护和接线校验。两个细胞的反转电位都是固定的 ±1 常量，不可训练。CfC 是阶段 6 的新特性，API 仍可能演进。 |
+| `tensor` | 核心稳定、测试充分（约 99.7% 行覆盖率）。唯一残余的未覆盖语句是 `broadcastBinary` 里一处双常量填充循环体，已论证为不可达（该路径上列数恒为 `1`，循环永不执行，且 `[1,1]×[1,1]` 会被同形快路径先截）；列明而非强凑一个造作的测试。阶段 7 新增的转置感知 MatMul 内核由 `autograd` 包的测试覆盖。 |
+| `autograd` | 稳定、测试充分（100% 行覆盖率）；已覆盖路径上的梯度均通过有限差分与逐位差分检验，包括阶段 7 为异形手设梯度新增的旧组合回退分支，以及阶段 8 Sigmoid–Hadamard 融合的常规与回退路径。 |
+| `nn` | 可用、测试充分（100% 行覆盖率）：LTC 与 CfC 的前向/反向路径有回归测试，包括闭式退化情形检验、微小/NaN `ts` 防护、接线校验与 Save/Load round-trip。两个细胞的反转电位都是固定的 ±1 常量，焙入构造期指示矩阵——不可训练，也没有死梯度。CfC 是阶段 6 的新特性，API 仍可能演进。 |
 | `optimizer` | 稳定，100% 行覆盖率：三条更新规则均与独立参考实现对照验证（SGD 逐位一致，Adam 对 float64 参考最大偏差约 1.6e-6），指针键状态语义有回归测试。 |
-| `serialize` | 稳定，97.8% 行覆盖率：round-trip 逐位精确性（含 NaN 与 −0）有回归测试；不可信流契约——固定限额先校验后分配、未知长度读端渐进分配——以分配计数测试钉住；红队变异模糊 7,500 个变异体 0 panic，资源耗尽加固后再测 1,200 个依然 0 panic。资源边界文档见 [doc/zh/persistence.md](doc/zh/persistence.md)。 |
+| `serialize` | 稳定，97.8% 行覆盖率：round-trip 逐位精确性（含 NaN 与 −0）有回归测试，并以提交的黄金向量做字节级钉死；不可信流契约——固定限额先校验后分配（含加载路径 `units`/`inDim` 上限 256，为 O(units³) 指示矩阵封顶）、未知长度读端渐进分配——以分配计数与字节预算测试钉住；红队变异模糊 7,500 个变异体 0 panic，资源耗尽加固后再测 1,200 个依然 0 panic。资源边界文档见 [doc/zh/persistence.md](doc/zh/persistence.md)。 |
 
-CfC（Closed-form Continuous-time）细胞与内置优化器在阶段 6 落地，序列化与 autograd 反向深改在阶段 7 落地：`nn.CfC`（[doc/zh/cfc.md](doc/zh/cfc.md)）是 API 仍可能演进的特性；`optimizer` 包（SGD/Momentum/Adam）与 `serialize` 包加 `nn` 的六个 Save/Load 函数（[doc/zh/persistence.md](doc/zh/persistence.md)）已稳定。手写循环依然有效，也仍是理解引擎的基础。序列展开由通用的 `nn.Unroll` 助手覆盖；`examples/ltc-sequence` 以手写 SGD 展示端到端训练范式，`examples/cfc-sequence` 在同一任务上展示 CfC 细胞加推荐 optimizer 形态（损失 `0.621 → 0.029`）。剩余路线图即 [doc/zh/pitfalls.md](doc/zh/pitfalls.md) 的技术债表——领衔的是 Sigmoid–Hadamard 融合反向（#13）、`tensor.New` 的逐节点固定开销（#12）与 CfC 的 `erev` 死梯度（#10）。
+CfC（Closed-form Continuous-time）细胞与内置优化器在阶段 6 落地，序列化与 autograd 反向深改在阶段 7 落地：`nn.CfC`（[doc/zh/cfc.md](doc/zh/cfc.md)）是 API 仍可能演进的特性；`optimizer` 包（SGD/Momentum/Adam）与 `serialize` 包加 `nn` 的六个 Save/Load 函数（[doc/zh/persistence.md](doc/zh/persistence.md)）已稳定。手写循环依然有效，也仍是理解引擎的基础。序列展开由通用的 `nn.Unroll` 助手覆盖；`examples/ltc-sequence` 以手写 SGD 展示端到端训练范式，`examples/cfc-sequence` 在同一任务上展示 CfC 细胞加推荐 optimizer 形态（损失 `0.621 → 0.029`）。阶段 8 销账了 Sigmoid–Hadamard 融合反向（#13）与 CfC 的 `erev` 死梯度（#10），并新增序列化黄金向量与加载路径 `units`/`inDim` 上限。剩余路线图即 [doc/zh/pitfalls.md](doc/zh/pitfalls.md) 的技术债表——领衔的是指示矩阵 O(units³) 实体化（#14，其加载侧已由上述上限封堵）与 `tensor.New` 的逐节点固定开销（#12）。
 
 修复计划与进展追踪见 `PLAN.md` 和 `PROGRESS.md`。
 

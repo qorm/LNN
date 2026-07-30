@@ -50,21 +50,21 @@ cm · dv/dt = −gleak · (v − vleak) + Σⱼ actⱼ · (erevⱼ − v)
 | `v ← num / (den + eps)` | `v = autograd.Div(num, Add(denBase, denR))` | 246 |
 | 仿射输出映射 `out = v⊙outW + outB` | `Step` | 249 |
 | `cm_t = softplus(cm)·unfolds/ts`，带溢出安全缩放 | `scaledCapacitance` | 267–280 |
-| 逐突触前神经元激活块 + 两次指示矩阵 MatMul 收缩 | `synapses` / `synapsesRows` | 318–331 / 336–358 |
+| 逐突触前神经元激活块 + 两次指示矩阵 MatMul 收缩 | `synapses` / `synapsesRows` | 318–331 / 336–360 |
 
 ### 突触驱动向量化
 
-`synapses`/`synapsesRows`（`nn/ltc.go:318-358`）以每个突触前神经元一个向量块计算电流，不再是逐突触对的循环。每个参数矩阵的第 `i` 行仍然参数化*从*神经元 `i` *出发*的突触：
+`synapses`/`synapsesRows`（`nn/ltc.go:318-360`）以每个突触前神经元一个向量块计算电流，不再是逐突触对的循环。每个参数矩阵的第 `i` 行仍然参数化*从*神经元 `i` *出发*的突触：
 
 ```go
 // 每个突触前神经元 i 一个 [batch, units] 激活块
-// （synapsesRows，nn/ltc.go:341-346）：
+// （synapsesRows，nn/ltc.go:341-348）：
 preCol := Col(pre, i)                              // [batch, 1]
 z := Hadamard(sigRs[i], Sub(preCol, muRs[i]))      // σᵢⱼ·(v_pre,i − μᵢⱼ)
-blocks[i] = Hadamard(Sigmoid(z), wmRs[i])          // × wᵢⱼ·maskᵢⱼ
+blocks[i] = SigmoidHadamard(z, wmRs[i])            // sigmoid(z) ⊙ wᵢⱼ·maskᵢⱼ，单个融合节点
 
 // 块并置为 [batch, pre·units]；与构造期稀疏指示矩阵（indicator matrix）
-// 做两次 MatMul，收缩突触前轴（nn/ltc.go:347-357）：
+// 做两次 MatMul，收缩突触前轴（nn/ltc.go:349-358）：
 den = MatMul(flat, denReduce)                      // den[:,j] = Σᵢ blocksᵢ[:,j]
 num = MatMul(flat, numReduce)                      // num[:,j] = Σᵢ blocksᵢ[:,j]·erev[i,j]
 ```
@@ -75,9 +75,9 @@ num = MatMul(flat, numReduce)                      // num[:,j] = Σᵢ blocksᵢ
 - **指示矩阵收缩。** `denReduce`/`numReduce` 是稀疏的 `[pre·units, units]` 指示矩阵（indicator matrix），构造时构建一次（`sumIndicator`，`nn/ltc.go:160-168`）；`numReduce` 还把常量 ±1 反转电位焙入其非零元（`reversalIndicator`，`nn/ltc.go:174-182`），因此 `erev` 再也不以逐突触图节点的形式出现。MatMul 跳过零表项，因此尽管指示矩阵有 `[pre·units, units]` 的规模，每次收缩的代价都是 O(batch·pre·units)。
 - **循环参数行每 Step 只切一次。** `mu`、`sigma` 与掩码后的权重矩阵都是 Step 不变量；`rows`（`nn/ltc.go:287-293`）切片一次，展开循环复用这些行，使每个矩阵 `units·(unfolds−1)` 个 `SliceRow` 节点留在图外。
 
-**等价性在 Step 层面是 ULP 级的——不是逐位。** 孤立的向量化驱动与旧的逐突触循环逐位相同（`nn/ltc_test.go` 的 `TestLTCSynapsesVectorizedEquivalence` 以严格 `==` 回归测试：mask ∈ {0,1} 加上升序收缩次序精确复现旧的 `Add` 链，舍入次序无任何变化）。但整个 `Step` 把 `eps` 和 Step 常量项（`gleak⊙vleak`、感知电流）提升到展开循环之外，改变了 `float32` 的结合次序。红队的独立 oracle——从 git 历史提取重写前的 `ltc.go`，在 13 组随机化配置上差分测试——实测最大差：前向 **1.79e-7**、全参数 BPTT 梯度 **1.19e-7**：ULP 级、良性，但不是"逐位"。
+**等价性在 Step 层面是 ULP 级的——不是逐位。** 孤立的向量化驱动与旧的逐突触循环逐位相同（`nn/ltc_test.go` 的 `TestLTCSynapsesVectorizedEquivalence` 以严格 `==` 回归测试：mask ∈ {0,1} 加上升序收缩次序精确复现旧的 `Add` 链，舍入次序无任何变化）——但有一个诚实的角落：**全掩蔽的突触后列**在 `±0` 符号位上有别。那里每个 `actⱼ` 都是 `+0`，于是旧 `Add` 链累加 `+0 · erevⱼ`，在 `erevⱼ = −1` 处得 `−0`（`0x80000000`）；而 MatMul 收缩跳过零表项，让累加器停在 `+0`。两者在 `==` 下相等，且差异在下游不可观测——平方误差损失里 `(±0)² = +0`，反向的零梯度也不带符号——但"与旧 `Add` 链逐位相同"这个严格宣称恰恰在这一个符号位上为假，所以我们如实说出。但整个 `Step` 把 `eps` 和 Step 常量项（`gleak⊙vleak`、感知电流）提升到展开循环之外，改变了 `float32` 的结合次序。红队的独立 oracle——从 git 历史提取重写前的 `ltc.go`，在 13 组随机化配置上差分测试——实测最大差：前向 **1.79e-7**、全参数 BPTT 梯度 **1.19e-7**：ULP 级、良性，但不是"逐位"。
 
-向量化本身的实测开销降幅（同机，`-benchtime=100x`，复验过）：`LTCStep` 7,360 → **3,440 allocs/op（−53.3%）**；`UnrollBackward` 120,163 → **68,688 allocs/op（−42.8%）**。每个 unfold 的图节点从 O(units²) 个逐突触节点降为 O(units) 个向量块加两次收缩；example 的首轮 loss 仍是 `0.690761`，与重写前逐位一致。（阶段 7 的 autograd 反向深改——见 [architecture.md](architecture.md)——在不改变图形态的前提下又把反向分配数砍掉约一半：当前值为 `LTCStep` **2,442**、`UnrollBackward` **33,963** allocs/op。）
+向量化本身的实测开销降幅（同机，`-benchtime=100x`，复验过）：`LTCStep` 7,360 → **3,440 allocs/op（−53.3%）**；`UnrollBackward` 120,163 → **68,688 allocs/op（−42.8%）**。每个 unfold 的图节点从 O(units²) 个逐突触节点降为 O(units) 个向量块加两次收缩；example 的首轮 loss 仍是 `0.690761`，与重写前逐位一致。（阶段 7 的 autograd 反向深改——见 [architecture.md](architecture.md)——在不改变图形态的前提下又把反向分配数砍掉约一半，阶段 8 的 Sigmoid–Hadamard 融合（`synapsesRows` 现改调 `autograd.SigmoidHadamard`，取代 `Sigmoid`+`Hadamard` 对）再削一刀：当前值为 `LTCStep` **2,306**、`UnrollBackward` **31,983** allocs/op。）
 
 ## 半隐式欧拉的推导
 
