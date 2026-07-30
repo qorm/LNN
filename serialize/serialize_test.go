@@ -223,6 +223,42 @@ func TestReadTensorsRejectsHostileStreams(t *testing.T) {
 	}
 }
 
+// TestReadTensorsRejectsUnknownVersionsActionably pins the versioning
+// contract: unknown versions are refused rather than parsed on a guess, and
+// the error must tell the caller which way the skew goes. A version above
+// the current one is a checkpoint from the future — the message carries the
+// actionable "written by a newer version / update" hint; a version below v1
+// can only be corruption, since no older layout was ever released. The
+// historic prefix of the message is asserted too, so documentation quoting
+// it keeps matching.
+func TestReadTensorsRejectsUnknownVersionsActionably(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		version byte
+		want    string
+	}{
+		{"version 2 (next release)", 2, "written by a newer version"},
+		{"version 99 (far future)", 99, "update this build"},
+		{"version 0 (never released)", 0, "no earlier layout exists"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stream := []byte{'L', 'N', 'N', 'S', tc.version, 0, 0, 0, 0} // magic, version, empty count
+			_, err := ReadTensors(bytes.NewReader(stream))
+			if err == nil {
+				t.Fatal("unknown version accepted")
+			}
+			msg := err.Error()
+			prefix := fmt.Sprintf("unsupported format version %d (this build reads version %d)", tc.version, Version)
+			if !strings.Contains(msg, prefix) {
+				t.Errorf("error %q loses the historic prefix %q", msg, prefix)
+			}
+			if !strings.Contains(msg, tc.want) {
+				t.Errorf("error %q lacks the actionable hint %q", msg, tc.want)
+			}
+		})
+	}
+}
+
 // TestHostileDimDoesNotAllocate proves the V-05 discipline: a stream claiming
 // a 1<<62-wide dimension is rejected by validation before any data buffer is
 // allocated. The whole read is required to run in a handful of allocations

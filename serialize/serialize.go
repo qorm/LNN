@@ -50,6 +50,46 @@
 // The write path, by contrast, handles in-memory tensors the caller owns;
 // still, it returns errors rather than panicking, so a Save loop can report
 // I/O failures uniformly.
+//
+// # Format versioning
+//
+// Version 1 — the layout documented above — is frozen. The meaning, position
+// and encoding of every byte this build writes will not change: same magic,
+// same header fields, same tensor order inside the nn model blobs, same
+// little-endian float32 payloads. Two sanctioned paths exist for future
+// formats:
+//
+//   - Append-only extension within v1: new data may be added only as extra
+//     tensors at the tail of a stream — counted in the header like any other
+//     tensor (bytes after the counted payloads remain corruption), never
+//     interleaved with existing ones, and only where the consuming model
+//     loader explicitly accepts both the old and the extended count. A
+//     moved, retyped or re-encoded field is not an extension. The
+//     model-level kind registry (nn/save.go: 0 = LTC, 1 = CfC, 2 = Linear)
+//     grows the same way: new kinds are appended with fresh tags; existing
+//     tags are never reused or redefined.
+//   - A whole-format upgrade: bump Version (to 2) and teach ReadTensors the
+//     old layout explicitly. One version byte governs the entire stream, so
+//     mixed-version streams cannot exist.
+//
+// Unknown versions are rejected, never guessed: a version byte above Version
+// fails with an error stating the stream was written by a newer version of
+// the library — update this build to read it — and a byte below Version as
+// corrupt, since no layout older than v1 was ever released. Guessing a
+// layout would silently mis-decode checkpoints, the exact failure mode this
+// package's error contract exists to prevent.
+//
+// The freeze is regression-pinned by golden vectors: testdata/ holds the
+// committed Save* byte streams of a documented LTC, CfC and Linear cell
+// (fixed seeds and construction parameters, listed in golden_test.go)
+// together with the exact Step outputs each loaded cell must reproduce.
+// Three tests stand guard: writer stability requires a same-seed rebuild to
+// re-emit the golden bytes byte for byte, load exactness requires the loaded
+// cells to reproduce the recorded outputs bit for bit, and reader-class
+// agreement requires identical loads on known- and unknown-length readers.
+// Any unintended change to the wire format or to cell semantics fails at
+// least one of them; regenerating the files is a deliberate, reviewed act
+// (go test ./serialize -write-golden), never a side effect.
 package serialize
 
 import (
@@ -314,7 +354,14 @@ func ReadTensors(r io.Reader) ([]*tensor.Tensor, error) {
 		return nil, fmt.Errorf("serialize: reading format version: %w", err)
 	}
 	if vb[0] != Version {
-		return nil, fmt.Errorf("serialize: unsupported format version %d (this build reads version %d)", vb[0], Version)
+		// Rejected, never guessed (see "Format versioning" in the package
+		// doc): the message tells the caller which way the skew goes, so a
+		// checkpoint from the future reads as an actionable "update this
+		// build" and anything below v1 as the corruption it must be.
+		if vb[0] > Version {
+			return nil, fmt.Errorf("serialize: unsupported format version %d (this build reads version %d): the stream was written by a newer version of the library; update this build to read it", vb[0], Version)
+		}
+		return nil, fmt.Errorf("serialize: unsupported format version %d (this build reads version %d): no earlier layout exists, the stream is corrupt or forged", vb[0], Version)
 	}
 	var cb [4]byte
 	if err := rd.full(cb[:]); err != nil {

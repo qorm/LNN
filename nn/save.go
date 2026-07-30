@@ -324,14 +324,17 @@ func LoadLTC(r io.Reader) (*LTC, error) {
 	return cell, nil
 }
 
-// cfcTensors returns c's tensors in stream order, mirroring ltcTensors.
+// cfcTensors returns c's tensors in stream order, mirroring ltcTensors. The
+// reversal potentials are plain tensors now (baked into the numerator
+// indicators at construction), so they go into the stream directly; the
+// order itself is unchanged.
 func cfcTensors(c *CfC) []*tensor.Tensor {
 	ts := make([]*tensor.Tensor, 0, cfcTensorCount)
 	ts = append(ts, c.wiring.sensoryMask, c.wiring.recurrentMask)
 	for _, p := range c.Parameters() {
 		ts = append(ts, p.Data)
 	}
-	ts = append(ts, c.erev.Data, c.sErev.Data)
+	ts = append(ts, c.erev, c.sErev)
 	return ts
 }
 
@@ -350,9 +353,10 @@ func SaveCfC(w io.Writer, c *CfC) error {
 }
 
 // LoadCfC reads a stream written by SaveCfC and returns an equivalent cell
-// with bit-identical Step behavior. The CfC evaluates its wiring and reversal
-// potentials directly at Step time (no baked-in indicators), so overwriting
-// the parameters, erev/sErev and the wiring is sufficient.
+// with bit-identical Step behavior. As in LoadLTC, the constructor bakes the
+// reversal potentials into the numerator reduction indicators, so after
+// overwriting the parameters, erev/sErev and the wiring, the indicators are
+// rebuilt in place from the streamed polarities.
 func LoadCfC(r io.Reader) (*CfC, error) {
 	hr := &headerReader{r: r}
 	if err := readKind(hr, kindCfC); err != nil {
@@ -388,10 +392,16 @@ func LoadCfC(r io.Reader) (*CfC, error) {
 	for _, p := range cell.Parameters() {
 		dsts = append(dsts, p.Data)
 	}
-	dsts = append(dsts, cell.erev.Data, cell.sErev.Data)
+	dsts = append(dsts, cell.erev, cell.sErev)
 	if err := copyFields(ts[2:], dsts); err != nil {
 		return nil, err
 	}
+	// The numerator reduction indicators were built by the constructor from
+	// its own (throwaway) reversal potentials; rebuild them in place from the
+	// loaded erev/sErev so the Step contraction uses the streamed polarities
+	// (same step as LoadLTC).
+	copy(cell.numReduceR.Data.Data, reversalIndicator(cell.erev.Data, units, units).Data)
+	copy(cell.numReduceS.Data.Data, reversalIndicator(cell.sErev.Data, inDim, units).Data)
 	return cell, nil
 }
 

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -375,7 +376,10 @@ func paramCount(params []*autograd.Variable) int {
 }
 
 // TestCfCParametersExcludeErev checks that reversal potentials are fixed
-// +/-1 constants absent from the trainable parameter set.
+// +/-1 constants absent from the trainable parameter set. Since the #10 fix
+// they are plain *tensor.Tensor fields (see TestCfCReversalPotentialsCarryNoGradient),
+// so leaking into the []*autograd.Variable Parameters() is a type-level
+// impossibility; the count and the +/-1 value assertions stay as before.
 func TestCfCParametersExcludeErev(t *testing.T) {
 	rng := rand.New(rand.NewSource(19))
 	cell := NewCfC(2, 4, nil, rng)
@@ -384,18 +388,214 @@ func TestCfCParametersExcludeErev(t *testing.T) {
 	if len(params) != 13 {
 		t.Fatalf("Parameters() has %d entries, want 13 (erev/sErev excluded)", len(params))
 	}
-	for _, p := range params {
-		if p == cell.erev || p == cell.sErev {
-			t.Fatalf("reversal potential %p leaked into Parameters()", p)
-		}
-	}
-	for name, e := range map[string]*autograd.Variable{"erev": cell.erev, "sErev": cell.sErev} {
-		for _, v := range e.Data.Data {
+	for name, e := range map[string]*tensor.Tensor{"erev": cell.erev, "sErev": cell.sErev} {
+		for _, v := range e.Data {
 			if v != 1 && v != -1 {
 				t.Fatalf("%s entry %v is not +/-1", name, v)
 			}
 		}
 	}
+}
+
+// TestCfCReversalPotentialsCarryNoGradient pins archived finding #10: the
+// reversal potentials used to enter the graph as Var leaves and accumulated
+// dead gradients that nothing ever read (red team measured
+// max|dL/dsErev| ~ 9e-3). They are now plain *tensor.Tensor fields baked
+// into the numReduce indicators, so a backward pass over a multi-step Unroll
+// can leave no gradient on them — verified structurally by reading the
+// fields via reflection: they are the gradient-free data type, and the 13
+// trainable parameters still receive finite gradients.
+func TestCfCReversalPotentialsCarryNoGradient(t *testing.T) {
+	rng := rand.New(rand.NewSource(61))
+	cell := NewCfC(2, 4, nil, rng)
+	readout := NewLinear(4, 1, rng)
+	params := ParametersOf(cell, readout)
+
+	xs := make([]*autograd.Variable, 3)
+	for i := range xs {
+		xs[i] = autograd.Var(tensor.Uniform(rng, -1, 1, 3, 2))
+	}
+	ys, _ := Unroll(cell, xs, nil, 0.2)
+	var acc *autograd.Variable
+	for i, y := range ys {
+		target := autograd.Var(tensor.Uniform(rng, -1, 1, 3, 1))
+		diff := autograd.Sub(readout.Forward(y), target)
+		sq := autograd.Hadamard(diff, diff)
+		if i == 0 {
+			acc = sq
+		} else {
+			acc = autograd.Add(acc, sq)
+		}
+	}
+	for _, p := range params {
+		p.ZeroGrad()
+	}
+	autograd.MeanAll(acc).Backward()
+
+	// The direct evidence: the reversal-potential fields are plain tensors.
+	// *tensor.Tensor has no Grad field, so gradient accumulation on them is
+	// not merely zero but structurally impossible.
+	rv := reflect.ValueOf(cell).Elem()
+	tensorType := reflect.TypeOf((*tensor.Tensor)(nil))
+	for _, name := range []string{"erev", "sErev"} {
+		f := rv.FieldByName(name)
+		if !f.IsValid() {
+			t.Fatalf("cell has no %s field", name)
+		}
+		if f.Type() != tensorType {
+			t.Fatalf("%s field is %v, want *tensor.Tensor (gradient-free data); a graph node here would revive the #10 dead gradient", name, f.Type())
+		}
+	}
+
+	// The bake removed dead weight only: every trainable parameter still
+	// receives a finite gradient.
+	for i, p := range params {
+		if p.Grad == nil {
+			t.Fatalf("parameter %d has nil gradient after Backward", i)
+		}
+		assertFinite(t, "parameter gradient", autograd.Var(p.Grad))
+	}
+}
+
+// legacyCfCDrive replicates the pre-#10 drive(): the reversal potentials
+// enter the graph as Var leaves and the presynaptic axis is contracted by an
+// Add chain of masked outer products. It is the white-box oracle for the
+// baked-indicator contraction the current drive() runs.
+func legacyCfCDrive(
+	pre, mu, sigma, w, erev *autograd.Variable,
+	maskRow func(i int) *tensor.Tensor,
+) (num, den *autograd.Variable) {
+	n := pre.Data.Cols()
+	for i := 0; i < n; i++ {
+		muR := autograd.SliceRow(mu, i)
+		sigR := autograd.SliceRow(sigma, i)
+		wR := autograd.SliceRow(w, i)
+		erevR := autograd.SliceRow(erev, i)
+		preCol := autograd.Col(pre, i)
+		act := autograd.Sigmoid(autograd.Hadamard(sigR, autograd.Sub(preCol, muR)))
+		act = autograd.Hadamard(act, wR)
+		act = autograd.Hadamard(act, autograd.Const(maskRow(i)))
+		rev := autograd.Hadamard(act, erevR)
+		if i == 0 {
+			num, den = rev, act
+		} else {
+			num = autograd.Add(num, rev)
+			den = autograd.Add(den, act)
+		}
+	}
+	return num, den
+}
+
+// TestCfCDriveBakeMatchesLegacyBitExact proves the baked-indicator
+// contraction is not merely equivalent but bit-identical to the old
+// Add-of-Hadamards drive: same forward bits for num and den on both paths
+// (sparse wiring included, so masked synapses are exercised), and same
+// backward bits for every parameter gradient. The oracle rebuilds erev as a
+// Var leaf, which simultaneously reproduces the old design's dead gradient —
+// asserted non-nil so the oracle is pinned as the genuine legacy code path.
+func TestCfCDriveBakeMatchesLegacyBitExact(t *testing.T) {
+	rng := rand.New(rand.NewSource(57))
+	cell := NewCfC(3, 5, RandomSparse(3, 5, 0.8, 0.7, rng), rng)
+	x := autograd.Var(tensor.Uniform(rng, -1, 1, 4, 3))
+	h := autograd.Var(tensor.Uniform(rng, -1, 1, 4, 5))
+
+	inputs := autograd.Add(autograd.Hadamard(x, cell.inW), cell.inB)
+	sWPos := autograd.Softplus(cell.sW)
+	wPos := autograd.Softplus(cell.w)
+
+	// Baked-indicator path (the current drive).
+	numS, denS := cell.drive(inputs, cell.sMu, cell.sSigma, sWPos, cell.denReduceS, cell.numReduceS, cell.wiring.SensoryRow)
+	numR, denR := cell.drive(h, cell.mu, cell.sigma, wPos, cell.denReduceR, cell.numReduceR, cell.wiring.RecurrentRow)
+
+	// Legacy Add-chain path, with erev re-wrapped as Var leaves (sharing the
+	// same data, which the forward pass only reads).
+	erevVar := autograd.Var(cell.erev)
+	sErevVar := autograd.Var(cell.sErev)
+	lNumS, lDenS := legacyCfCDrive(inputs, cell.sMu, cell.sSigma, sWPos, sErevVar, cell.wiring.SensoryRow)
+	lNumR, lDenR := legacyCfCDrive(h, cell.mu, cell.sigma, wPos, erevVar, cell.wiring.RecurrentRow)
+
+	for name, pair := range map[string][2]*autograd.Variable{
+		"numS": {numS, lNumS}, "denS": {denS, lDenS},
+		"numR": {numR, lNumR}, "denR": {denR, lDenR},
+	} {
+		if !sameBitsT(pair[0].Data, pair[1].Data) {
+			t.Fatalf("%s: baked-indicator contraction differs from the legacy Add chain", name)
+		}
+	}
+
+	// Backward through equal-valued roots: every parameter gradient must
+	// agree bit for bit between the two contractions.
+	newLoss := autograd.MeanAll(autograd.Add(autograd.Add(numS, numR), autograd.Add(denS, denR)))
+	legacyLoss := autograd.MeanAll(autograd.Add(autograd.Add(lNumS, lNumR), autograd.Add(lDenS, lDenR)))
+	params := cell.Parameters()
+	for _, p := range params {
+		p.ZeroGrad()
+	}
+	newLoss.Backward()
+	newGrads := make([]*tensor.Tensor, len(params))
+	for i, p := range params {
+		if p.Grad != nil {
+			newGrads[i] = p.Grad.Clone()
+		}
+	}
+	for _, p := range params {
+		p.ZeroGrad()
+	}
+	legacyLoss.Backward()
+	// gleak/vleak/cm/outW/outB feed the membrane algebra downstream of drive,
+	// not drive itself, so they stay gradient-free under both losses; every
+	// parameter that does participate must agree bit for bit.
+	touched := 0
+	for i, p := range params {
+		if newGrads[i] == nil && p.Grad == nil {
+			continue
+		}
+		touched++
+		if newGrads[i] == nil || p.Grad == nil || !sameBitsT(newGrads[i], p.Grad) {
+			t.Fatalf("parameter %d gradient differs between baked and legacy contractions", i)
+		}
+	}
+	if touched != 8 { // inW, inB (via inputs) + sMu, sSigma, sW, mu, sigma, w
+		t.Fatalf("drive touched %d parameters, want 8; the oracle graph is not the drive subgraph", touched)
+	}
+
+	// The oracle genuinely is the legacy design: its erev leaves accumulated
+	// the dead gradients that #10 removes (the red team measured ~9e-3 here).
+	if erevVar.Grad == nil || sErevVar.Grad == nil {
+		t.Fatal("legacy oracle did not accumulate the dead erev gradient; the oracle is not the old code path")
+	}
+	var maxDead float32
+	for _, g := range []*tensor.Tensor{erevVar.Grad, sErevVar.Grad} {
+		for _, v := range g.Data {
+			if a := float32(math.Abs(float64(v))); a > maxDead {
+				maxDead = a
+			}
+		}
+	}
+	if maxDead == 0 {
+		t.Fatal("legacy dead gradient is identically zero; the test would prove nothing")
+	}
+	t.Logf("legacy dead gradient max|dL/derev| = %.3e (now structurally impossible: erev is plain data)", maxDead)
+}
+
+// sameBitsT reports whether a and b have identical shapes and bit-identical
+// float32 payloads (named apart from save_test.go's saveSameBits to keep
+// this oracle self-describing).
+func sameBitsT(a, b *tensor.Tensor) bool {
+	if len(a.Shape) != len(b.Shape) || len(a.Data) != len(b.Data) {
+		return false
+	}
+	for i := range a.Shape {
+		if a.Shape[i] != b.Shape[i] {
+			return false
+		}
+	}
+	for i := range a.Data {
+		if math.Float32bits(a.Data[i]) != math.Float32bits(b.Data[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 // TestNewCfCValidation covers constructor argument checks.

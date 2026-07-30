@@ -35,6 +35,7 @@ const (
 	opMeanAll
 	opGatherRows
 	opLogSoftmaxRows
+	opSigmoidHadamard
 )
 
 // runBackward propagates v's accumulated gradient to its parents. The case
@@ -312,6 +313,56 @@ func (v *Variable) runBackward() {
 			}
 		}
 		a.addGrad(r)
+	case opSigmoidHadamard:
+		// Fused backward of Hadamard(Sigmoid(z), w): dz = g⊙w⊙s⊙(1−s) and
+		// dw = g⊙s reduced to w's shape, where s = sigmoid(z) is the auxiliary
+		// tensor the forward recorded (allocated once, never recomputed). The
+		// two branches reproduce exactly what the opHadamard+opSigmoid pair
+		// used to run: Hadamard's backward handed the sigmoid node the rounded
+		// product g⊙w (hadamardReduce's sameShape fast path), and opSigmoid's
+		// fused loop then evaluated mul32(g⊙w, mul32(s, 1−s)) per element. The
+		// loop below rounds the g⊙w product through mul32 at the very same
+		// spot, so the regular path is bit-identical to the legacy chain.
+		z, w := v.parents[0], v.parents[1]
+		s := v.aux
+		if s.Dims() == 2 && sameShape(v.Grad.Shape, s.Shape) {
+			// Regular 2D path (the LTC hot path): w broadcasts across s's rows
+			// (xRowAccess classifies every mode forward's Hadamard accepted).
+			gd, sd, wd := v.Grad.Data, s.Data, w.Data.Data
+			rows, cols := s.Shape[0], s.Shape[1]
+			r := tensor.New(elemwiseGradShape(z.Data.Shape)...)
+			for i := 0; i < rows; i++ {
+				wb, ws := xRowAccess(w.Data, i, cols)
+				for j := 0; j < cols; j++ {
+					k := i*cols + j
+					// rounded product g⊙w, then the opSigmoid grouping: no FMA
+					gw := mul32(gd[k], wd[wb+ws*j])
+					r.Data[k] = mul32(gw, mul32(sd[k], 1-sd[k]))
+				}
+			}
+			z.addGrad(r)
+			// dw: the same fused product-or-reduction opHadamard's b-branch ran.
+			w.addGrad(hadamardReduce(v.Grad, s, w.Data.Shape))
+			return
+		}
+		// Non-2D operands or an irregular manually seeded gradient: reproduce
+		// the legacy opHadamard+opSigmoid pair verbatim — both hadamardReduce
+		// branches, then opSigmoid's own regular/fallback dispatch — so the
+		// values, shapes, 1D-lift quirk and panic contract are all preserved.
+		gs := hadamardReduce(v.Grad, w.Data, s.Shape)
+		w.addGrad(hadamardReduce(v.Grad, s, w.Data.Shape))
+		if !gradMatchesElemwise(gs.Shape, z.Data.Shape) {
+			one := s.OnesLike()
+			deriv := tensor.Hadamard(s, tensor.Sub(one, s))
+			z.addGrad(tensor.Hadamard(gs, deriv))
+			return
+		}
+		gsd, sd := gs.Data, s.Data
+		r := tensor.New(elemwiseGradShape(z.Data.Shape)...)
+		for i := range r.Data {
+			r.Data[i] = mul32(gsd[i], mul32(sd[i], 1-sd[i]))
+		}
+		z.addGrad(r)
 	}
 }
 
@@ -678,6 +729,23 @@ func Tanh(a *Variable) *Variable {
 // Sigmoid applies the logistic sigmoid elementwise.
 func Sigmoid(a *Variable) *Variable {
 	return newOp(tensor.Sigmoid(a.Data), []*Variable{a}, opSigmoid)
+}
+
+// SigmoidHadamard differentiably computes Hadamard(Sigmoid(z), w) as a single
+// fused node. The forward runs the very same two tensor operations the
+// composition ran (sigmoid, then the elementwise product), so shapes,
+// broadcasting and values are bit-identical; the sigmoid buffer is kept on
+// the node (aux) so the backward reuses it instead of recomputing. The
+// backward propagates dz = g⊙w⊙s⊙(1−s) in one fused loop and dw = g⊙s
+// through the same fused reduction the Hadamard backward used, where the
+// composition recorded two op nodes and ran Sigmoid's backward on top of
+// Hadamard's (materializing the intermediate g⊙s gradient buffer the fusion
+// avoids). Broadcasting and shape semantics follow Hadamard exactly.
+func SigmoidHadamard(z, w *Variable) *Variable {
+	s := tensor.Sigmoid(z.Data)
+	out := newOp(tensor.Hadamard(s, w.Data), []*Variable{z, w}, opSigmoidHadamard)
+	out.aux = s
+	return out
 }
 
 // Exp applies exp elementwise.

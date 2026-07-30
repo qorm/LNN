@@ -206,10 +206,10 @@ func TestSaveLoadCfCBitExact(t *testing.T) {
 	}
 
 	saveParamsEqual(t, "CfC", cell.Parameters(), loaded.Parameters())
-	if !saveSameBits(cell.erev.Data, loaded.erev.Data) || !saveSameBits(cell.sErev.Data, loaded.sErev.Data) {
+	if !saveSameBits(cell.erev, loaded.erev) || !saveSameBits(cell.sErev, loaded.sErev) {
 		t.Error("reversal potentials differ after round trip")
 	}
-	for i, v := range append(append([]float32{}, loaded.erev.Data.Data...), loaded.sErev.Data.Data...) {
+	for i, v := range append(append([]float32{}, loaded.erev.Data...), loaded.sErev.Data...) {
 		if v != 1 && v != -1 {
 			t.Errorf("loaded reversal potential %d = %v, want +/-1", i, v)
 		}
@@ -701,6 +701,46 @@ func TestLoadLTCAcceptsFlippedReversalPattern(t *testing.T) {
 	orig, _ := cell.Step(x, nil, 0.1)
 	if saveSameBits(orig.Data, out.Data) {
 		t.Error("flipping every reversal potential left the Step output unchanged")
+	}
+}
+
+// TestLoadCfCAcceptsFlippedReversalPattern is the CfC twin of the LTC
+// flipped-pattern test, and the gate for the LoadCfC indicator rebuild:
+// since the #10 fix the CfC bakes erev/sErev into numerator indicators at
+// construction, so a load that forgot to rebuild them from the streamed
+// polarities would step exactly like the throwaway-RNG cell — the flipped
+// stream would load "fine" yet leave the output unchanged. Requiring the
+// output to actually move proves the streamed signs took effect.
+func TestLoadCfCAcceptsFlippedReversalPattern(t *testing.T) {
+	cell := NewCfC(4, 6, nil, rand.New(rand.NewSource(107)))
+	ts := cfcTensors(cell)
+	for _, idx := range []int{cfcTensorCount - 2, cfcTensorCount - 1} {
+		flipped := ts[idx].Clone()
+		for i, v := range flipped.Data {
+			flipped.Data[i] = -v
+		}
+		ts[idx] = flipped
+	}
+	raw := writeModelStream(t, kindCfC, []int{4, 6}, ts)
+	loaded, err := LoadCfC(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatalf("sign-flipped +/-1 pattern rejected: %v", err)
+	}
+	if !saveSameBits(ts[cfcTensorCount-2], loaded.erev) || !saveSameBits(ts[cfcTensorCount-1], loaded.sErev) {
+		t.Error("loaded reversal potentials do not match the flipped stream")
+	}
+	// The baked indicators must have been rebuilt from the flipped stream.
+	wantR := reversalIndicator(loaded.erev.Data, 6, 6)
+	wantS := reversalIndicator(loaded.sErev.Data, 4, 6)
+	if !saveSameBits(wantR, loaded.numReduceR.Data) || !saveSameBits(wantS, loaded.numReduceS.Data) {
+		t.Error("loaded numerator indicators do not match the streamed polarities")
+	}
+	x := saveInput(2, 4)
+	out, h := loaded.Step(x, nil, 0.1)
+	assertFinite(t, "flipped-erev CfC", out, h)
+	orig, _ := cell.Step(x, nil, 0.1)
+	if saveSameBits(orig.Data, out.Data) {
+		t.Error("flipping every reversal potential left the Step output unchanged; LoadCfC did not rebuild the indicators")
 	}
 }
 

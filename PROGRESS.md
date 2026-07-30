@@ -15,6 +15,7 @@
 | 5 | 技术债清扫 + 工程成熟度（Benchmark/CI/双语文档） | ✅ 完成 |
 | 6 | 双轨扩展：特性（optimizer/CfC）+ 性能（热路径向量化） | ✅ 完成 |
 | 7 | 双轨再进：序列化特性 + autograd 深改 + 发布 | ✅ 完成 |
+| 8 | v0.2 双轨：融合反向 + 序列化版本化 → 覆盖率收复 → 红队总扫 → v0.2.0 | 🔄 进行中（8a ✅ / 8b 红队双路已派发） |
 
 ## 阶段 1：并行分析（已完成）
 
@@ -207,6 +208,23 @@
 **⚠️ 主控更正**：前条 P-B 摘要中"96,000 图严格 == 零失败（含 ±0）"的表述**仅在实施方生成器覆盖域内成立**——红队以异源生成器在 1D 怪癖×广播组合与 NaN 梯域发现 F1-F3。P-B 的门禁机制本身有效（负对照可侦测、确曾拦截 FMA 与升维两缺陷），短板在覆盖域；教训：差分 fuzz 的裁决力不超过生成器的想象力，异源生成器交叉是必需而非可选
 
 **红队·序列化组（已完成）**：7,500 变异体（位翻转/删除/插入/块交换，25% 叠连击）**0 panic / 0 静默错乱**（黑盒 oracle 重序列化核验掩码二值/形状/Step 健全；7 例"ok 垃圾入参"均为参数含 NaN/Inf 的忠实复现）；语义攻击全挡（张量顺序偷换/掩码注入 0.5/−1/2/NaN/跨 kind/未知 kind/version 0·2·99·255/UTF-16/大端伪流）；错误全透传（写端每个截断点、读端多偏移）；round-trip **训练动力学逐位等价**（加载后再训练 3 步的参数轨迹与同步训练锁死、种子无关）。**资源耗尽维度不安全**：F1 Medium——**无 Len() 读端**（网络/管道/gzip）绕过剩余字节守卫，~20 字节截断流逼出 64MiB～**4GiB** 分配（make 在读之前）；F2 Medium——`unfolds` 无上限，1<<20 展开 2.26s、1<<30 外推单次 Step ~38 分钟 CPU 耗尽（CfC 免疫）；F3 Low——count=maxCount−1 强分 8MiB 指针切片；F4 Low——加载不校验 erev∈{±1}（可造 NewLTC 永不能产生的细胞）；F5 Info——LoadParameters 保留陈旧 Grad 未文档化；F6 Info——限额私有且包注释"绝不无界分配"措辞掩盖 F1。**裁决：panic/语义维度安全，资源耗尽维度需补防——已派发修复（发布前置条件）**
+
+**F-E（序列化版本化 + erev 死梯度清除，留档 #10 销账，已完成）**：
+- **格式冻结四件套**：黄金字节流 `testdata/golden_v1_{ltc,cfc,linear}.lnns`（1607/1603/120 B，固定种子 101/202/303，参数全文档化）+ `.expected.txt` 逐元素 `%08x` 位模式期望（可手工审计）+ 包注释「Format versioning」节（v1 逐字节冻结语义、**追加式演进规则**——新数据只能尾部追加计数张量、kind 注册表只追加不复用、或整体 version=2 升级；**拒绝而非猜测**——高版本报"written by a newer version, update this build"、低版本报"no earlier layout exists"）+ `-write-golden` 门禁式再生成。三测试：加载逐位（Float32bits）+ 写端 `bytes.Equal` 逐字节 + 双读端类一致
+- **交叉验证红利**：黄金 LTC 向量在并行 P-C 改动 ltc.go **之前**生成，改动后三测试仍全绿——独立字节级证明 P-C 改动透明
+- **erev 焙入（#10 销账）**：复用 ltc.go 的 sumIndicator/reversalIndicator（ltc.go 零改动）建 den/numReduce 指示阵（±1 焙入 numReduce），erev/sErev 字段 `*autograd.Variable → *tensor.Tensor`（rng 抽取位点一字未动）——死梯度从"为零"升级为**结构上不可能**（反射断言字段类型无 Grad 可言）；drive() 逐突触 Hadamard+Add 链 → 块拼 [batch,n·units] 双 MatMul 收缩
+- **逐位证据**：cfc-sequence **11 个打印点全部与留档逐字相等**（0.620651→0.029091，含 iter 100=0.041556 = persistence.md 记录值）；全参 gradcheck 8.626e-3 与改前 8.63e-3 同量级同舍入；白盒 oracle（内嵌旧 drive、erev 重包 Var 叶）新旧四输出 + 8 参数梯度 **Float32bits 逐位相等**，且 oracle 确有死梯度（max|∂L/∂erev|=1.631e-1）——对照非空转
+- **加载侧回归捕手**：LoadCfC 按流内 erev 重建指示阵（对齐 LoadLTC 先例）；`TestLoadCfCAcceptsFlippedReversalPattern` 断言翻转图谱加载后输出**确实改变**（若忘记重建则纹丝不动——正是此回归的捕手）；cfcTensors 17 张量序不变（黄金依赖）
+- 版本错误信息按方向分流补强（保留原前缀供文档平滑过渡）+ 三断言测试；覆盖率 serialize 97.8% / nn 99.0%（微降 0.2pp 系 P-C 新增 ltc.go 代码，8c 收复）
+
+**P-C（Sigmoid-Hadamard 融合反向，留档 #13 销账，已完成）**：新增 `autograd.SigmoidHadamard(z,w)` 单节点（opKind 派发、aux 槽存 sigmoid 输出 s 复用不重算），采纳于 `nn/ltc.go:347` synapsesRows（sensory/recurrent 共同入口）。
+- **前向逐位为构造性**（逐字调用同一 tensor.Sigmoid+Hadamard 代码）；**反向意外达成逐位等价**（设计书诚实预期"反向不逐位、用容差门禁"，实际通过舍入位点对齐——`mul32(g⊙w)` 复刻旧链中间张量舍入、外层分组复刻旧 opSigmoid 融合循环——常规 2D 路径 Float32bits 逐位，已固化测试；非 2D/异形种子走**逐字复刻旧双节点**的回退路径，升维怪癖与 panic 契约原样保留）
+- 门禁七项全绿：前向 11 组（含饱和/±Inf/NaN/次正规）逐位 + aux==sigmoid(z) 断言；gradcheck 3 种子×8 组合（**初版两例超限经对照诊断为 w≈0 近零梯度 FD 条件数噪声——组合实现同抽取同样超限、解析梯度逐位相同**，调整抽取区间后全绿，容差 2e-2 未放宽、既有断言零改动）；零掩码闭式回归、全参 gradcheck 9.39e-5、BPTT 有限、确定性、既有向量化 oracle 全绿
+- **example loss 0.690761→0.041996 逐位不变**（常规路径反向逐位 ⇒ 训练轨迹零漂移）；cfc-sequence 旁证逐字一致
+- **基准（同时间窗 A/B，排除整机漂移）**：LTCStep 2,442→**2,306 allocs/op（−5.6%）**；UnrollBackward 33,963→**31,983（−5.8%）**、B −6.2%、ns −3.4%。**结构核算精确闭合**：LTCStep 68 点位×省 2 分配=136=差值 ✓；UnrollBackward 396 点位×省 5=1,980=差值 ✓
+- **诚实校准**：收益为个位数百分比——每点位可省的就是"1 图节点+1 反向中间张量"，剩余由 tensor.New 逐节点固定开销主导（留档 #12 公共 API 禁区），此即 #13"收益/脆弱性比"的**实测终答**：三降零回归但结构上限已到
+- compile -S 实证：融合循环 **FMADD/FNMSUB/FMSUB/FNMUL 合计 0 条**（正对照裸循环发射 FMADDS，检测灵敏）；并行冲突自适应：nn 包因对方在改 cfc.go 暂时编译失败期间，全部 nn 验证移 /tmp 沙箱（HEAD+仅己方 4 文件）五包 -race 绿
+- 遗留：variable.go aux 字段注释仍为 Div 语义（文件范围纪律未改，双语义在 ops.go 注释完整说明——8d 文档工单）
 
 **发布至 GitHub（7c+，已完成）**：仓库 **https://github.com/qorm/LNN（public）**。远端原有用户初始提交（46ab9ff，仅 LICENSE），以 `--allow-unrelated-histories` 合并，LICENSE 冲突按**用户初始提交的既有选择**解决（Copyright (c) 2026 QORM，替换本项目的 LNN Authors 占位）；v0.1.0 标签重定位于合并提交（1eb157a）保证发布快照 LICENSE 与 main 逐字一致。完整历史（基线→阶段3a/3b/4/5/6/7a/7b/7c 全部原子提交）已推送；双语 README 加 CI + Go Reference 徽章。**验证三连**：①GitHub Actions 3 次运行全 `success`（含 v0.1.0 tag 流水线：gofmt 门禁/vet/build/test-race/example 冒烟）；②`go list -m github.com/qorm/LNN@v0.1.0` 经 proxy.golang.org **实测解析成功**——`go get` 全球可用；③仓库可见性 PUBLIC 确认
 

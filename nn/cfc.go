@@ -60,9 +60,23 @@ type CfC struct {
 	outW, outB       *autograd.Variable // [units]
 
 	// Reversal potentials are fixed random +/-1 constants, exactly as in the
-	// LTC: NOT trainable and deliberately absent from Parameters().
-	erev  *autograd.Variable // [units, units]
-	sErev *autograd.Variable // [inDim, units]
+	// LTC: NOT trainable and deliberately absent from Parameters(). They are
+	// plain data, never graph nodes: their signs are baked into the
+	// numReduce* indicators below at construction time, so backward produces
+	// no gradient on them at all (the old design let them enter the graph as
+	// Var leaves and accumulated dead gradients no one ever read; archived
+	// finding #10, fixed by mirroring ltc.go's reversalIndicator scheme).
+	erev  *tensor.Tensor // [units, units]
+	sErev *tensor.Tensor // [inDim, units]
+
+	// Construction-time graph constants shared by every Step, mirroring the
+	// LTC's reduction indicators: denReduce*/numReduce* are sparse
+	// [pre*units, units] matrices whose MatMul contraction sums the
+	// per-presynaptic activation blocks drive() concatenates; numReduce*
+	// additionally scales each synapse by its (constant) reversal potential,
+	// so the fixed +/-1 signs enter the graph only as baked constants.
+	denReduceS, denReduceR *autograd.Variable
+	numReduceS, numReduceR *autograd.Variable
 
 	wiring *Wiring
 }
@@ -107,8 +121,9 @@ func NewCfC(inDim, units int, wiring *Wiring, rng *rand.Rand) *CfC {
 	uniform := func(lo, hi float32, shape ...int) *autograd.Variable {
 		return autograd.Var(tensor.Uniform(rng, lo, hi, shape...))
 	}
-	// Reversal potentials are random +/- 1, as in the LTC wiring.
-	erevInit := func(shape ...int) *autograd.Variable {
+	// Reversal potentials are random +/- 1, as in the LTC wiring. Plain
+	// tensors: they never become graph nodes (see the struct field docs).
+	erevInit := func(shape ...int) *tensor.Tensor {
 		t := tensor.New(shape...)
 		for i := range t.Data {
 			if rng.Intn(2) == 0 {
@@ -117,9 +132,9 @@ func NewCfC(inDim, units int, wiring *Wiring, rng *rand.Rand) *CfC {
 				t.Data[i] = 1
 			}
 		}
-		return autograd.Var(t)
+		return t
 	}
-	return &CfC{
+	c := &CfC{
 		inDim: inDim, units: units, eps: 1e-8,
 		gleak:  uniform(0.001, 1, units),
 		vleak:  uniform(-0.2, 0.2, units),
@@ -134,10 +149,21 @@ func NewCfC(inDim, units int, wiring *Wiring, rng *rand.Rand) *CfC {
 		inB:    autograd.Var(tensor.New(inDim)),
 		outW:   autograd.Var(tensor.New(units).OnesLike()),
 		outB:   autograd.Var(tensor.New(units)),
-		erev:   erevInit(units, units),
-		sErev:  erevInit(inDim, units),
-		wiring: wiring,
+		// The reversal potentials must keep drawing the rng at exactly this
+		// point: the draw order fixes same-seed initialization, so the
+		// rng-free graph constants below come after.
+		erev:       erevInit(units, units),
+		sErev:      erevInit(inDim, units),
+		denReduceS: autograd.Const(sumIndicator(inDim, units)),
+		denReduceR: autograd.Const(sumIndicator(units, units)),
+		wiring:     wiring,
 	}
+	// Numerator reductions bake in the (already drawn) reversal potentials:
+	// the same indicators the LTC builds in its constructor (ltc.go), so the
+	// fixed +/-1 signs never appear as graph leaves.
+	c.numReduceR = autograd.Const(reversalIndicator(c.erev.Data, units, units))
+	c.numReduceS = autograd.Const(reversalIndicator(c.sErev.Data, inDim, units))
+	return c
 }
 
 // cfcShapeEq reports whether sh equals want, without allocating. Named
@@ -192,9 +218,10 @@ func (c *CfC) Step(x, h *autograd.Variable, ts float64) (out, hNew *autograd.Var
 	wPos := autograd.Softplus(c.w)
 	sWPos := autograd.Softplus(c.sW)
 
-	// Synaptic drives: num = sum_j act_j*erev_j, den = sum_j act_j.
-	numS, denS := c.drive(inputs, c.sMu, c.sSigma, sWPos, c.sErev, c.wiring.SensoryRow)
-	numR, denR := c.drive(h, c.mu, c.sigma, wPos, c.erev, c.wiring.RecurrentRow)
+	// Synaptic drives: num = sum_j act_j*erev_j, den = sum_j act_j, with the
+	// erev signs baked into the numReduce indicators (see drive).
+	numS, denS := c.drive(inputs, c.sMu, c.sSigma, sWPos, c.denReduceS, c.numReduceS, c.wiring.SensoryRow)
+	numR, denR := c.drive(h, c.mu, c.sigma, wPos, c.denReduceR, c.numReduceR, c.wiring.RecurrentRow)
 
 	epsV := autograd.Const(tensor.FromData([]float32{c.eps}, 1))
 	// G = gleak + den, the total conductance [batch, units].
@@ -218,33 +245,51 @@ func (c *CfC) Step(x, h *autograd.Variable, ts float64) (out, hNew *autograd.Var
 
 // drive accumulates numerator and denominator synaptic currents from a
 // presynaptic source (inputs or previous state), self-contained in cfc.go
-// (it does not share the LTC's synapse routine). Row i of the parameter
-// matrices parameterizes the synapses of presynaptic neuron i, whose wiring
-// mask row comes from maskRow(i); the sensory and recurrent paths share this
-// single calling convention. Each iteration produces a [batch, units] outer
-// product (column [batch, 1] x row [1, units]) and accumulates elementwise.
+// (it does not share the LTC's synapse routine, but it does share the LTC's
+// sparse-indicator contraction). Row i of the parameter matrices
+// parameterizes the synapses of presynaptic neuron i, whose wiring mask row
+// comes from maskRow(i); the sensory and recurrent paths share this single
+// calling convention. Each iteration produces a [batch, units] outer product
+// (column [batch, 1] x row [1, units]); the blocks then concatenate into
+// [batch, n·units] and two MatMuls against the construction-time indicators
+// contract the presynaptic axis:
+//
+//	den[:, j] = Σ_i block_i[:, j]
+//	num[:, j] = Σ_i block_i[:, j] · erev[i, j]
+//
+// with the fixed +/-1 reversal potentials baked into numReduce — exactly the
+// ltc.go reversalIndicator scheme. Because every indicator row carries a
+// single nonzero (a plain +/-1 or 0), MatMul's zero-skipping, left-to-right
+// accumulation leaves each output element as one exact float32 product, so
+// this contraction is bit-identical to the former per-presynaptic
+// Add-of-Hadamards chain in both forward and backward — while the reversal
+// potentials no longer enter the graph at all (no dead gradient, archived
+// finding #10).
 func (c *CfC) drive(
-	pre, mu, sigma, w, erev *autograd.Variable,
+	pre, mu, sigma, w, denReduce, numReduce *autograd.Variable,
 	maskRow func(i int) *tensor.Tensor,
 ) (num, den *autograd.Variable) {
 	n := pre.Data.Cols()
+	blocks := make([]*autograd.Variable, n)
 	for i := 0; i < n; i++ {
 		muR := autograd.SliceRow(mu, i)
 		sigR := autograd.SliceRow(sigma, i)
 		wR := autograd.SliceRow(w, i)
-		erevR := autograd.SliceRow(erev, i)
 		preCol := autograd.Col(pre, i) // [batch, 1]
 		act := autograd.Sigmoid(autograd.Hadamard(sigR, autograd.Sub(preCol, muR)))
 		act = autograd.Hadamard(act, wR)
-		act = autograd.Hadamard(act, autograd.Const(maskRow(i)))
-		rev := autograd.Hadamard(act, erevR)
-		if i == 0 {
-			num, den = rev, act
-		} else {
-			num = autograd.Add(num, rev)
-			den = autograd.Add(den, act)
-		}
+		blocks[i] = autograd.Hadamard(act, autograd.Const(maskRow(i)))
 	}
+	flat := blocks[0]
+	if n > 1 {
+		flat = autograd.ConcatCol(blocks...)
+		den = autograd.MatMul(flat, denReduce)
+	} else {
+		// A single presynaptic source: denReduce is the units×units identity,
+		// so the contraction is the block itself.
+		den = flat
+	}
+	num = autograd.MatMul(flat, numReduce)
 	return num, den
 }
 

@@ -342,7 +342,9 @@ func (c *LTC) synapsesRows(
 	for i := range blocks {
 		preCol := autograd.Col(pre, i) // [batch, 1]
 		z := autograd.Hadamard(sigRs[i], autograd.Sub(preCol, muRs[i]))
-		blocks[i] = autograd.Hadamard(autograd.Sigmoid(z), wmRs[i])
+		// One fused sigmoid(z)⊙wm node per presynaptic neuron instead of the
+		// Sigmoid+Hadamard pair: identical forward bits, one backward pass.
+		blocks[i] = autograd.SigmoidHadamard(z, wmRs[i])
 	}
 	flat := blocks[0]
 	if len(blocks) > 1 {

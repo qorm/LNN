@@ -1,0 +1,10 @@
+# Golden expectation for golden_v1_ltc.lnns — the exact outputs the loaded cell must produce.
+# float32 bit patterns in hex, row-major, one token per element.
+# cell: nn.NewLTC(4, 6, nil, 6, rand.New(rand.NewSource(101)))
+# input x [2 4]: [0.25 -0.5 0.75 -1 0.1 0.2 -0.3 0.4]
+# input h [2 6]: [0.1 -0.2 0.3 -0.4 0.5 -0.6 -0.1 0.2 -0.3 0.4 -0.5 0.6]
+# ts: 0.1
+out 2 6
+bdad6550 be20370a 3e888b38 beae58b0 3ef7b070 bf022393 be1cb4dc 3d8d812d beaff57b 3e24dffd beb7175d 3ebd2c48
+hnew 2 6
+bdad6550 be20370a 3e888b38 beae58b0 3ef7b070 bf022393 be1cb4dc 3d8d812d beaff57b 3e24dffd beb7175d 3ebd2c48
