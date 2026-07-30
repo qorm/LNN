@@ -352,11 +352,12 @@ func TestGoldenStreamsLoadBitExact(t *testing.T) {
 	}
 }
 
-// TestWriterStability is the byte-level freeze: rebuilding each cell from
-// its documented seed and saving must re-emit the committed golden stream
-// byte for byte. Any drift in the writer, the tensor order, the header or
-// same-seed construction fails here.
-func TestWriterStability(t *testing.T) {
+// TestGoldenWriterStability is the byte-level freeze: rebuilding each cell
+// from its documented seed and saving must re-emit the committed golden
+// stream byte for byte. Any drift in the writer, the tensor order, the
+// header or same-seed construction fails here. (Named with the Golden
+// prefix so `-run Golden` selects the whole freeze trio — red-team F-RT3.)
+func TestGoldenWriterStability(t *testing.T) {
 	for _, tc := range goldenCases(t) {
 		t.Run(tc.name, func(t *testing.T) {
 			golden := readGoldenStream(t, tc.name)
