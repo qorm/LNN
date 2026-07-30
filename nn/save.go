@@ -65,6 +65,20 @@ const (
 	linearTensorCount = 2
 )
 
+// maxUnfolds caps the unfolds value LoadLTC accepts from a stream. Value:
+// 1024. Real LTC configurations use 1-16 ODE substeps, so 1024 is far beyond
+// any plausible deployment; a hostile stream, by contrast, turns a gigantic
+// unfolds into a CPU-exhaustion loop the moment the loaded cell steps (red
+// team F2: unfolds=1<<20 cost 2.26 s per load+step, extrapolating to ~38
+// minutes for a single Step at 1<<30).
+//
+// The cap is deliberately load-only: NewLTC's runtime contract is unchanged
+// (it still requires only unfolds >= 1, panicking otherwise), because a
+// constructor's inputs come from the caller's own code — an extreme unfolds
+// there is a bug the caller controls — while a load's input is an untrusted
+// byte stream that gets no vote on its own resource budget.
+const maxUnfolds = 1024
+
 // headerWriter writes the kind byte and the int32 header fields, capturing
 // the first I/O error for a single report at the end.
 type headerWriter struct {
@@ -180,6 +194,23 @@ func wiringFromStream(sensory, recurrent *tensor.Tensor, inDim, units int) (*Wir
 	return newWiring(sensory, recurrent), nil
 }
 
+// checkReversals validates a streamed reversal-potential tensor (erev or
+// sErev): every entry must be exactly +1 or -1. The comparison is bitwise ==,
+// so NaN, ±Inf, 0 and fractional values like 2.5 are all rejected. The
+// constructors fix these signs and training excludes the potentials from
+// Parameters(), so a stream carrying anything else describes a cell
+// NewLTC/NewCfC could never have produced — accepting it would let a hostile
+// checkpoint mint excitatory/inhibitory patterns outside the model's state
+// space (red team F4).
+func checkReversals(name string, t *tensor.Tensor) error {
+	for i, v := range t.Data {
+		if v != 1 && v != -1 {
+			return fmt.Errorf("nn: %s[%d] = %v is not a reversal potential (must be exactly +1 or -1)", name, i, v)
+		}
+	}
+	return nil
+}
+
 // copyFields copies src into dst elementwise. It validates every shape pair
 // before copying anything, so a stream that mismatches late leaves the early
 // fields exactly as they were.
@@ -233,7 +264,8 @@ func SaveLTC(w io.Writer, c *LTC) error {
 
 // LoadLTC reads a stream written by SaveLTC and returns an equivalent cell:
 // for the same input and state, Step produces bit-identical outputs. Any
-// corruption, version skew, truncation or cross-model stream is an error.
+// corruption, version skew, truncation or cross-model stream is an error, as
+// is an unfolds value above the load limit maxUnfolds (1024).
 func LoadLTC(r io.Reader) (*LTC, error) {
 	hr := &headerReader{r: r}
 	if err := readKind(hr, kindLTC); err != nil {
@@ -249,6 +281,11 @@ func LoadLTC(r io.Reader) (*LTC, error) {
 	if unfolds < 1 {
 		return nil, fmt.Errorf("nn: LTC header has invalid unfolds=%d", unfolds)
 	}
+	// Checked before the blob is even parsed, so a hostile unfolds cannot
+	// bill any parsing or construction work (see maxUnfolds).
+	if unfolds > maxUnfolds {
+		return nil, fmt.Errorf("nn: LTC header has unfolds=%d, exceeding the load limit %d", unfolds, maxUnfolds)
+	}
 	ts, err := serialize.ReadTensors(r)
 	if err != nil {
 		return nil, err
@@ -258,6 +295,15 @@ func LoadLTC(r io.Reader) (*LTC, error) {
 	}
 	wiring, err := wiringFromStream(ts[0], ts[1], inDim, units)
 	if err != nil {
+		return nil, err
+	}
+	// Reversal potentials sit at the blob's tail; validate them before the
+	// cell is built, so no cell (even the throwaway) exists for a stream
+	// outside the model's state space.
+	if err := checkReversals("erev", ts[ltcTensorCount-2]); err != nil {
+		return nil, err
+	}
+	if err := checkReversals("sErev", ts[ltcTensorCount-1]); err != nil {
 		return nil, err
 	}
 	cell := NewLTC(inDim, units, wiring, unfolds, throwawayRNG())
@@ -328,6 +374,12 @@ func LoadCfC(r io.Reader) (*CfC, error) {
 	}
 	wiring, err := wiringFromStream(ts[0], ts[1], inDim, units)
 	if err != nil {
+		return nil, err
+	}
+	if err := checkReversals("erev", ts[cfcTensorCount-2]); err != nil {
+		return nil, err
+	}
+	if err := checkReversals("sErev", ts[cfcTensorCount-1]); err != nil {
 		return nil, err
 	}
 	cell := NewCfC(inDim, units, wiring, throwawayRNG())

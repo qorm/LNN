@@ -87,6 +87,14 @@ func (v *Variable) runBackward() {
 		// Fused g ⊙ (1 − tanh²): the per-element operation sequence is
 		// unchanged from the former composition x*x, 1−r, g⊙r.
 		a := v.parents[0]
+		if !gradMatchesElemwise(v.Grad.Shape, a.Data.Shape) {
+			// Irregular seeded gradient: broadcast exactly as the legacy
+			// composition did (see gradMatchesElemwise).
+			one := v.Data.OnesLike()
+			deriv := tensor.Sub(one, tensor.Hadamard(v.Data, v.Data))
+			a.addGrad(tensor.Hadamard(v.Grad, deriv))
+			return
+		}
 		gd, x := v.Grad.Data, v.Data.Data
 		r := tensor.New(elemwiseGradShape(a.Data.Shape)...)
 		for i := range r.Data {
@@ -102,6 +110,12 @@ func (v *Variable) runBackward() {
 		// Fused g ⊙ σ ⊙ (1−σ), evaluating x*(1−x) per element exactly as
 		// the former Sub-then-Hadamard composition did.
 		a := v.parents[0]
+		if !gradMatchesElemwise(v.Grad.Shape, a.Data.Shape) {
+			one := v.Data.OnesLike()
+			deriv := tensor.Hadamard(v.Data, tensor.Sub(one, v.Data))
+			a.addGrad(tensor.Hadamard(v.Grad, deriv))
+			return
+		}
 		gd, x := v.Grad.Data, v.Data.Data
 		r := tensor.New(elemwiseGradShape(a.Data.Shape)...)
 		for i := range r.Data {
@@ -115,6 +129,11 @@ func (v *Variable) runBackward() {
 		// Fused g ⊙ (1/x): the reciprocal is computed with the same
 		// float32 division as the former Apply, then multiplied.
 		a := v.parents[0]
+		if !gradMatchesElemwise(v.Grad.Shape, a.Data.Shape) {
+			inv := tensor.Apply(a.Data, func(x float32) float32 { return 1 / x })
+			a.addGrad(tensor.Hadamard(v.Grad, inv))
+			return
+		}
 		gd, x := v.Grad.Data, a.Data.Data
 		r := tensor.New(elemwiseGradShape(a.Data.Shape)...)
 		for i := range r.Data {
@@ -128,6 +147,11 @@ func (v *Variable) runBackward() {
 			// d/dx x^0 == 0 everywhere. Computing p*x^(p-1) directly would
 			// evaluate 0 * x^-1, which is 0*Inf = NaN at x == 0.
 			a.addGrad(tensor.New(a.Data.Shape...))
+			return
+		}
+		if !gradMatchesElemwise(v.Grad.Shape, a.Data.Shape) {
+			deriv := tensor.Scale(tensor.Pow(a.Data, p-1), p)
+			a.addGrad(tensor.Hadamard(v.Grad, deriv))
 			return
 		}
 		// Fused g ⊙ p·x^(p−1): the power goes through the identical
@@ -148,6 +172,20 @@ func (v *Variable) runBackward() {
 		// Fused g ⊙ sign(x): the same sign classification and the same
 		// g*mask multiplication as the former Apply-then-Hadamard pair.
 		a := v.parents[0]
+		if !gradMatchesElemwise(v.Grad.Shape, a.Data.Shape) {
+			sign := tensor.Apply(a.Data, func(x float32) float32 {
+				switch {
+				case x > 0:
+					return 1
+				case x < 0:
+					return -1
+				default:
+					return 0
+				}
+			})
+			a.addGrad(tensor.Hadamard(v.Grad, sign))
+			return
+		}
 		gd, x := v.Grad.Data, a.Data.Data
 		r := tensor.New(elemwiseGradShape(a.Data.Shape)...)
 		for i := range r.Data {
@@ -165,6 +203,16 @@ func (v *Variable) runBackward() {
 		// Fused g ⊙ [x > 0]: the same mask and the same g*mask
 		// multiplication as the former Apply-then-Hadamard pair.
 		a := v.parents[0]
+		if !gradMatchesElemwise(v.Grad.Shape, a.Data.Shape) {
+			mask := tensor.Apply(a.Data, func(x float32) float32 {
+				if x > 0 {
+					return 1
+				}
+				return 0
+			})
+			a.addGrad(tensor.Hadamard(v.Grad, mask))
+			return
+		}
 		gd, x := v.Grad.Data, a.Data.Data
 		r := tensor.New(elemwiseGradShape(a.Data.Shape)...)
 		for i := range r.Data {
@@ -240,6 +288,16 @@ func (v *Variable) runBackward() {
 		// Fused g − softmax⊙rowsum: per element the same product sm*rs is
 		// subtracted from g, in the same row-major order.
 		a := v.parents[0]
+		if !sameShape(v.Grad.Shape, v.Data.Shape) {
+			// Irregular seeded gradient: the legacy composition's SumCols
+			// reduction broadcasts differently (and panics on 1D seeds) —
+			// replicate it exactly (see gradMatchesElemwise).
+			softmax := tensor.Exp(v.Data)
+			rowsum := tensor.SumCols(v.Grad)
+			rowsum.Shape = []int{rowsum.Size(), 1}
+			a.addGrad(tensor.Sub(v.Grad, tensor.Hadamard(softmax, rowsum)))
+			return
+		}
 		softmax := tensor.Exp(v.Data)
 		rowsum := tensor.SumCols(v.Grad)
 		rowsum.Shape = []int{rowsum.Size(), 1}
@@ -260,22 +318,53 @@ func (v *Variable) runBackward() {
 // hadamardReduce evaluates SumToShapeTake(Hadamard(g, x), shape) — the
 // gradient contribution of one operand of an elementwise product — without
 // materializing the full-size product when a reduction is due. When the
-// target shape matches g's, the product itself is the gradient buffer (one
-// allocation, handed to addGrad). When the target is a scalar, row vector or
-// column vector, the reduction accumulates the elementwise products directly
-// into the reduced buffer: same multiplicands, same summation order, so the
-// values are bit-identical to the two-step form. x may be any shape that
-// broadcasts against g (accessed through xRowAccess). Anything else —
-// unreachable for broadcast-compatible operands — falls back to the unfused
-// composition, preserving the historical panic contract exactly.
+// target shape matches g's AND the product's own broadcast shape, the
+// product itself is the gradient buffer (one allocation, handed to addGrad).
+// The product-shape check matters: broadcastBinary lifts 1D results to
+// [1, n] (and a scalar-scalar product lands at [1, 1]), so the product can
+// be shaped [1, n] even when both g and the target are [n] — the legacy
+// chain's SumToShape flattened that lift away, and skipping it broke the
+// gradient shape contract for 1D leaves (and panicked when one leaf then
+// received both [n] and [1, n] contributions). When product and target
+// disagree the reduction runs on the materialized product, exactly as the
+// legacy chain did. When the target is a scalar, row vector or column
+// vector with a differently shaped g, the reduction accumulates the
+// elementwise products directly into the reduced buffer: same multiplicands,
+// same summation order, so the values are bit-identical to the two-step
+// form — valid precisely when the product would carry g's own shape (see
+// productCarriesGShape) and, for scalar targets, when x shares g's flat
+// layout (flatSameLayout); backward propagation always arranges both.
+// Anything else — irregular seeded gradient shapes, or combinations
+// unreachable for broadcast-compatible operands — falls back to the
+// unfused composition, preserving the legacy values, shapes and panic
+// contract exactly.
 func hadamardReduce(g, x *tensor.Tensor, shape []int) *tensor.Tensor {
 	if sameShape(g.Shape, shape) {
-		return tensor.Hadamard(g, x)
+		p := tensor.Hadamard(g, x)
+		if sameShape(p.Shape, shape) {
+			return p
+		}
+		// The product's broadcast shape is wider than the target (the
+		// 1D-lift quirk above): reduce it exactly as the legacy chain did.
+		// SumToShapeTake returns a fresh buffer for every reduction branch,
+		// and cannot alias p back to this caller.
+		return tensor.SumToShapeTake(p, shape)
 	}
+	// The fused branches below index the pairwise products in g's flat/row
+	// layout; that is exact only when the product would carry g's very
+	// shape (guard) and — for the scalar branch — x shares g's flat layout.
+	// Backward-propagated gradients always satisfy both; irregular manually
+	// seeded shapes (outer products against g, a [1] seed over a [1,1]
+	// node, …) take the legacy composition instead, panic contract
+	// included.
 	switch {
-	case shapeSize(shape) == 1:
-		// The target being scalar means the other operand determined the
-		// output shape, so x shares g's layout and flat indexing is safe.
+	case shapeSize(shape) == 1 && flatSameLayout(g, x) && !sameShape(broadcastLift(g.Shape), shape):
+		// The target being scalar and x sharing g's layout means the
+		// product's elements are exactly gd[k]*xd[k] in flat order. The
+		// extra shape check excludes the pass-through case: when the
+		// lifted product shape equals the target (say g [1] × x [1] with
+		// target [1, 1]) the legacy chain's SumToShape returns the product
+		// at the target's shape, not the fused [1].
 		r := tensor.New(1)
 		gd, xd := g.Data, x.Data
 		var s float32
@@ -284,7 +373,7 @@ func hadamardReduce(g, x *tensor.Tensor, shape []int) *tensor.Tensor {
 		}
 		r.Data[0] = s
 		return r
-	case len(g.Shape) == 2 && targetIsRowVec(shape) && g.Shape[1] == shapeSize(shape):
+	case len(g.Shape) == 2 && targetIsRowVec(shape) && g.Shape[1] == shapeSize(shape) && productCarriesGShape(g, x):
 		n := shapeSize(shape)
 		r := tensor.New(1, n)
 		for i := 0; i < g.Shape[0]; i++ {
@@ -303,7 +392,7 @@ func hadamardReduce(g, x *tensor.Tensor, shape []int) *tensor.Tensor {
 			r.Shape = []int{shape[0]}
 		}
 		return r
-	case len(g.Shape) == 2 && len(shape) == 2 && shape[1] == 1 && g.Shape[0] == shape[0]:
+	case len(g.Shape) == 2 && len(shape) == 2 && shape[1] == 1 && g.Shape[0] == shape[0] && productCarriesGShape(g, x):
 		n := g.Shape[1]
 		r := tensor.New(shape[0], 1)
 		for i := 0; i < shape[0]; i++ {
@@ -321,10 +410,68 @@ func hadamardReduce(g, x *tensor.Tensor, shape []int) *tensor.Tensor {
 	}
 }
 
+// productCarriesGShape reports whether tensor.Hadamard(g, x) produces g's
+// exact shape — broadcastBinary's 1D→[1, n] lift included — so that the
+// product's element at g's flat index k is g.Data[k] paired with x's
+// broadcast value (the premise the fused reduction branches rely on). The
+// dispatch mirrors tensor.broadcastShapeFresh plus the 1D lift exactly; an
+// unbroadcastable x returns false, leaving the legacy fallback to reproduce
+// the historical forward panic.
+func productCarriesGShape(g, x *tensor.Tensor) bool {
+	var s []int
+	switch {
+	case tensor.SameShape(g, x):
+		s = g.Shape
+	case g.IsScalar():
+		s = x.Shape
+	case x.IsScalar():
+		s = g.Shape
+	case g.Dims() == 2 && x.IsRowVec() && g.Cols() == x.Size():
+		s = g.Shape
+	case x.Dims() == 2 && g.IsRowVec() && x.Cols() == g.Size():
+		s = x.Shape
+	case g.Dims() == 2 && g.Cols() == 1 && x.Dims() == 2 && x.Shape[0] == g.Shape[0]:
+		s = x.Shape
+	case x.Dims() == 2 && x.Cols() == 1 && g.Dims() == 2 && g.Shape[0] == x.Shape[0]:
+		s = g.Shape
+	case g.Dims() == 2 && g.Cols() == 1 && x.IsRowVec():
+		s = []int{g.Shape[0], x.Size()}
+	case x.Dims() == 2 && x.Cols() == 1 && g.IsRowVec():
+		s = []int{x.Shape[0], g.Size()}
+	default:
+		return false
+	}
+	return sameShape(broadcastLift(s), g.Shape)
+}
+
+// broadcastLift applies broadcastBinary's output-shape normalization: 1D
+// shapes are lifted to [1, n], and the empty shape (a scalar-scalar
+// product) lands at [1].
+func broadcastLift(s []int) []int {
+	switch len(s) {
+	case 0:
+		return []int{1}
+	case 1:
+		return []int{1, s[0]}
+	default:
+		return s
+	}
+}
+
+// flatSameLayout reports whether x's elements sit in the same flat order
+// as g's (identical shapes, modulo the 1D→[1, n] lift a 1D x would take in
+// a product), so that x.Data[k] is the broadcast partner of g.Data[k].
+func flatSameLayout(g, x *tensor.Tensor) bool {
+	return sameShape(x.Shape, g.Shape) || sameShape(elemwiseGradShape(x.Shape), g.Shape)
+}
+
 // negReduce evaluates SumToShapeTake(Neg(g), shape) for the subtracted
-// operand's gradient, fusing the sign flip into the reduction. Negation is an
-// exact sign flip whether written -v or v*(-1) (as tensor.Neg does), so the
-// fused addends are bit-identical to the two-step form.
+// operand's gradient, fusing the sign flip into the reduction. Each addend
+// goes through mul32(v, -1), which reproduces tensor.Neg's v*(-1) multiply
+// exactly: bit-identical to a unary minus for finite values (the exact
+// product is a pure sign flip), and — unlike a unary minus, which would
+// flip a NaN's sign bit — propagating NaNs the way the hardware multiply
+// in the legacy Neg did.
 func negReduce(g *tensor.Tensor, shape []int) *tensor.Tensor {
 	if sameShape(g.Shape, shape) {
 		return tensor.Neg(g)
@@ -334,7 +481,7 @@ func negReduce(g *tensor.Tensor, shape []int) *tensor.Tensor {
 		r := tensor.New(1)
 		var s float32
 		for _, v := range g.Data {
-			s += -v
+			s += mul32(v, negOne)
 		}
 		r.Data[0] = s
 		return r
@@ -344,7 +491,7 @@ func negReduce(g *tensor.Tensor, shape []int) *tensor.Tensor {
 		for i := 0; i < g.Shape[0]; i++ {
 			grow := g.Data[i*n : (i+1)*n]
 			for j := 0; j < n; j++ {
-				r.Data[j] += -grow[j]
+				r.Data[j] += mul32(grow[j], negOne)
 			}
 		}
 		if len(shape) == 1 {
@@ -358,7 +505,7 @@ func negReduce(g *tensor.Tensor, shape []int) *tensor.Tensor {
 			grow := g.Data[i*n : (i+1)*n]
 			var s float32
 			for j := 0; j < n; j++ {
-				s += -grow[j]
+				s += mul32(grow[j], negOne)
 			}
 			r.Data[i] = s
 		}
@@ -370,8 +517,11 @@ func negReduce(g *tensor.Tensor, shape []int) *tensor.Tensor {
 
 // negHadamardPow2 evaluates Neg(Hadamard(ga, Pow(b, -2))) in one pass: the
 // per-element power goes through the identical math.Pow(float64) call and
-// float32 conversion as tensor.Pow, and x*(-1) is the same exact sign flip
-// as -x, so the result is bit-identical to the three-tensor composition.
+// float32 conversion as tensor.Pow. The final mul32(m, -1) reproduces
+// tensor.Neg's v*(-1) multiplication rather than a unary minus: identical
+// for every finite value (the exact product is a pure sign flip), but a
+// unary minus also flips the sign bit of a NaN, while the hardware
+// multiply propagates the NaN unchanged — the legacy chain's behavior.
 func negHadamardPow2(ga, b *tensor.Tensor) *tensor.Tensor {
 	// The legacy chain ended in a Hadamard, whose 1D-lift the result shape
 	// must replicate (see elemwiseGradShape).
@@ -379,7 +529,7 @@ func negHadamardPow2(ga, b *tensor.Tensor) *tensor.Tensor {
 	for i := range r.Data {
 		pb2 := float32(math.Pow(float64(b.Data[i]), -2))
 		m := ga.Data[i] * pb2 // rounded before the sign flip, as in the old chain
-		r.Data[i] = -m
+		r.Data[i] = mul32(m, negOne)
 	}
 	return r
 }
@@ -439,16 +589,56 @@ func elemwiseGradShape(shape []int) []int {
 	return shape
 }
 
-// mul32 computes the float32 product a*b with the exact single rounding of a
-// native float32 multiply (the exact product fits a 48-bit mantissa, which
-// float64 represents precisely, so rounding it to float32 is bit-identical
-// to the hardware float32 operation). Writing the product through this
-// conversion keeps an explicit rounding node between multiply and a
-// following add/sub in the SSA graph, which bars arm64 FMA/FNMS fusion
-// across fused-loop statements — fusion would collapse the historical
-// two-step rounding (product stored to a tensor, then accumulated) into one
-// and drift ~1 ULP.
-func mul32(a, b float32) float32 { return float32(float64(a) * float64(b)) }
+// gradMatchesElemwise reports whether a fused elementwise backward may read
+// g flat against the parent's element layout — exactly the shapes for which
+// the legacy composition tensor.Hadamard(g, deriv) pairs elements in flat
+// order (g carrying the node's shape, or its [1, n] lift for 1D nodes).
+// Any other shape — reachable only through a manually seeded Grad whose
+// shape differs from the node's, which the legacy composition broadcast
+// (outer products, scalar replication) — must take the legacy composition
+// instead, or the fused loop would silently pair the wrong elements and
+// allocate the wrong shape. Normal backward propagation always arrives in
+// a matching shape, so the hot path keeps the fused loop.
+func gradMatchesElemwise(g, nodeShape []int) bool {
+	return sameShape(g, nodeShape) || sameShape(g, elemwiseGradShape(nodeShape))
+}
+
+// mul32 computes the float32 product a*b bit-identically to a native
+// hardware float32 multiply. For finite operands the exact product fits a
+// 48-bit mantissa, which float64 represents precisely, so rounding it to
+// float32 is bit-identical to the hardware operation. Writing the product
+// through this conversion keeps an explicit rounding node between multiply
+// and a following add/sub in the SSA graph, which bars arm64 FMA/FNMS
+// fusion across fused-loop statements — fusion would collapse the
+// historical two-step rounding (product stored to a tensor, then
+// accumulated) into one and drift ~1 ULP.
+//
+// Non-finite operands (NaN or ±Inf, detected by an all-ones exponent field)
+// take the native a*b path instead: the float64 round-trip recanonicalizes
+// NaN payloads — the widened multiply settles on one operand's payload and
+// the float64→float32 conversion truncates it again — which diverges, bit
+// for bit, from the hardware float32 propagation the legacy chain ran. The
+// native product is a lone float32 multiply with no adjacent add/sub in
+// this expression, and the branch leaves an If/Phi structure in the SSA
+// graph that the FMA formation rules do not match, so fusion still cannot
+// reach it (verified via go tool compile -S: FMULS+FADDS, never FMADDS).
+// Finite products keep the float64 barrier.
+func mul32(a, b float32) float32 {
+	if math.Float32bits(a)&0x7F800000 == 0x7F800000 ||
+		math.Float32bits(b)&0x7F800000 == 0x7F800000 {
+		return a * b
+	}
+	return float32(float64(a) * float64(b))
+}
+
+// negOne carries the -1 the negation fuses multiply by. It is deliberately
+// a variable rather than a constant: the compiler rewrites a multiply by a
+// constant -1 into a sign flip (FNEGS), which is bit-identical for finite
+// values but flips a NaN's sign bit — while the legacy tensor.Neg chain
+// ran Scale's v*(-1) with a runtime operand, a genuine hardware multiply
+// that propagates NaNs unchanged. Loading negOne from memory keeps the
+// multiply genuine on the non-finite mul32 path.
+var negOne float32 = -1
 
 // MatMul differentiably multiplies two 2D variables.
 func MatMul(a, b *Variable) *Variable {

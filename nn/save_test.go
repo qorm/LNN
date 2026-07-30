@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"math/rand"
@@ -558,6 +559,203 @@ func TestLoadLinearRejectsBadShapes(t *testing.T) {
 	if _, err := LoadLinear(bytes.NewReader([]byte{kindLinear, 'g', 'a', 'r', 'b'})); err == nil ||
 		!strings.Contains(err.Error(), "magic") {
 		t.Fatalf("garbage blob: got %v, want magic error", err)
+	}
+}
+
+// TestLoadLTCRejectsExcessiveUnfolds pins red team F2: a hostile unfolds
+// turns every later Step into a CPU-exhaustion loop (the old code loaded
+// unfolds=1<<20 happily and then spent 3.6 s on a single Step), so the
+// limit must fire in the header check — before the blob is parsed and
+// before any cell exists.
+func TestLoadLTCRejectsExcessiveUnfolds(t *testing.T) {
+	header := func(unfolds int) []byte {
+		var b [13]byte
+		b[0] = kindLTC
+		binary.LittleEndian.PutUint32(b[1:], 4) // inDim
+		binary.LittleEndian.PutUint32(b[5:], 6) // units
+		binary.LittleEndian.PutUint32(b[9:], uint32(unfolds))
+		return b[:]
+	}
+	for _, u := range []int{maxUnfolds + 1, 1 << 20, math.MaxInt32} {
+		_, err := LoadLTC(bytes.NewReader(header(u)))
+		if err == nil || !strings.Contains(err.Error(), "unfolds") || !strings.Contains(err.Error(), fmt.Sprint(u)) {
+			t.Fatalf("unfolds=%d: got %v, want an unfolds-limit error carrying the value", u, err)
+		}
+	}
+	// The stream is header-only on purpose: if the limit did not fire first,
+	// the missing blob would surface a different (magic/EOF) error, and the
+	// allocation footprint would grow with parsing. Both guard the claim
+	// that the check happens up front.
+	raw := header(1 << 20)
+	allocs := testing.AllocsPerRun(20, func() {
+		if _, err := LoadLTC(bytes.NewReader(raw)); err == nil {
+			t.Fatal("hostile unfolds accepted")
+		}
+	})
+	if allocs > 50 {
+		t.Errorf("rejection took %.0f allocations; the limit must fire before parsing", allocs)
+	}
+}
+
+// TestLoadLTCAcceptsUnfoldsAtLimit proves the limit is not over-tight: a
+// legitimate stream at exactly maxUnfolds round-trips, and the loaded cell
+// steps bit-identically.
+func TestLoadLTCAcceptsUnfoldsAtLimit(t *testing.T) {
+	cell := NewLTC(1, 2, nil, maxUnfolds, rand.New(rand.NewSource(71)))
+	var buf bytes.Buffer
+	if err := SaveLTC(&buf, cell); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadLTC(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatalf("unfolds=%d must round-trip: %v", maxUnfolds, err)
+	}
+	if loaded.unfolds != maxUnfolds {
+		t.Errorf("loaded unfolds = %d, want %d", loaded.unfolds, maxUnfolds)
+	}
+	saveParamsEqual(t, "LTC@limit", cell.Parameters(), loaded.Parameters())
+	if !saveSameBits(cell.erev.Data, loaded.erev.Data) || !saveSameBits(cell.sErev.Data, loaded.sErev.Data) {
+		t.Error("reversal potentials differ after round trip at the unfolds limit")
+	}
+	x := saveInput(1, 1)
+	out1, h1 := cell.Step(x, nil, 0.1)
+	out2, h2 := loaded.Step(x, nil, 0.1)
+	if !saveSameBits(out1.Data, out2.Data) || !saveSameBits(h1.Data, h2.Data) {
+		t.Error("Step at the unfolds limit differs after round trip")
+	}
+}
+
+// TestLoadRejectsInvalidReversalPotentials pins red team F4: erev/sErev are
+// fixed +/-1 signs that no constructor call can produce differently, so a
+// stream carrying anything else (2.5, 0, NaN, +Inf below) must be rejected
+// with a semantic error on every load path that carries them.
+func TestLoadRejectsInvalidReversalPotentials(t *testing.T) {
+	ltc := NewLTC(4, 6, nil, 3, rand.New(rand.NewSource(83)))
+	goodLTC := ltcTensors(ltc)
+	cfc := NewCfC(4, 6, nil, rand.New(rand.NewSource(89)))
+	goodCfC := cfcTensors(cfc)
+
+	// withReversal forges a stream whose reversal tensor at idx has entry 0
+	// replaced by v, leaving everything else valid.
+	withReversal := func(src []*tensor.Tensor, idx int, v float32) []*tensor.Tensor {
+		ts := append([]*tensor.Tensor{}, src...)
+		bad := ts[idx].Clone()
+		bad.Data[0] = v
+		ts[idx] = bad
+		return ts
+	}
+
+	for name, v := range map[string]float32{
+		"2.5":  2.5,
+		"0":    0,
+		"NaN":  float32(math.NaN()),
+		"+Inf": float32(math.Inf(1)),
+	} {
+		for _, tc := range []struct {
+			where string
+			raw   []byte
+			load  func(io.Reader) error
+		}{
+			{"LTC erev", writeModelStream(t, kindLTC, []int{4, 6, 3}, withReversal(goodLTC, ltcTensorCount-2, v)),
+				func(r io.Reader) error { _, err := LoadLTC(r); return err }},
+			{"LTC sErev", writeModelStream(t, kindLTC, []int{4, 6, 3}, withReversal(goodLTC, ltcTensorCount-1, v)),
+				func(r io.Reader) error { _, err := LoadLTC(r); return err }},
+			{"CfC erev", writeModelStream(t, kindCfC, []int{4, 6}, withReversal(goodCfC, cfcTensorCount-2, v)),
+				func(r io.Reader) error { _, err := LoadCfC(r); return err }},
+			{"CfC sErev", writeModelStream(t, kindCfC, []int{4, 6}, withReversal(goodCfC, cfcTensorCount-1, v)),
+				func(r io.Reader) error { _, err := LoadCfC(r); return err }},
+		} {
+			err := tc.load(bytes.NewReader(tc.raw))
+			if err == nil || !strings.Contains(err.Error(), "+1 or -1") {
+				t.Errorf("%s = %s: got %v, want a reversal-potential error", tc.where, name, err)
+			}
+		}
+	}
+}
+
+// TestLoadLTCAcceptsFlippedReversalPattern proves the check accepts any +/-1
+// pattern, not just the constructor's own: a stream whose reversal signs are
+// all flipped is exotic but legal, loads, and actually takes effect (the
+// baked-in numerator indicators are rebuilt from the streamed polarities).
+func TestLoadLTCAcceptsFlippedReversalPattern(t *testing.T) {
+	cell := NewLTC(4, 6, nil, 3, rand.New(rand.NewSource(97)))
+	ts := ltcTensors(cell)
+	for _, idx := range []int{ltcTensorCount - 2, ltcTensorCount - 1} {
+		flipped := ts[idx].Clone()
+		for i, v := range flipped.Data {
+			flipped.Data[i] = -v
+		}
+		ts[idx] = flipped
+	}
+	raw := writeModelStream(t, kindLTC, []int{4, 6, 3}, ts)
+	loaded, err := LoadLTC(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatalf("sign-flipped +/-1 pattern rejected: %v", err)
+	}
+	if !saveSameBits(ts[ltcTensorCount-2], loaded.erev.Data) || !saveSameBits(ts[ltcTensorCount-1], loaded.sErev.Data) {
+		t.Error("loaded reversal potentials do not match the flipped stream")
+	}
+	x := saveInput(2, 4)
+	out, h := loaded.Step(x, nil, 0.1)
+	assertFinite(t, "flipped-erev LTC", out, h)
+	orig, _ := cell.Step(x, nil, 0.1)
+	if saveSameBits(orig.Data, out.Data) {
+		t.Error("flipping every reversal potential left the Step output unchanged")
+	}
+}
+
+// noLenReader hides Len() so loads exercise the unknown-length (incremental
+// allocation) path of the serialize reader.
+type noLenReader struct{ r io.Reader }
+
+func (n noLenReader) Read(p []byte) (int, error) { return n.r.Read(p) }
+
+// TestMutatedModelStreamsNeverPanic replays the red team's mutation
+// technique at smoke scale: 300 single-bit flips per model kind, each fed
+// through both reader classes, must yield an error or a successful load —
+// never a panic — confirming the hardening introduced no new fragile point.
+func TestMutatedModelStreamsNeverPanic(t *testing.T) {
+	ltc := NewLTC(4, 6, RandomSparse(4, 6, 0.4, 0.4, rand.New(rand.NewSource(101))), 4, rand.New(rand.NewSource(102)))
+	cfc := NewCfC(4, 6, RandomSparse(4, 6, 0.4, 0.4, rand.New(rand.NewSource(103))), rand.New(rand.NewSource(104)))
+	lin := NewLinear(3, 4, rand.New(rand.NewSource(105)))
+	var ltcBuf, cfcBuf, linBuf bytes.Buffer
+	if err := SaveLTC(&ltcBuf, ltc); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveCfC(&cfcBuf, cfc); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveLinear(&linBuf, lin); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name string
+		raw  []byte
+		load func(io.Reader) error
+	}{
+		{"LTC", ltcBuf.Bytes(), func(r io.Reader) error { _, err := LoadLTC(r); return err }},
+		{"CfC", cfcBuf.Bytes(), func(r io.Reader) error { _, err := LoadCfC(r); return err }},
+		{"Linear", linBuf.Bytes(), func(r io.Reader) error { _, err := LoadLinear(r); return err }},
+	}
+	for _, tc := range cases {
+		rng := rand.New(rand.NewSource(int64(7501 + len(tc.name))))
+		for i := 0; i < 300; i++ {
+			mut := append([]byte(nil), tc.raw...)
+			pos := rng.Intn(len(mut))
+			mut[pos] ^= 1 << uint(rng.Intn(8))
+			func() {
+				defer func() {
+					if p := recover(); p != nil {
+						t.Fatalf("%s mutant %d (byte %d bit-flipped): panic: %v", tc.name, i, pos, p)
+					}
+				}()
+				if i%2 == 0 {
+					tc.load(bytes.NewReader(mut))
+				} else {
+					tc.load(noLenReader{bytes.NewReader(mut)})
+				}
+			}()
+		}
 	}
 }
 

@@ -14,7 +14,7 @@
 | 4 | 红队复审 + 全量验证 | ✅ 完成（裁决：生产就绪，置信度 ~90%） |
 | 5 | 技术债清扫 + 工程成熟度（Benchmark/CI/双语文档） | ✅ 完成 |
 | 6 | 双轨扩展：特性（optimizer/CfC）+ 性能（热路径向量化） | ✅ 完成 |
-| 7 | 双轨再进：序列化特性 + autograd 深改 | 🔄 进行中（7a 三路实施已派发） |
+| 7 | 双轨再进：序列化特性 + autograd 深改 | 🔄 进行中（7a/7b ✅，7c+ 迁移中 → 7c 文档 → 发布） |
 
 ## 阶段 1：并行分析（已完成）
 
@@ -165,6 +165,8 @@
 | 实施 F-C | 特性 | `serialize/` 二进制流包 + `nn/save.go`（LTC/CfC/Linear Save/Load，先校验后分配） | ✅ 已回报 |
 | 实施 F-D | 特性 | `examples/cfc-sequence`（CfC + optimizer 范式） | ✅ 已回报（loss 0.621→0.029，与 doc/cfc.md 六打印点逐值吻合） |
 | 实施 P-B | 性能 | autograd 反向分配深改（addGrad 去克隆 / broadcast 去闭包），零数值变化逐位门禁 | ✅ 已回报（−50.55%，门禁两度拦截真实缺陷） |
+| 红队·序列化 | 验证 | 变异模糊 7,500 体 + 资源耗尽 + 语义攻击 + 动力学等价 | ✅ 已回报 + **F1-F6 修复已销账**（4GiB→33KiB 等，1,200 变异体 0 panic） |
+| 红队·autograd | 验证 | 独立差分 fuzz + FMA 屏障千万对验证 + 别名专项 + 基准复测 | ✅ 已回报 + **F1-F3 修复已销账**（52k 图四类差异全零；自证震出同族 F4-F6 一并修补） |
 
 **F-C（序列化，已完成）**：新建 4 文件（serialize 367+531 行 / nn/save 378+572 行），覆盖率 **serialize 97.4% / nn 99.2%**。格式：`"LNNS"` 魔数 + version=1 + 小端张量流（rank≤8、int64 形状、float32 LE、自定界拒尾字节）；模型流 kind 字节（0=LTC/1=CfC/2=Linear）+ header + 17 张量 blob（掩码×2 + 13 参数 + erev×2，顺序单点定义）。**V-05 纪律制度化**：`bits.Mul64` 溢出安全乘法 + maxElems/maxCount/maxRank 限额 + **先校验后分配**——`TestHostileDimDoesNotAllocate`/`TestHostileCountDoesNotAllocate` 以 `AllocsPerRun` 断言 1<<62 维与 0xFFFFFFFF 计数恶意流全程 <50 次小分配、不 OOM；恶意流十一连（bad magic/version=99/截断×2/尾字节/负维/rank=200/乘积溢出/掩码非二值/layout 偷换 [6]→[2,3]）全部语义化 error。**逐位复现保证**：round-trip 经 `Float32bits` 比对（NaN/−0 自等），加载后细胞 Step 输出 + 梯度与原细胞逐位相等（LTC 原位重建 erev 焙入的 numReduce 指示阵是关键一步）；Load 与 rng 种子无关。26 个测试含 quick.Check 200 轮随机 round-trip、跨 kind 互载 7 例、稀疏 wiring 保留、多步 Unroll 逐位。零反射零依赖、未碰任何既有文件——**README 路线图最后一项功能缺口闭合**
 
@@ -174,6 +176,37 @@
 - **基准（−benchtime=100x −count=3）**：`UnrollBackward` 68,688→**33,963 allocs/op（−50.55% ✅ 越过 −50% 门禁）**、B/op −50.1%、ns −24%；ChainForwardBackward −57.7%、DivDenLoop −56.7%、LTCStep −29.0%、GatherRowsBackward −23.5%——**五基准全降零回归**。剩余剖析：tensor.New 64.9%（每节点前向输出+Shape/Data 双分配）为下一阶段候选（受阻于公共 API 禁区，留档#12）；Sigmoid-Hadamard 融合反向需新算子层（留档#13）
 
 **F-D（CfC 示例，已完成）**：`examples/cfc-sequence/main.go`——有界累加器任务，CfC(1→8)+Linear、`optimizer.NewSGD` + 手动范数裁剪组合范式（原地缩放梯度后 Step，数学等价于手搓 scale 写法）、显式 ZeroGrad 纪律；loss **0.620651→0.029091（−95.3%）**，两次运行 diff 为空（确定性），六个打印点与 doc/cfc.md 记录**逐值吻合**（双向锁定）
+
+**序列化加固修复（F1-F6 已销账）**：六项全落地，既有断言**零改动**（git diff -U0 删除行为 0，错误信息包装逐字等价保 substring/errors.Is 契约）：
+- **F1**：`reader.floats(n)` 二分——已知长度读端（bytes.Reader 等）保持先校验后单次分配的旧行为逐字等价；**未知长度读端（io.Pipe/net.Conn/gzip.Reader）渐进分配**（初始 min(n,16KiB)，4KiB 块读解码 append，EOF 即 ErrUnexpectedEOF）。实测对照：18 字节流声称 [1<<30] 峰值 **4 GiB → 33 KiB（压缩 12.9 万倍）**；[1<<24] 64 MiB → 33 KiB；合法大张量（5×chunk+11，含 NaN/−0）经真 io.Pipe round-trip 逐位正确
+- **F2**：`maxUnfolds=1024` 加载路径限额（插在头部解析段、ReadTensors 之前，blob 不解析即拒）；NewLTC 运行时契约不改（构造面 vs 加载面的不对称已论证入 doc）。实测：unfolds=1<<20 从"接受 + 单次 Step 3.58s"→"**2µs 带值拒绝**"；unfolds=1024 合法流 round-trip 逐位正常
+- **F3**：张量指针切片渐进增长，count=maxCount−1 分配 **8 MiB → 416 B**
+- **F4**：erev/sErev 逐元素位级 ∈{±1} 校验（拒 NaN/±Inf/0/2.5，16 组合全 error，细胞不构造）；**全符号翻图谱可加载**（证明校验认值域而非构造器产物，指示阵按流内极性重建）
+- **F5**：LoadParameters "覆写 Data、刻意保留陈旧 Grad、复用前 ZeroGrad" 契约文档化 + 测试钉住（Grad 指针同一性断言）
+- **F6**：包注释改为三条精确分项（限额值列明 / 已知长度快路径 / 未知长度按到达字节增长，点名 io.Pipe/net.Conn/gzip.Reader）
+- 变异抽测复用红队手法：**1,200 变异体 × 双读端 0 panic**，加固未引入新脆点；五包 `-race` 全绿
+
+**autograd 等价性修复（F1-F3 + 同族 F4-F6 已销账）**：发布阻断解除。
+- **F1**：快路产出后校验**乘积真实形状**（方案②——不复制 broadcastShapeFresh 避免第二真相源）：`p := Hadamard(g,x); sameShape(p.Shape,shape) ? p : SumToShapeTake(p,shape)`。热路径仅多 ≤2 整数比较、分配不变。红队最小复现 `[1]` 值 12 逐位恢复；panic 复现场景恢复正常运行（[1]·14）；1D 叶手设种子 [3] 不再升 [1,3]
+- **F3 随 F1 自愈**：±0 复现第 4 元素 0x80000000 → 0x00000000（归约恢复 +0 规范化），四元素 Float32bits 逐一相等，固化为测试
+- **F2 完全修复（含 NaN 位）**：mul32 非有限操作数走原生乘；**双重实证**——`go tool compile -S` 全包含 FMADD/FNMSUB/FMSUB/FNMUL **合计 0 条**（裸循环对照探针仍发射 FMADDS，证明屏障必要且生效）+ 千万对（全位模式/特殊值/次正规/4 种 NaN 载荷）Float32bits **差异 0/10,000,000**
+- **自证震出同族三缺口（红队未覆盖，一并修复）**：F4 融合一元反向对异形手设种子的布局假设（`gradMatchesElemwise` 守卫，不符回退字面旧组合）；F5 hadamardReduce 融合分支 `productCarriesGShape`+`flatSameLayout`+**升维贯通排除**（52k 图第二轮才震出：g[1]⊙x[1]→目标[1,1] 旧链贯通 vs 融合塌缩）；**F6 NaN 符号位**——`-m` 一元负号 FNEGS 翻 NaN 符号 vs 旧链硬件乘传播；坑中坑：**常量 −1 被编译器折叠 Mul32F→Neg32F**，`negOne` 须为包级变量（内存加载折叠不掉，-S 实证）
+- **52,000 图 × 三种子差分 fuzz（~50 万节点）**：有限值/形状/panic 有无/NaN 位 **四类差异全部 0**（覆盖桶含 1D 怪癖×广播 500、Hadamard(x,x) 500、扇出 7,899、NaN 梯域 1,579、±0 1,671 等）；负对照 600 图即报 5,893 例差异（门禁非空转）；残留 88-124 例/轮 panic 消息分歧均为 MatMulTransB 改名类表面项（红队已归类）；**自曝两个 harness bug 并修正后三种子交叉**（生成器想象力教训再次应验）
+- **性能零回归**：五基准 allocs 逐数持平（UnrollBackward 33,963 不变，2D 热路径快路原样命中）；两 example 逐字；新增 f1_regress_test.go 8 个测试期望值全部对 1aab2de oracle 实测
+
+**红队·autograd 组（已完成）**：自写差分生成器（刻意异于实施方：偏重广播二元 46% + 深扇出 35% + 全怪癖形状池 + NaN 梯域）6,000 图 × 78,696 节点，协议含同图多次反向/手设非叶种子/叶梯度缓冲原位突变/结构别名断言。发现 **254 例差异（4.2%）**，逐一起因定位：
+- **F1（Important，必修，发布阻断）**：`hadamardReduce` sameShape 快路对 1D 叶破坏梯度形状契约——旧链 `SumToShape(Hadamard(g,x),target)` 先乘后约，1D 升维怪癖被归约抹平；新快路以"g 形状==目标"短路，但**乘积形状≠g 形状**（`[1]⊙[1]→[1,1]`）。57 例形状违反（值逐元素相等）+ **升级为 panic 回归**：同叶收到 [1] 与 [1,1] 两路贡献时 addGrad 形状断言炸（基线正常运行）——36 例 panic 有无分歧、22 例消息分歧（MatMul vs MatMulTransB 等表面项）。最小复现：`x:=New([3],1); SumAll(Sub(Hadamard(x,x),[2,1])).Backward()` → 旧 x.Grad 形 [1]、新 [1,1]。**与实施方 `elemwiseGradShape` 注释自称的"怪癖忠实复刻"自相矛盾**。实施方 96,000 图零失败系**生成器盲区**（未采样 1D 怪癖×广播 Hadamard；红队生成器 154 图内首发命中，命中率 ~3.3%）
+- **F2（Minor）**：138 例 NaN 位漂移（mul32 float64 往返对 NaN 载荷/符号的规范化 ≠ 硬件 float32 传播），两侧皆 NaN、训练语义无影响，但**证伪 PROGRESS 所引"Float32bits 相等"的绝对化宣称**（仅成立于有限值域）
+- **F3（Minor）**：1 例 ±0 漂移，与 F1 同源（跳过归约失去 +0 规范化），精确命中"含 ±0"宣称边界
+- **F4（正面认证）**：FMA 屏障千万对验证（4M 随机位模式 + 2M 次正规 + 2M 特殊值 + 2M 正态跨 80 数量级）**真实值分歧 0**；`go tool compile -S` 实测 arm64 对裸循环发射 FMADDS——**屏障是承重的，实施方此项完全正确**，"本次审计中质量最高的工程细节"
+- **别名安全宣称完全成立（最高风险项经受最强攻击）**：A-E 五个定向 PoC（Add 双叶/三消费者扇入逆拓扑边界/两级直通链/根种子克隆归还/跨实现头对头）双实现通过 + fuzz 内嵌 6,000 图结构别名扫描 **0 命中**
+- **性能宣称五项精确属实**：独立复测 UnrollBackward 68,688→33,963（**−50.555%，与宣称逐字吻合**）、ChainForwardBackward −57.65%、DivDenLoop −56.71%、LTCStep −29.01%、GatherRowsBackward −23.53%，ns −38%，三轮稳定零回归
+- API 完整性：导出签名零变更；3 个新导出符号（MatMulTransA/B 正当通用算子；`SumToShapeTake` 所有权契约挂公共面为脚枪——保留强文档警示）；既有测试 diff 为空、结构断言未弱化；两 example 输出逐字吻合留档值
+- **裁决：既有用法（nn/examples 的 2D 世界）内逐位等价、别名安全、性能属实；但绝对化宣称不成立——F1 为发布前必修项。已派发修复**
+
+**⚠️ 主控更正**：前条 P-B 摘要中"96,000 图严格 == 零失败（含 ±0）"的表述**仅在实施方生成器覆盖域内成立**——红队以异源生成器在 1D 怪癖×广播组合与 NaN 梯域发现 F1-F3。P-B 的门禁机制本身有效（负对照可侦测、确曾拦截 FMA 与升维两缺陷），短板在覆盖域；教训：差分 fuzz 的裁决力不超过生成器的想象力，异源生成器交叉是必需而非可选
+
+**红队·序列化组（已完成）**：7,500 变异体（位翻转/删除/插入/块交换，25% 叠连击）**0 panic / 0 静默错乱**（黑盒 oracle 重序列化核验掩码二值/形状/Step 健全；7 例"ok 垃圾入参"均为参数含 NaN/Inf 的忠实复现）；语义攻击全挡（张量顺序偷换/掩码注入 0.5/−1/2/NaN/跨 kind/未知 kind/version 0·2·99·255/UTF-16/大端伪流）；错误全透传（写端每个截断点、读端多偏移）；round-trip **训练动力学逐位等价**（加载后再训练 3 步的参数轨迹与同步训练锁死、种子无关）。**资源耗尽维度不安全**：F1 Medium——**无 Len() 读端**（网络/管道/gzip）绕过剩余字节守卫，~20 字节截断流逼出 64MiB～**4GiB** 分配（make 在读之前）；F2 Medium——`unfolds` 无上限，1<<20 展开 2.26s、1<<30 外推单次 Step ~38 分钟 CPU 耗尽（CfC 免疫）；F3 Low——count=maxCount−1 强分 8MiB 指针切片；F4 Low——加载不校验 erev∈{±1}（可造 NewLTC 永不能产生的细胞）；F5 Info——LoadParameters 保留陈旧 Grad 未文档化；F6 Info——限额私有且包注释"绝不无界分配"措辞掩盖 F1。**裁决：panic/语义维度安全，资源耗尽维度需补防——已派发修复（发布前置条件）**
 
 **用户指示（阶段 7 期间追加）**：①README 致谢 LNN 相关团队——**主控已双语落地**（Hasani/Lechner/Amini/Rus/Grosu 两位论文、mlech26l/ncps、raminmh/CfC、MIT CSAIL/TU Wien/IST Austria/Liquid AI）；②项目发布至 **github.com/qorm/LNN**——`gh auth` 确认 qorm 账号已登录；发布编排纳入 7c+：**模块路径迁移 `lnn` → `github.com/qorm/LNN`**（go.mod + 全仓 import + 双语文档代码块 + godoc 交叉引用，API 破坏性但发布必需，等 7a/7b 代码定型后统一执行）→ Installation 段改 `go get` → 仓库创建/推送/tag/CI 徽章
 

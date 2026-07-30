@@ -25,15 +25,27 @@
 // deliberate exception. A load path consumes bytes from outside the program
 // — files, networks, checkpoints from other versions — which may be corrupt,
 // truncated, or outright hostile. Every failure on the read path is therefore
-// returned as an error, never a panic, and a hostile stream must never drive
-// an unbounded allocation: claimed ranks, dimensions and counts are validated
-// against fixed limits and the element count is checked with overflow-safe
-// multiplication (math/bits.Mul64, the same discipline as tensor.Size) BEFORE
-// any buffer is allocated. A stream claiming a 1<<62-wide dimension is
-// rejected with an error, not serviced with a petabyte-sized make(). When the
-// reader exposes its remaining length (bytes.Buffer, bytes.Reader, ...) the
-// claimed payload is additionally checked against it, so an oversized claim
-// is rejected even when it fits the global limit.
+// returned as an error, never a panic, and a hostile stream can allocate only
+// in proportion to the bytes it actually delivers:
+//
+//   - Claimed ranks, dimensions and counts are validated against fixed
+//     limits BEFORE any buffer is allocated, and element counts are checked
+//     with overflow-safe multiplication (math/bits.Mul64, the same
+//     discipline as tensor.Size). The limits: maxElems = 1<<30 float32s per
+//     tensor (4 GiB of payload), maxCount = 1<<20 tensors per stream and
+//     maxRank = 8 axes. A stream claiming a 1<<62-wide dimension is rejected
+//     with an error, not serviced with a petabyte-sized make().
+//   - When the reader reports its remaining length (the Len() method of
+//     bytes.Buffer, bytes.Reader, strings.Reader), every payload claim is
+//     additionally checked against those bytes, so an oversized or truncated
+//     claim is validated before its buffer is allocated and the full payload
+//     is allocated in a single make.
+//   - Readers without a length (io.Pipe, net.Conn, gzip.Reader) cannot be
+//     checked up front; for them, payload buffers start small (at most one
+//     16 KiB chunk) and grow only as bytes arrive, so a stream claiming
+//     1<<30 elements but stopping after its 18-byte header peaks at a few
+//     chunks of memory and fails with io.ErrUnexpectedEOF instead of
+//     front-loading a 4 GiB make.
 //
 // The write path, by contrast, handles in-memory tensors the caller owns;
 // still, it returns errors rather than panicking, so a Save loop can report
@@ -148,6 +160,73 @@ func (rd *reader) full(b []byte) error {
 	return err
 }
 
+// floats reads a payload of n float32s, choosing its allocation strategy by
+// what the underlying reader can promise (red team F1):
+//
+//   - Known remaining length: a claim that does not fit the bytes actually
+//     left is truncation, reported BEFORE any buffer is allocated; a claim
+//     that fits is serviced by a single full-size make, filled in
+//     chunk-sized I/O passes. This is the fast path bytes.Buffer,
+//     bytes.Reader and strings.Reader take.
+//   - Unknown length (io.Pipe, net.Conn, gzip.Reader — readers without a
+//     Len method): nothing can be proven up front, so the buffer starts
+//     small (at most chunk elements, 16 KiB) and grows only as bytes
+//     actually arrive. A stream that claims 1<<30 elements but stops after
+//     its 18-byte header then peaks at a few chunks of memory and fails
+//     with io.ErrUnexpectedEOF, instead of front-loading a 4 GiB make —
+//     peak allocation stays proportional to the delivered bytes. A complete
+//     stream still ends with all n elements in a single slice.
+//
+// n must have passed the limit and overflow checks already; n*4 is then at
+// most 4 GiB and cannot overflow uint64.
+func (rd *reader) floats(n uint64) ([]float32, error) {
+	var enc [chunk * 4]byte
+	if rem := rd.remaining(); rem >= 0 {
+		if n*4 > uint64(rem) {
+			return nil, fmt.Errorf("truncated stream: claims %d data bytes but only %d remain: %w",
+				n*4, rem, io.ErrUnexpectedEOF)
+		}
+		data := make([]float32, n)
+		for done := uint64(0); done < n; {
+			k := n - done
+			if k > chunk {
+				k = chunk
+			}
+			buf := enc[:4*k]
+			if err := rd.full(buf); err != nil {
+				return nil, fmt.Errorf("reading data: %w", err)
+			}
+			for i := uint64(0); i < k; i++ {
+				data[done+i] = math.Float32frombits(binary.LittleEndian.Uint32(buf[4*i:]))
+			}
+			done += k
+		}
+		return data, nil
+	}
+	init := n
+	if init > chunk {
+		init = chunk
+	}
+	data := make([]float32, 0, init)
+	var dec [chunk]float32
+	for done := uint64(0); done < n; {
+		k := n - done
+		if k > chunk {
+			k = chunk
+		}
+		buf := enc[:4*k]
+		if err := rd.full(buf); err != nil {
+			return nil, fmt.Errorf("reading data: %w", err)
+		}
+		for i := uint64(0); i < k; i++ {
+			dec[i] = math.Float32frombits(binary.LittleEndian.Uint32(buf[4*i:]))
+		}
+		data = append(data, dec[:k]...)
+		done += k
+	}
+	return data, nil
+}
+
 // WriteTensors writes ts to w in the package's wire format. It fails with a
 // descriptive error on I/O failure, on a nil tensor, or on an in-memory
 // tensor whose Shape and Data disagree (checked with the same overflow-safe
@@ -217,8 +296,10 @@ func (bw *writer) tensor(t *tensor.Tensor, idx int) error {
 
 // ReadTensors reads a stream written by WriteTensors and returns its tensors.
 // Corrupt, truncated, unknown-version or hostile streams fail with a
-// descriptive error; nothing in the stream can trigger an allocation beyond
-// the documented limits (see the package doc).
+// descriptive error; memory use is bounded as described in the package doc:
+// fixed limits validated first, a remaining-bytes check on known-length
+// readers, and growth proportional to the bytes actually delivered on
+// unknown-length readers.
 func ReadTensors(r io.Reader) ([]*tensor.Tensor, error) {
 	rd := newReader(r)
 	var m [4]byte
@@ -243,13 +324,23 @@ func ReadTensors(r io.Reader) ([]*tensor.Tensor, error) {
 	if count > maxCount {
 		return nil, fmt.Errorf("serialize: stream claims %d tensors, exceeding the count limit %d", count, maxCount)
 	}
-	ts := make([]*tensor.Tensor, count)
-	for i := range ts {
-		t, err := readTensor(rd, i)
+	// Grow the slice as tensors arrive instead of allocating count slots up
+	// front: a 9-byte stream claiming nearly maxCount tensors must not force
+	// an ~8 MiB pointer slice just to fail on the first missing rank byte
+	// (red team F3). Legitimate streams stay small — model blobs carry 17
+	// tensors — so a small starting capacity grows at most a couple of times.
+	const countStart = 16
+	start := count
+	if start > countStart {
+		start = countStart
+	}
+	ts := make([]*tensor.Tensor, 0, start)
+	for i := uint64(0); i < count; i++ {
+		t, err := readTensor(rd, int(i))
 		if err != nil {
 			return nil, err
 		}
-		ts[i] = t
+		ts = append(ts, t)
 	}
 	// The format is self-framing (an explicit count), so anything after the
 	// last tensor's payload is corruption rather than "another message".
@@ -264,9 +355,9 @@ func ReadTensors(r io.Reader) ([]*tensor.Tensor, error) {
 
 // readTensor decodes tensor idx, validating every claim before allocating:
 // rank against maxRank, dimensions against negativity, and the total element
-// count against both overflow (bits.Mul64) and maxElems. When the stream
-// length is known, the payload claim is finally checked against the bytes
-// actually left, so an oversized claim errors out before make() runs.
+// count against both overflow (bits.Mul64) and maxElems. The payload itself
+// is then read through reader.floats, which picks an allocation strategy by
+// what the underlying reader can promise (see its doc).
 func readTensor(rd *reader, idx int) (*tensor.Tensor, error) {
 	var rb [1]byte
 	if err := rd.full(rb[:]); err != nil {
@@ -298,25 +389,9 @@ func readTensor(rd *reader, idx int) (*tensor.Tensor, error) {
 		n = lo
 		shape[d] = int(dim)
 	}
-	if rem := rd.remaining(); rem >= 0 && n*4 > uint64(rem) {
-		return nil, fmt.Errorf("serialize: tensor %d: truncated stream: claims %d data bytes but only %d remain: %w",
-			idx, n*4, rem, io.ErrUnexpectedEOF)
-	}
-	data := make([]float32, n)
-	var enc [chunk * 4]byte
-	for done := uint64(0); done < n; {
-		k := n - done
-		if k > chunk {
-			k = chunk
-		}
-		buf := enc[:4*k]
-		if err := rd.full(buf); err != nil {
-			return nil, fmt.Errorf("serialize: tensor %d: reading data: %w", idx, err)
-		}
-		for i := uint64(0); i < k; i++ {
-			data[done+i] = math.Float32frombits(binary.LittleEndian.Uint32(buf[4*i:]))
-		}
-		done += k
+	data, err := rd.floats(n)
+	if err != nil {
+		return nil, fmt.Errorf("serialize: tensor %d: %w", idx, err)
 	}
 	return &tensor.Tensor{Shape: shape, Data: data}, nil
 }
@@ -340,6 +415,11 @@ func WriteParameters(w io.Writer, params []*autograd.Variable) error {
 // graph ownership is preserved. A count mismatch or any shape mismatch is an
 // error; all shapes are validated before anything is copied, so a failing
 // load leaves every parameter exactly as it was.
+//
+// The load overwrites each parameter's Data and deliberately leaves its Grad
+// field untouched: gradients accumulated on an earlier graph survive the load
+// as stale values. A caller that reuses the variables in a new graph should
+// call ZeroGrad first, exactly as before any training step.
 func LoadParameters(r io.Reader, params []*autograd.Variable) error {
 	for i, p := range params {
 		if p == nil || p.Data == nil {

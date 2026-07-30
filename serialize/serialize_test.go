@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"math/rand"
+	"runtime"
 	"strings"
 	"testing"
 	"testing/quick"
@@ -513,6 +514,217 @@ func TestRoundTripFuzzish(t *testing.T) {
 	}
 	if err := quick.Check(func(seed int64) bool { return f(seed) }, &quick.Config{MaxCount: 200}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// allocatedBytes returns the heap bytes allocated during f (a delta of
+// runtime.MemStats.TotalAlloc), for pinning the red-team allocation bounds.
+func allocatedBytes(f func()) uint64 {
+	var m0, m1 runtime.MemStats
+	runtime.ReadMemStats(&m0)
+	f()
+	runtime.ReadMemStats(&m1)
+	return m1.TotalAlloc - m0.TotalAlloc
+}
+
+// hostileClaimStream forges the red team's F1 stream: magic+version+count,
+// rank 1 and a single giant dimension — len(stream) bytes total, zero
+// payload. It must be handed to a reader without Len(), or the
+// remaining-bytes fast path (correctly) rejects it before allocation.
+func hostileClaimStream(dim int64) []byte {
+	return frame(append(count(1), append([]byte{1}, shape64(dim)...)...))
+}
+
+func TestHostileClaimOnUnknownLengthReaderErrors(t *testing.T) {
+	for _, dim := range []int64{1 << 24, 1 << 30} { // 64 MiB and 4 GiB claims
+		stream := hostileClaimStream(dim)
+		if len(stream) != 18 {
+			t.Fatalf("forged stream is %d bytes, want exactly 18", len(stream))
+		}
+		// Hand-rolled no-Len reader: truncation is detectable only by the
+		// failing read itself.
+		if _, err := ReadTensors(noLen{bytes.NewReader(stream)}); !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Errorf("dim %d via noLen: got %v, want errors.Is(io.ErrUnexpectedEOF)", dim, err)
+		}
+		// A real unknown-length reader: io.Pipe delivers the 18 bytes, then EOF.
+		pr, pw := io.Pipe()
+		go func() {
+			pw.Write(stream)
+			pw.Close()
+		}()
+		if _, err := ReadTensors(pr); !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Errorf("dim %d via io.Pipe: got %v, want errors.Is(io.ErrUnexpectedEOF)", dim, err)
+		}
+	}
+}
+
+// TestHostileUnknownLengthReaderAllocatesLittle pins red team F1: on a
+// reader without Len(), an 18-byte stream claiming a 1<<30-element (4 GiB)
+// payload must not front-load the payload allocation. The old code ran
+// make([]float32, n) before the first read — the red team measured 64 MiB
+// for a 1<<24 claim; the incremental-growth path must stay under 1 MiB in
+// total, proportional to the 18 bytes actually delivered.
+func TestHostileUnknownLengthReaderAllocatesLittle(t *testing.T) {
+	stream := hostileClaimStream(1 << 30)
+	read := func() {
+		if _, err := ReadTensors(noLen{bytes.NewReader(stream)}); !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Fatalf("got %v, want errors.Is(io.ErrUnexpectedEOF)", err)
+		}
+	}
+	if b := allocatedBytes(read); b > 1<<20 {
+		t.Errorf("hostile read allocated %d bytes; must scale with the 18 bytes delivered, not the 4 GiB claimed", b)
+	}
+	if allocs := testing.AllocsPerRun(20, read); allocs > 50 {
+		t.Errorf("hostile read took %.0f allocations; growth must stay chunk-sized", allocs)
+	}
+}
+
+// TestLargeTensorThroughPipeRoundTripBitExact proves the incremental path
+// corrupts nothing on legitimate streams: a payload spanning many chunks
+// round-trips bit-exactly through both a noLen wrapper and a real io.Pipe.
+func TestLargeTensorThroughPipeRoundTripBitExact(t *testing.T) {
+	big := tensor.New(5*chunk + 11)
+	for i := range big.Data {
+		big.Data[i] = float32(i)*0.25 - 100
+	}
+	big.Data[3] = float32(math.NaN())
+	big.Data[4] = float32(math.Inf(-1))
+	big.Data[5] = -0.0
+	in := []*tensor.Tensor{tensor.FromData([]float32{1, -2}, 2), big}
+
+	var buf bytes.Buffer
+	if err := WriteTensors(&buf, in); err != nil {
+		t.Fatal(err)
+	}
+	raw := buf.Bytes()
+
+	check := func(out []*tensor.Tensor, err error, via string) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("%s: ReadTensors: %v", via, err)
+		}
+		if len(out) != len(in) {
+			t.Fatalf("%s: read %d tensors, want %d", via, len(out), len(in))
+		}
+		for i := range in {
+			if !sameBits(in[i], out[i]) {
+				t.Errorf("%s: tensor %d is not bit-exact after round trip", via, i)
+			}
+		}
+	}
+	out, err := ReadTensors(noLen{bytes.NewReader(raw)})
+	check(out, err, "noLen")
+
+	pr, pw := io.Pipe()
+	go func() {
+		if _, err := pw.Write(raw); err != nil {
+			pw.CloseWithError(err)
+			return
+		}
+		pw.Close()
+	}()
+	out, err = ReadTensors(pr)
+	check(out, err, "io.Pipe")
+}
+
+// TestHostileCountGrowsSliceIncrementally pins red team F3: a 9-byte stream
+// claiming count = maxCount-1 tensors forced an ~8 MiB pointer slice up
+// front in the old code. Incremental growth must keep the total allocation
+// of the rejected read well under 64 KiB, on both reader classes.
+func TestHostileCountGrowsSliceIncrementally(t *testing.T) {
+	stream := frame(count(uint32(maxCount - 1)))
+	for name, mk := range map[string]func() io.Reader{
+		"known length":   func() io.Reader { return bytes.NewReader(stream) },
+		"unknown length": func() io.Reader { return noLen{bytes.NewReader(stream)} },
+	} {
+		read := func() {
+			if _, err := ReadTensors(mk()); err == nil {
+				t.Fatal("hostile count stream accepted")
+			}
+		}
+		if b := allocatedBytes(read); b > 64<<10 {
+			t.Errorf("%s: hostile count read allocated %d bytes, want < 64 KiB", name, b)
+		}
+	}
+}
+
+func TestLoadParametersPreservesGrad(t *testing.T) {
+	w := autograd.Var(tensor.FromData([]float32{1, 2}, 2))
+	// Populate w.Grad on a throwaway graph: d mean(w*w) / dw = w.
+	autograd.MeanAll(autograd.Hadamard(w, w)).Backward()
+	if w.Grad == nil {
+		t.Fatal("backward did not populate Grad")
+	}
+	gradBefore := w.Grad
+	gradVals := append([]float32(nil), w.Grad.Data...)
+	nonZero := false
+	for _, v := range gradVals {
+		nonZero = nonZero || v != 0
+	}
+	if !nonZero {
+		t.Fatal("setup produced an all-zero gradient; the test would prove nothing")
+	}
+
+	// The stream carries different values.
+	var buf bytes.Buffer
+	if err := WriteParameters(&buf, []*autograd.Variable{autograd.Var(tensor.FromData([]float32{9, -9}, 2))}); err != nil {
+		t.Fatal(err)
+	}
+	if err := LoadParameters(bytes.NewReader(buf.Bytes()), []*autograd.Variable{w}); err != nil {
+		t.Fatalf("LoadParameters: %v", err)
+	}
+
+	// Data is overwritten with the streamed values...
+	if w.Data.Data[0] != 9 || w.Data.Data[1] != -9 {
+		t.Errorf("Data = %v, want the streamed [9 -9]", w.Data.Data)
+	}
+	// ...while Grad survives untouched — the same object, still holding the
+	// now-stale gradients of the earlier graph (the documented contract; the
+	// caller ZeroGrads before reusing the variable in a new graph).
+	if w.Grad != gradBefore {
+		t.Error("LoadParameters replaced the Grad tensor; it must be preserved")
+	}
+	for i := range gradVals {
+		if w.Grad.Data[i] != gradVals[i] {
+			t.Errorf("Grad[%d] = %v, want preserved %v", i, w.Grad.Data[i], gradVals[i])
+		}
+	}
+}
+
+// TestMutatedTensorStreamsNeverPanic replays the red team's mutation
+// technique at smoke scale: 300 single-bit flips of a valid multi-tensor
+// stream, each through both reader classes, must produce an error or a
+// successful load — never a panic.
+func TestMutatedTensorStreamsNeverPanic(t *testing.T) {
+	ts := []*tensor.Tensor{
+		tensor.FromData([]float32{1.5, -2.25, 0, -0.0}, 4),
+		tensor.FromData([]float32{1, 2, 3, 4, 5, 6}, 2, 3),
+		tensor.New(),
+		tensor.New(0),
+		tensor.FromData([]float32{1, 2, 3}, 1, 3),
+	}
+	var buf bytes.Buffer
+	if err := WriteTensors(&buf, ts); err != nil {
+		t.Fatal(err)
+	}
+	raw := buf.Bytes()
+	rng := rand.New(rand.NewSource(7501))
+	for i := 0; i < 300; i++ {
+		mut := append([]byte(nil), raw...)
+		pos := rng.Intn(len(mut))
+		mut[pos] ^= 1 << uint(rng.Intn(8))
+		func() {
+			defer func() {
+				if p := recover(); p != nil {
+					t.Fatalf("mutant %d (byte %d bit-flipped): panic: %v", i, pos, p)
+				}
+			}()
+			if i%2 == 0 {
+				ReadTensors(bytes.NewReader(mut))
+			} else {
+				ReadTensors(noLen{bytes.NewReader(mut)})
+			}
+		}()
 	}
 }
 
