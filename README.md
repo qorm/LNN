@@ -153,6 +153,8 @@ epoch 160  loss=0.000000  w=1.9999  b=1.0000
 epoch 199  loss=0.000000  w=2.0000  b=1.0000
 ```
 
+_Output recorded on arm64 (Apple Silicon); on other architectures the trailing digits may differ slightly due to floating-point contraction (Go permits fused multiply-add rounding)._
+
 The loop recovers `w ≈ 2` and `b ≈ 1` to `float32` precision.
 
 ### Using the `nn` package

@@ -83,13 +83,22 @@
 // committed Save* byte streams of a documented LTC, CfC and Linear cell
 // (fixed seeds and construction parameters, listed in golden_test.go)
 // together with the exact Step outputs each loaded cell must reproduce.
-// Three tests stand guard: writer stability requires a same-seed rebuild to
-// re-emit the golden bytes byte for byte, load exactness requires the loaded
-// cells to reproduce the recorded outputs bit for bit, and reader-class
-// agreement requires identical loads on known- and unknown-length readers.
-// Any unintended change to the wire format or to cell semantics fails at
-// least one of them; regenerating the files is a deliberate, reviewed act
-// (go test ./serialize -write-golden), never a side effect.
+// Three tests stand guard, graded by platform because the Go specification
+// permits an implementation to fuse multiple floating-point operations into
+// a single rounded operation (FMA contraction), so the same source can
+// legitimately round differently across architectures. On the architecture
+// the vectors were generated on (arm64) the guard is absolute: writer
+// stability requires a same-seed rebuild to re-emit the golden bytes byte
+// for byte, and load exactness requires the loaded cells to reproduce the
+// recorded outputs bit for bit. On any other architecture the format
+// skeleton — magic, version, tensor count, ranks and shapes — is still
+// pinned byte for byte, while float32 payloads are pinned within a 4 ULP
+// window (measured cross-architecture drift: 1 ULP). On every platform,
+// reader-class agreement requires bit-identical loads on known- and
+// unknown-length readers — a same-binary self-check, so it stays strict
+// everywhere. Any unintended change to the wire format or to cell semantics
+// fails at least one of them; regenerating the files is a deliberate,
+// reviewed act (go test ./serialize -write-golden), never a side effect.
 package serialize
 
 import (

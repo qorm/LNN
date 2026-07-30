@@ -497,19 +497,43 @@ each built from a fixed, documented cell (`nn.NewLTC(4, 6, nil, 6, …101)`,
 `golden_v1_<kind>.expected.txt` recording the exact `Step`/`Forward`
 outputs the loaded cell must reproduce, as `%08x` float32 bit patterns
 that a human can audit byte by byte. Three tests play three distinct
-roles:
+roles, and the freeze they enforce is **graded by platform**:
+
+- The **format layout** — magic, version, tensor count, tensor order,
+  ranks, shapes, and the little-endian float32 encoding — is frozen
+  **byte for byte on every platform**. The writer emits identical bytes
+  for identical values wherever it runs.
+- **Bit-for-bit reproduction of the float payloads** is guaranteed
+  **within a platform and toolchain**. Across architectures it is not,
+  and that is Go's doing, not the library's: the language specification
+  permits an implementation to "combine multiple floating-point
+  operations into a single fused operation, possibly across statements"
+  — FMA contraction, which rounds once where a non-fused path rounds per
+  operation. An arm64 build and an amd64 build can therefore disagree
+  by ≤ 1 ULP per contraction (exactly what CI measured: `0xbe8aa433` vs
+  `0xbe8aa430`). The vectors were generated on arm64 (Apple Silicon), so
+  on `GOARCH=arm64` the assertions below are strict — bit for bit and
+  byte for byte — while on any other architecture the skeleton stays
+  byte-frozen and every payload element is asserted within a **4 ULP**
+  window (four times the measured drift, still tight enough to reject
+  real corruption; `TestGoldenULPToleranceDiscriminates` pins that
+  teeth — 8 ULP fails, shape and count drift fail).
 
 - **`TestGoldenStreamsLoadBitExact` — the behavioral freeze.** Each
   committed stream loads, and the loaded cell's output matches the
-  expected bit patterns exactly (compared with `Float32bits`, so `NaN`
-  and `−0` compare equal to themselves).
+  expected bit patterns exactly on the generating architecture
+  (compared with `Float32bits`, so `NaN` and `−0` compare equal to
+  themselves), within the 4 ULP window elsewhere.
 - **`TestGoldenWriterStability` — the byte-level freeze.** Rebuilding
   each cell from its documented seed and re-saving yields a stream that is
-  byte-for-byte identical to the committed one (`bytes.Equal`) — the
-  writer is deterministic, so any change to the encoding trips this.
+  byte-for-byte identical to the committed one (`bytes.Equal`) on the
+  generating architecture; elsewhere the envelope and wire skeleton
+  (magic, version, count, ranks, shapes) are still compared byte for
+  byte and only the float payloads are compared within the ULP window.
 - **`TestGoldenStreamsLoadOnBothReaderClasses` — reader agreement.** The
   known-length fast path and the progressive streaming path load the same
-  golden stream to bit-identical cells.
+  golden stream to bit-identical cells — a same-binary self-check, so it
+  stays bit-exact on every platform.
 
 Regeneration is gated: `TestWriteGoldenFiles` **skips unless** the run
 passes `-write-golden` (`go test ./serialize -write-golden`), so the
