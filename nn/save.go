@@ -79,6 +79,45 @@ const (
 // byte stream that gets no vote on its own resource budget.
 const maxUnfolds = 1024
 
+// maxUnits and maxInDim cap the units and inDim values LoadLTC and LoadCfC
+// accept from a stream. Value: 256 each. The constructors materialize the
+// synaptic reduction indicators as dense [pre*units, units] matrices
+// (sumIndicator/reversalIndicator in ltc.go): two of units^3 float32s on the
+// recurrent side and two of inDim*units^2 on the sensory side, so load-time
+// memory is O(units^3) while the header that controls it is only 9-13
+// bytes. Quantified at the caps (units = inDim = 256):
+//
+//	persistent  2*(units^3 + inDim*units^2)*4B = 2*(256^3 + 256*256^2)*4B
+//	            = 256 MiB of indicator matrices per loaded cell
+//	transient   plus one indicator rebuild while Load re-bakes the numerator
+//	            indicators from the streamed polarities: at most
+//	            max(units^3, inDim*units^2)*4B = 64 MiB, freed right after
+//	            the copy — a bounded worst-case peak of ~320 MiB.
+//
+// Before these caps, the v0.2.0 red team sweep (F1, the release blocker)
+// loaded a legal units=512 stream (5 MB of delivered bytes) at the cost of
+// 1,560 MB of allocations (311x amplification), and a minimal units=4096
+// attack stream made the process attempt 2*4096^3*4B ≈ 550 GB of recurrent
+// indicators until the operating system killed it outright — worse than a
+// panic, and a direct breach of this file's and the serialize package's
+// contract that a hostile stream allocates only in proportion to the bytes
+// it actually delivers. units and inDim were the twin face maxUnfolds had
+// already covered for the time axis.
+//
+// Like maxUnfolds, the caps are deliberately load-only: NewLTC/NewCfC's
+// runtime contracts are unchanged (dims >= 1 remains the only requirement),
+// because a constructor's inputs come from the caller's own code — an
+// extreme size there is the caller's own allocation decision — while a
+// load's input is an untrusted byte stream that gets no vote on its own
+// resource budget. The root-level fix — sparse contractions that never
+// materialize the [units^2, units] indicators at all — is tracked in the
+// project's technical-debt log (item #14); these caps close the load side
+// in the meantime.
+const (
+	maxUnits = 256
+	maxInDim = 256
+)
+
 // headerWriter writes the kind byte and the int32 header fields, capturing
 // the first I/O error for a single report at the end.
 type headerWriter struct {
@@ -265,7 +304,8 @@ func SaveLTC(w io.Writer, c *LTC) error {
 // LoadLTC reads a stream written by SaveLTC and returns an equivalent cell:
 // for the same input and state, Step produces bit-identical outputs. Any
 // corruption, version skew, truncation or cross-model stream is an error, as
-// is an unfolds value above the load limit maxUnfolds (1024).
+// is an unfolds value above the load limit maxUnfolds (1024) or a units or
+// inDim value above maxUnits / maxInDim (256 each).
 func LoadLTC(r io.Reader) (*LTC, error) {
 	hr := &headerReader{r: r}
 	if err := readKind(hr, kindLTC); err != nil {
@@ -281,10 +321,19 @@ func LoadLTC(r io.Reader) (*LTC, error) {
 	if unfolds < 1 {
 		return nil, fmt.Errorf("nn: LTC header has invalid unfolds=%d", unfolds)
 	}
-	// Checked before the blob is even parsed, so a hostile unfolds cannot
-	// bill any parsing or construction work (see maxUnfolds).
+	// All three size claims are checked before the blob is even parsed, so
+	// a hostile header cannot bill any parsing or construction work:
+	// unfolds would become a CPU-exhaustion loop (see maxUnfolds), and
+	// units/inDim would become O(units^3) indicator allocations the moment
+	// the cell is built (see maxUnits/maxInDim, red team sweep F1).
 	if unfolds > maxUnfolds {
 		return nil, fmt.Errorf("nn: LTC header has unfolds=%d, exceeding the load limit %d", unfolds, maxUnfolds)
+	}
+	if units > maxUnits {
+		return nil, fmt.Errorf("nn: LTC header has units=%d, exceeding the load limit %d", units, maxUnits)
+	}
+	if inDim > maxInDim {
+		return nil, fmt.Errorf("nn: LTC header has inDim=%d, exceeding the load limit %d", inDim, maxInDim)
 	}
 	ts, err := serialize.ReadTensors(r)
 	if err != nil {
@@ -353,10 +402,12 @@ func SaveCfC(w io.Writer, c *CfC) error {
 }
 
 // LoadCfC reads a stream written by SaveCfC and returns an equivalent cell
-// with bit-identical Step behavior. As in LoadLTC, the constructor bakes the
-// reversal potentials into the numerator reduction indicators, so after
-// overwriting the parameters, erev/sErev and the wiring, the indicators are
-// rebuilt in place from the streamed polarities.
+// with bit-identical Step behavior; a units or inDim value above the load
+// limits maxUnits / maxInDim (256 each) is an error, exactly as in LoadLTC.
+// As in LoadLTC, the constructor bakes the reversal potentials into the
+// numerator reduction indicators, so after overwriting the parameters,
+// erev/sErev and the wiring, the indicators are rebuilt in place from the
+// streamed polarities.
 func LoadCfC(r io.Reader) (*CfC, error) {
 	hr := &headerReader{r: r}
 	if err := readKind(hr, kindCfC); err != nil {
@@ -368,6 +419,16 @@ func LoadCfC(r io.Reader) (*CfC, error) {
 	}
 	if inDim < 1 || units < 1 {
 		return nil, fmt.Errorf("nn: CfC header has invalid dims in=%d units=%d", inDim, units)
+	}
+	// Checked before the blob is even parsed, the same defense as LoadLTC:
+	// the CfC constructor materializes the same O(units^3) indicators, so a
+	// hostile header is refused before any parsing or construction work
+	// (see maxUnits/maxInDim, red team sweep F1).
+	if units > maxUnits {
+		return nil, fmt.Errorf("nn: CfC header has units=%d, exceeding the load limit %d", units, maxUnits)
+	}
+	if inDim > maxInDim {
+		return nil, fmt.Errorf("nn: CfC header has inDim=%d, exceeding the load limit %d", inDim, maxInDim)
 	}
 	ts, err := serialize.ReadTensors(r)
 	if err != nil {

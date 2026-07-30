@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"math/rand"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -623,6 +624,163 @@ func TestLoadLTCAcceptsUnfoldsAtLimit(t *testing.T) {
 	if !saveSameBits(out1.Data, out2.Data) || !saveSameBits(h1.Data, h2.Data) {
 		t.Error("Step at the unfolds limit differs after round trip")
 	}
+}
+
+// allocBytesPerRun returns the average heap bytes allocated per call of f
+// (TotalAlloc delta over n runs). testing.AllocsPerRun counts allocations
+// but not their size, and red team F1's threat was exactly size: a 13-byte
+// header billing O(units^3) float32s.
+func allocBytesPerRun(n int, f func()) uint64 {
+	var m0, m1 runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&m0)
+	for i := 0; i < n; i++ {
+		f()
+	}
+	runtime.ReadMemStats(&m1)
+	return (m1.TotalAlloc - m0.TotalAlloc) / uint64(n)
+}
+
+// TestLoadLTCRejectsExcessiveUnits pins red team sweep F1 (the v0.2.0
+// blocker): NewLTC materializes the reduction indicators as dense
+// [pre*units, units] matrices, so a load is O(units^3) in memory — the PoC
+// loaded a legal units=512 stream (5 MB delivered) at the cost of 1,560 MB
+// of allocations (311x amplification), and a minimal units=4096 attack
+// stream made the process attempt 2*4096^3*4B ≈ 550 GB of indicators until
+// the OS killed it. The cap must therefore fire in the header check, before
+// the blob is parsed and before any indicator matrix is allocated.
+func TestLoadLTCRejectsExcessiveUnits(t *testing.T) {
+	header := func(units int) []byte {
+		var b [13]byte
+		b[0] = kindLTC
+		binary.LittleEndian.PutUint32(b[1:], 4)             // inDim
+		binary.LittleEndian.PutUint32(b[5:], uint32(units)) // units
+		binary.LittleEndian.PutUint32(b[9:], 5)             // unfolds
+		return b[:]
+	}
+	for _, u := range []int{maxUnits + 1, 4096, math.MaxInt32} {
+		_, err := LoadLTC(bytes.NewReader(header(u)))
+		if err == nil || !strings.Contains(err.Error(), "units") ||
+			!strings.Contains(err.Error(), fmt.Sprint(maxUnits)) || !strings.Contains(err.Error(), fmt.Sprint(u)) {
+			t.Fatalf("units=%d: got %v, want a units-limit error carrying the value and the limit %d", u, err, maxUnits)
+		}
+	}
+	// The stream is header-only on purpose: if the cap did not fire first,
+	// the missing blob would surface a different (magic/EOF) error, and the
+	// indicator construction would allocate O(units^3). The old code took
+	// the units=4096 claim to ~550 GB until the OS killed the process; the
+	// capped rejection must stay under 1 MiB per run.
+	raw := header(4096)
+	allocs := testing.AllocsPerRun(20, func() {
+		if _, err := LoadLTC(bytes.NewReader(raw)); err == nil {
+			t.Fatal("hostile units accepted")
+		}
+	})
+	if allocs > 50 {
+		t.Errorf("rejection took %.0f allocations; the cap must fire before parsing", allocs)
+	}
+	if b := allocBytesPerRun(20, func() { LoadLTC(bytes.NewReader(raw)) }); b >= 1<<20 {
+		t.Errorf("rejection allocated %d bytes per run; want < 1 MiB (red team: units=4096 attempted ~550 GB)", b)
+	}
+}
+
+// TestLoadCfCRejectsExcessiveUnits is the CfC twin: NewCfC bakes the same
+// [pre*units, units] indicators (cfc.go mirrors ltc.go's scheme), so the
+// identical cap must guard LoadCfC's header before its blob is parsed.
+func TestLoadCfCRejectsExcessiveUnits(t *testing.T) {
+	header := func(units int) []byte {
+		var b [9]byte
+		b[0] = kindCfC
+		binary.LittleEndian.PutUint32(b[1:], 4)             // inDim
+		binary.LittleEndian.PutUint32(b[5:], uint32(units)) // units
+		return b[:]
+	}
+	for _, u := range []int{maxUnits + 1, 4096, math.MaxInt32} {
+		_, err := LoadCfC(bytes.NewReader(header(u)))
+		if err == nil || !strings.Contains(err.Error(), "units") ||
+			!strings.Contains(err.Error(), fmt.Sprint(maxUnits)) || !strings.Contains(err.Error(), fmt.Sprint(u)) {
+			t.Fatalf("units=%d: got %v, want a units-limit error carrying the value and the limit %d", u, err, maxUnits)
+		}
+	}
+	raw := header(4096)
+	allocs := testing.AllocsPerRun(20, func() {
+		if _, err := LoadCfC(bytes.NewReader(raw)); err == nil {
+			t.Fatal("hostile units accepted")
+		}
+	})
+	if allocs > 50 {
+		t.Errorf("rejection took %.0f allocations; the cap must fire before parsing", allocs)
+	}
+	if b := allocBytesPerRun(20, func() { LoadCfC(bytes.NewReader(raw)) }); b >= 1<<20 {
+		t.Errorf("rejection allocated %d bytes per run; want < 1 MiB (red team: units=4096 attempted ~550 GB)", b)
+	}
+}
+
+// TestLoadRejectsExcessiveInDim covers the sensory twin of the F1 cliff:
+// the sensory indicators are [inDim*units, units], so an unbounded inDim is
+// the same unbounded-memory claim through the other header field. Both load
+// paths carry it.
+func TestLoadRejectsExcessiveInDim(t *testing.T) {
+	ltcHeader := func(inDim int) []byte {
+		var b [13]byte
+		b[0] = kindLTC
+		binary.LittleEndian.PutUint32(b[1:], uint32(inDim)) // inDim
+		binary.LittleEndian.PutUint32(b[5:], 6)             // units
+		binary.LittleEndian.PutUint32(b[9:], 5)             // unfolds
+		return b[:]
+	}
+	cfcHeader := func(inDim int) []byte {
+		var b [9]byte
+		b[0] = kindCfC
+		binary.LittleEndian.PutUint32(b[1:], uint32(inDim)) // inDim
+		binary.LittleEndian.PutUint32(b[5:], 6)             // units
+		return b[:]
+	}
+	for _, d := range []int{maxInDim + 1, 4096, math.MaxInt32} {
+		if _, err := LoadLTC(bytes.NewReader(ltcHeader(d))); err == nil ||
+			!strings.Contains(err.Error(), "inDim") ||
+			!strings.Contains(err.Error(), fmt.Sprint(maxInDim)) || !strings.Contains(err.Error(), fmt.Sprint(d)) {
+			t.Fatalf("LTC inDim=%d: got %v, want an inDim-limit error carrying the value and the limit %d", d, err, maxInDim)
+		}
+		if _, err := LoadCfC(bytes.NewReader(cfcHeader(d))); err == nil ||
+			!strings.Contains(err.Error(), "inDim") ||
+			!strings.Contains(err.Error(), fmt.Sprint(maxInDim)) || !strings.Contains(err.Error(), fmt.Sprint(d)) {
+			t.Fatalf("CfC inDim=%d: got %v, want an inDim-limit error carrying the value and the limit %d", d, err, maxInDim)
+		}
+	}
+}
+
+// TestLoadLTCAcceptsUnitsAtLimit proves the cap is not over-tight: a
+// legitimate stream at exactly maxUnits — the largest legal value, near the
+// red team's legal PoC size of 512, which used to cost 1,560 MB —
+// round-trips, and the loaded cell steps bit-identically.
+func TestLoadLTCAcceptsUnitsAtLimit(t *testing.T) {
+	// Sensory side kept small on purpose: the recurrent indicators alone
+	// (2*units^3 float32s) cost 128 MiB per cell at units=256, and the
+	// round trip holds two cells plus one transient 64 MiB rebuild.
+	cell := NewLTC(4, maxUnits, nil, 1, rand.New(rand.NewSource(113)))
+	var buf bytes.Buffer
+	if err := SaveLTC(&buf, cell); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadLTC(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatalf("units=%d must round-trip: %v", maxUnits, err)
+	}
+	if loaded.units != maxUnits {
+		t.Errorf("loaded units = %d, want %d", loaded.units, maxUnits)
+	}
+	saveParamsEqual(t, "LTC@units-limit", cell.Parameters(), loaded.Parameters())
+	if !saveSameBits(cell.erev.Data, loaded.erev.Data) || !saveSameBits(cell.sErev.Data, loaded.sErev.Data) {
+		t.Error("reversal potentials differ after round trip at the units limit")
+	}
+	x := saveInput(1, 4)
+	out1, h1 := cell.Step(x, nil, 0.1)
+	out2, h2 := loaded.Step(x, nil, 0.1)
+	if !saveSameBits(out1.Data, out2.Data) || !saveSameBits(h1.Data, h2.Data) {
+		t.Error("Step at the units limit differs after round trip")
+	}
+	assertFinite(t, "LTC@units-limit", out2, h2)
 }
 
 // TestLoadRejectsInvalidReversalPotentials pins red team F4: erev/sErev are

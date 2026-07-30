@@ -15,7 +15,7 @@
 | 5 | 技术债清扫 + 工程成熟度（Benchmark/CI/双语文档） | ✅ 完成 |
 | 6 | 双轨扩展：特性（optimizer/CfC）+ 性能（热路径向量化） | ✅ 完成 |
 | 7 | 双轨再进：序列化特性 + autograd 深改 + 发布 | ✅ 完成 |
-| 8 | v0.2 双轨：融合反向 + 序列化版本化 → 覆盖率收复 → 红队总扫 → v0.2.0 | 🔄 进行中（8a ✅ / 8b 红队双路已派发） |
+| 8 | v0.2 双轨：融合反向 + 序列化版本化 → 覆盖率收复 → 红队总扫 → v0.2.0 | 🔄 进行中（8b：总扫 ✅ 逮住 F1 High→修复中 / 新代码专项运行中） |
 
 ## 阶段 1：并行分析（已完成）
 
@@ -209,6 +209,27 @@
 
 **红队·序列化组（已完成）**：7,500 变异体（位翻转/删除/插入/块交换，25% 叠连击）**0 panic / 0 静默错乱**（黑盒 oracle 重序列化核验掩码二值/形状/Step 健全；7 例"ok 垃圾入参"均为参数含 NaN/Inf 的忠实复现）；语义攻击全挡（张量顺序偷换/掩码注入 0.5/−1/2/NaN/跨 kind/未知 kind/version 0·2·99·255/UTF-16/大端伪流）；错误全透传（写端每个截断点、读端多偏移）；round-trip **训练动力学逐位等价**（加载后再训练 3 步的参数轨迹与同步训练锁死、种子无关）。**资源耗尽维度不安全**：F1 Medium——**无 Len() 读端**（网络/管道/gzip）绕过剩余字节守卫，~20 字节截断流逼出 64MiB～**4GiB** 分配（make 在读之前）；F2 Medium——`unfolds` 无上限，1<<20 展开 2.26s、1<<30 外推单次 Step ~38 分钟 CPU 耗尽（CfC 免疫）；F3 Low——count=maxCount−1 强分 8MiB 指针切片；F4 Low——加载不校验 erev∈{±1}（可造 NewLTC 永不能产生的细胞）；F5 Info——LoadParameters 保留陈旧 Grad 未文档化；F6 Info——限额私有且包注释"绝不无界分配"措辞掩盖 F1。**裁决：panic/语义维度安全，资源耗尽维度需补防——已派发修复（发布前置条件）**
 
+**F1 修复（v0.2.0 阻断项销账，已完成）**：load-only 常量 `maxUnits = maxInDim = 256`（与 maxUnfolds 并列，save.go:82-119，doc comment 含完整推导与红队出处）。**内存模型先与红队实测对账证明精确**：units=512 公式 2·units³·4B+瞬时重建 = 1.61GB vs 红队实测 1,560MB ✓；units=4096 = 549.8GB vs 红队"~550GB 强杀" ✓。取值推导：持久最坏 2·(units³+inDim·units²)·4B = **恰 256 MiB**，加载峰值 +64MiB 瞬时重建 ≈320MiB 封顶；示例/黄金 units≤8，256 给 32× 头room。校验在头部解析段、**blob 解析之前**（LoadLTC save.go:332-337 / LoadCfC:427-432，紧跟 maxUnfolds 检查）；LoadLinear 无指示阵不受影响（已核对）。
+- **红队 PoC 场景前后对照**：units=4096 十三字节攻击流从"尝试 ~550GB → 进程 jetsam 强杀"收敛为 **8 allocs / 186 B 的带值 error**（`nn: LTC header has units=4096, exceeding the load limit 256`），压缩 ~30 亿倍
+- **门禁工具发现**：`testing.AllocsPerRun` 只数次数不数大小——F1 威胁恰是大小，故新增 `allocBytesPerRun` 字节预算 helper（save_test.go:633），双门禁（次数 ≤50 + 字节 <1MiB）
+- **AtLimit 真实触达**：`NewLTC(4,256,nil,1)` round-trip → 13 参数+erev 逐位、Step 输出 Float32bits 逐位（上限不误伤合法使用，0.04s 完成）；回归测试三组（LTC/CfC units × {257,4096,MaxInt32} 三档 + inDim 同构）
+- 全绿：五包 -race、黄金向量 units=6 保持、两 example 逐字；仅改 save.go + save_test.go（构造器契约不动，沿用加载面/构造面不对称论证）
+
+**红队·新代码专项（三条独立证据链：现役 API 组合 oracle + git 历史真旧版差分 + 黄金流字节手术，已完成）**：**三项变更逐位等价宣称在敌对值谱下全部成立**——
+- SigmoidHadamard：26 组广播组合×敌对值谱（饱和 ±1e6、次正规 1e-45、NaN 双载荷 0x7FC00000/0x7FC0ABCD、±Inf、怪形）前向+反向 dz/dw **Float32bits 零差异**；异形种子回退 19 组值+形状双逐位；panic 消息与旧链逐字相同；共享操作数 NaN 载荷顺序攻击 7 组未兑现宣称的交换律风险；aux 生命周期（二次 Backward 恰 ×2、多消费者图不改写）；采纳点全仓仅 ltc.go:347，cfc.go:279 旧式未被误融合
+- 黄金向量：篡改一字节**确实失败**（防空转：末字节/中段/expected.txt token 三种手术全 FAIL，还原复绿）；**手工逐偏移解码 golden_v1_linear.lnns 120B 并按 MatMul 舍入序手算 Forward，6 个 %08x token 逐字吻合**；版本门先于任何分配（v=2 携恶意 count/rank/1<<62 维只在版本门报出，无解析泄漏）；追加式规则与代码无裂缝；-write-golden 默认 false、默认运行 SKIP、testdata shasum 不变
+- erev 焙入：真 pre-8a 代码差分 10 组 CfC 配置前向+全 13 参数梯度**逐位零差异**；流内 erev 符号位手术 → 加载后 Step **必变**（指示阵确从流重建）；erev=2.0/0/NaN/±Inf 六值×双路径×双细胞全拒；反射确认字段类型 *tensor.Tensor（死梯度清零）
+- **新发现**：F-RT1 低——**±0 符号位角**：全掩蔽突触后列+erev=−1 时旧 Add 链 −0（0x80000000）vs MatMul 收缩 +0，反向零梯度同；(±0)²=+0 使下游不可观测，但"逐位等价"宣称在此角严格为假（机制随 LTC 7b 已发布、8a CfC 继承——8d 文档精确化措辞）；**F-RT2 高（独立确认总扫 F1 且缩窄归属）**：erev 焙入使 **CfC 构造器与 LoadCfC 新增 O(units³) 实体化**——pre-8a cfc.go 对指示阵 **0 引用**，确为 8a 新攻击面（实测 units=256 流 1.3MB → 207MB ≈160×）——已在 F1 修复覆盖内（load-only 上限含 LoadCfC）；F-RT3 信息——`-run Golden` 不匹配 TestWriterStability（命名待 8c 归一）
+- **裁决**：等价性 ✅ 可信（唯一例外为实践不可达的 ±0 符号角）；序列化防护非空转、拒绝语义可操作无泄漏；**安全性待 F-RT2（=总扫 F1）修复后放行**
+
+**红队·v0.2.0 全库总扫（新鲜视角，不读既往发现清单，已完成）**：7 类攻击面（52 条文档断言核验 / 15 项数值病理 / 8 项状态别名 / **1,400 定向变异体×4 入口≈6,200 次恶意流调用** / 3 组端到端病理回路 / 跨包组合 / 文档三角裂缝）。
+- **F1（High，未披露，阻断 v0.2.0 安全宣称）**：`LoadLTC/LoadCfC` 头部仅校验 `dims≥1` 无上限，而 `sumIndicator/reversalIndicator` 实体化 **[units², units] 指示阵 → O(units³) float32 内存**——ltc.go:310-317 注释只审计了 MatMul 跳零的**算力**没审计**内存**（历史盲区）。PoC 双阶段：合法流 units=512（5.0MB）加载成功但分配 **1,560MB（放大 311×）**；最小攻击流 units=4096（64MB）→ **子进程 signal: killed**（尝试 ~550GB，macOS jetsam 强杀——比 panic 更糟，不可 recover）。**直接击穿三处明示契约**（pitfalls#10/persistence 摘要/serialize 包 doc "敌意流按交付字节比例分配"），且 maxUnfolds=1024 先例证明项目本有此防御范式——units 是被遗漏的孪生面。**裁决：修后放行**（load-only 上限，maxUnfolds 同构，数行）
+- F2（低）：NaN 在 Momentum/Adam 状态中**永久毒化**（实测单 NaN 注入→60 轮起全 NaN 永不恢复），pitfalls §2 "该轮剩余"措辞偏轻；architecture.md MatMul 跳零只述 0×NaN→0（实测 NaN×0→NaN，跳过只查左操作数）——措辞方向性不完整
+- F3（低）：8a 后 5 处文档陈旧——erev #10 已修但 pitfalls:233/README:262-264/README_zh:208/cfc.md:363-368/zh/cfc.md:262 仍称开放；runBackward 21-case→实际 23（含 opLeaf/opSigmoidHadamard）；ltc.md:72-84 示例为融合前写法
+- F4（信息级，不计）：手构不一致张量 String() 裸 panic（违反结构体不变量，契约不覆盖）；另发现遗留空目录 `asym/`（主控清理）
+- **正面认证 11 项**：字节流层 6,200 次恶意调用 **0 panic**；模型级语义校验全拒；**训练失败无静默模式（"最重要的负面结果"——未找到任何产出貌似合理错误数字的路径）**；Adam×LTC 500 步 0/500 非有限；ts 契约、梯度正确性（SigmoidHadamard/Div/LogSoftmax/Pow/Softplus/GatherRows gradcheck，MatMulTransA/B 位级一致）、状态隔离（访问器篡改 Step 位级不变、Save/Load 独立性、失败加载原子性）、LoadParameters 语义逐字相符、文档数值宣称**全部逐字实跑吻合**（quick-start 六行/两 example 含中间点/SGD 位级一致）、CfC exprel 阈值差 8.32e-13 与 B⁵/120 理论余项精确吻合、已披露脚枪全守约
+- **总评**："文档诚实度罕见高的库"；F1 修复后放行 v0.2.0；根因级修复（稀疏收缩消灭 O(units³) 实体化，构造器层面同存此悬崖）立留档 #14
+
 **F-E（序列化版本化 + erev 死梯度清除，留档 #10 销账，已完成）**：
 - **格式冻结四件套**：黄金字节流 `testdata/golden_v1_{ltc,cfc,linear}.lnns`（1607/1603/120 B，固定种子 101/202/303，参数全文档化）+ `.expected.txt` 逐元素 `%08x` 位模式期望（可手工审计）+ 包注释「Format versioning」节（v1 逐字节冻结语义、**追加式演进规则**——新数据只能尾部追加计数张量、kind 注册表只追加不复用、或整体 version=2 升级；**拒绝而非猜测**——高版本报"written by a newer version, update this build"、低版本报"no earlier layout exists"）+ `-write-golden` 门禁式再生成。三测试：加载逐位（Float32bits）+ 写端 `bytes.Equal` 逐字节 + 双读端类一致
 - **交叉验证红利**：黄金 LTC 向量在并行 P-C 改动 ltc.go **之前**生成，改动后三测试仍全绿——独立字节级证明 P-C 改动透明
@@ -297,7 +318,8 @@ Git 历史：`87ccf77` 基线 → `08aba45` 阶段3a → `102af40` 阶段3b → 
 | 10 | CfC 的 erev/sErev 以 Var 叶入图产生死梯度 | CfC 红队 | Info | LTC 已焙入 Const 指示阵；CfC 可同法优化，正确性无碍（Parameters 排除⇒优化器不可达），微量浪费 |
 | 11 | `NewSGD(+Inf)` 被字面校验放行；构造后字段可改非法值 | optimizer 红队 | Info | 信任模型自洽且已文档化，sgd.go 注释已补（6c） |
 | 12 | tensor.New 每节点前向输出 + Shape/Data 双分配（终态 pprof 64.9%） | P-B | 🟢 | 进一步压缩需 parents 定长槽化（受阻既有结构断言测试）与 Tensor 定秩 Shape（公共 API 禁区），独立工单候选 |
-| 13 | Sigmoid-Hadamard 融合反向（LTC 热路径模式） | P-B | 🟢 | 需新算子层，收益/脆弱性比待评估，独立工单候选 |
+| 13 | ~~Sigmoid-Hadamard 融合反向~~ | P-B | — | ✅ **阶段 8 已销账**（SigmoidHadamard 算子，−5.6%/−5.8%，结构上限实测终答） |
+| 14 | 指示矩阵 O(units³) 实体化（构造器与加载双悬崖） | 总扫红队 F1 | 🟡 | 加载侧已由 maxUnits 上限封堵；根因需稀疏收缩（不实体化 [units²,units]），独立工单候选 |
 
 ## 变更日志
 
