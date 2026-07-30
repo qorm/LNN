@@ -11,7 +11,7 @@
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │  你的代码                                                    │
-│  数据、模型组装、损失、手写优化器循环                        │
+│  数据、模型、损失、更新循环（手写或 optimizer 包）           │
 └───────────────┬──────────────────────────────────────────────┘
                 │  Step/Forward、Unroll、ParametersOf、
                 │  ZeroGrad → Backward → 显式参数更新
@@ -34,13 +34,14 @@
 └──────────────────────────────────────────────────────────────┘
 ```
 
-导入方向严格向下（`nn → autograd → tensor`）；没有环，也没有跨层捷径——唯一的例外是 `nn` 会直接调用 `tensor` 来构造不需要梯度的常量（接线掩码（mask）、epsilon）。
+导入方向严格向下（`nn → autograd → tensor`）；没有环，也没有跨层捷径——唯一的例外是 `nn` 会直接调用 `tensor` 来构造不需要梯度的常量（接线掩码（mask）、epsilon、稀疏归约指示矩阵（indicator matrix））。`optimizer` 包（SGD、Momentum、Adam）与 `nn` 并列坐在 `autograd` 之上——它只导入 `autograd`，写的就是手写循环会写的朴素 Go 原地更新（[training.md](training.md)）。
 
 | 层 | 职责 | 刻意不具备的东西 |
 |---|---|---|
 | `tensor` | 稠密缓冲与数值内核；以 panic 做校验 | stride、视图、原地算子、枚举子集之外的广播 |
 | `autograd` | 即时前向 + 记录反向闭包；反向模式 `Backward` | tape/session 对象、图优化、高阶导数 |
-| `nn` | 层、细胞、接线、序列展开（unroll）、参数聚合 | 优化器、序列化、CfC 细胞（路线图） |
+| `nn` | 层、细胞（LTC 与 CfC）、接线、序列展开（unroll）、参数聚合 | 序列化（路线图）；内置优化器位于独立的 `optimizer` 包 |
+| `optimizer` | 作用于 `autograd` 叶节点的 SGD/Momentum/Adam，显式 struct | 每参数速度/矩以外的状态；学习率调度（由调用方持有的字段） |
 
 ## 一次训练迭代的数据流
 
@@ -96,7 +97,7 @@ type Variable struct {
 
 ### 图就是内存模型
 
-每个中间张量都保持存活——被其节点的闭包引用——直到 `Backward` 完成。因此内存随每次迭代的算子数量扩展，而不仅仅随参数规模。一次 LTC `Step` 会把 `unfolds` 轮 ODE 迭代、每轮 O(units²) 个突触算子展开进图，所以在这个引擎上，`units`、`unfolds` 和序列长度都要保持适度。
+每个中间张量都保持存活——被其节点的闭包引用——直到 `Backward` 完成。因此内存随每次迭代的算子数量扩展，而不仅仅随参数规模。一次 LTC `Step` 会把 `unfolds` 轮 ODE 迭代展开进图；自阶段 6 的突触向量化起，每轮是 O(units) 个向量块加两次对构造期指示矩阵的 MatMul 收缩（见 [ltc.md](ltc.md)）——从 O(units²) 个逐突触节点降下来（实测：`LTCStep` 3,440 allocs/op，较原循环 −53%；`UnrollBackward` 68,688，−43%）。内存仍然随 `units · unfolds · 序列长度` 增长，所以在这个引擎上三者都要保持适度；`CfC` 细胞（[cfc.md](cfc.md)）的闭式步进则完全没有 `unfolds` 因子。
 
 ## float32 是全局约束
 

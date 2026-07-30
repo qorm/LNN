@@ -2,10 +2,13 @@
 
 > English | [中文](zh/training.md)
 
-**Summary:** lnn ships no optimizer on purpose — you write a four-line
-loop (zero grads → forward → `Backward` → explicit parameter update) over
-`Parameters()`, and you own stability (learning rate and gradient
-clipping). This guide shows the supported pattern end to end.
+**Summary:** training with lnn is a four-phase loop (zero grads → forward
+→ `Backward` → parameter update) over `Parameters()`, and you own
+stability (learning rate and gradient clipping). The update phase is
+either five hand-rolled lines of Go — the basis for understanding the
+engine — or one `optimizer.Step` call (the `optimizer` package ships
+SGD/Momentum/Adam), the recommended form for production training. This
+guide shows both end to end.
 
 **Audience:** engineers about to train their first model with the library.
 
@@ -130,17 +133,127 @@ cross-step memory (a bounded accumulator): `go run ./examples/ltc-sequence`
 trains for 250 iterations and prints the loss falling from `0.690761` to
 `0.041996`.
 
-## Why there is no optimizer
+## Using the optimizer package
 
-By design. The library's contract is a small, readable, auditable numeric
-core; an update rule is five lines of Go, and writing it yourself keeps
-lr schedules, clipping and regularization in your code, visible and
+The `optimizer` package packages phase 4 of the loop — exactly the
+hand-rolled update above, same `float32` arithmetic, same in-place writes
+to `p.Data` — as one auditable method call. Three explicit structs, no
+configuration objects, no reflection:
+
+| Optimizer | Constructor | Update rule |
+|---|---|---|
+| `SGD` | `optimizer.NewSGD(lr)` | `p -= LR·g` — the hand-rolled loop itself |
+| `Momentum` | `optimizer.NewMomentum(lr, mu)` | `v = Mu·v + g`, then `p -= LR·v` — velocity stores *unscaled* gradients, exactly the "Optional: momentum" snippet below |
+| `Adam` | `optimizer.NewAdam(lr, beta1, beta2, eps)` or `optimizer.NewAdamDefault(lr)` (Kingma & Ba's 0.9 / 0.999 / 1e-8) | bias-corrected first/second moment estimates |
+
+All implement `optimizer.Optimizer` (`Step(params []*autograd.Variable)`),
+constructors validate their arguments and panic with the offending value,
+and `SGD` reproduces the Quick start loop at the top of this guide
+line-for-line — measured: identical output at every printed epoch,
+recovering `w = 2.0000, b = 1.0000` at epoch 199 with seed 42.
+
+The loop with `Step`:
+
+```go
+params := nn.ParametersOf(cell, readout)
+opt := optimizer.NewAdamDefault(0.01)
+
+for it := 0; it < iters; it++ {
+	for _, p := range params {
+		p.ZeroGrad()
+	}
+	loss := ...       // build a fresh graph
+	loss.Backward()   // one Backward per graph
+	opt.Step(params)  // update in place
+}
+```
+
+### The Step contract
+
+- **`Step` never calls `ZeroGrad`.** Leaf gradients accumulate across
+  `Backward` calls by design, and when to reset them is *your* contract.
+  Zero before every iteration for plain training; zero once every `N`
+  iterations while stepping after each `Backward`, and you get gradient
+  accumulation over `N` micro-batches for free — an optimizer that zeroed
+  on your behalf would silently break that pattern.
+- **Parameters with nil `Grad` are skipped.** A parameter unused in the
+  last graph (e.g. an unused module handed over by `nn.ParametersOf`)
+  keeps its `Data` and — for stateful optimizers — its state. Adam's
+  per-parameter step counter does not advance either, so the parameter's
+  first real update carries exactly the bias correction of a fresh
+  optimizer.
+- `Step` assumes `p.Grad` has the same shape as `p.Data`, which
+  autograd's `addGrad` guarantees.
+
+### Hyperparameters are exported fields
+
+Every hyperparameter is a plain exported struct field — read and write it
+directly; adjusting the learning rate mid-training is a supported
+pattern:
+
+```go
+adam := optimizer.NewAdamDefault(0.1)
+// ...
+if epoch == 200 {
+	adam.LR = 0.01 // anneal: in effect from the next Step
+}
+```
+
+Measured on the quick-start fit (seed 42): Adam annealed `0.1 → 0.01 →
+0.001` at epochs 200/300 reaches loss `0.000009` at epoch 99 and
+`w = 2.0000, b = 1.0000` by epoch 199.
+
+Constructors validate; `Step` trusts field values as written — the same
+trust model as a hand-rolled loop trusting its `lr` constant. So
+`optimizer.NewSGD(+Inf)` is *accepted* (it satisfies `lr > 0`; every step
+then produces `±Inf`, or `NaN` where a gradient element is exactly zero),
+and writing a nonsense value into `adam.LR` after construction gets you
+precisely the arithmetic you asked for.
+
+### State is keyed by pointer identity
+
+`Momentum` and `Adam` keep per-parameter state (velocity; Adam's moment
+buffers and step count) in maps keyed by `*autograd.Variable` pointer.
+Consequences:
+
+- The same variable stepped repeatedly accumulates its state; distinct
+  variables never share state, even if identically shaped.
+- The state maps *pin* every variable they have ever seen (map keys are
+  strong references): discard the optimizer when you discard a model.
+- Re-pointing a variable's `Data` at a new **same-sized** tensor keeps
+  its state — the optimizer still sees the same parameter. **Resizing**
+  a parameter between steps panics rather than silently corrupting the
+  update.
+- **Aliased variables couple.** Two `Variable`s built over the *same*
+  `Tensor` (sharing one `Data` slice) are distinct map keys but one
+  buffer: stepping both applies each update to the shared storage —
+  measured at SGD `LR = 0.1` with unit gradients, the value moves by
+  `0.2`, not `0.1`. Treat aliased variables as one parameter and step it
+  once.
+
+### Numerics
+
+`float32` everywhere, including optimizer state. Adam's update is
+self-normalizing (`m'/sqrt(v')` stays bounded near `±1` regardless of
+gradient scale), so no wide-magnitude sum ever forms and the `float64`
+trick used for the global gradient norm in the clipping section below
+does not apply here. Adam's square root goes through `math.Sqrt` — the
+standard library has no `float32` sqrt, and one correctly-rounded
+conversion per element is not an accumulation, so it cannot drift.
+
+## Why the hand-rolled loop remains
+
+The library's contract is a small, readable, auditable numeric core; an
+update rule is five lines of Go, and writing it yourself keeps lr
+schedules, clipping and regularization in your code, visible and
 diffable, rather than hidden behind a framework abstraction. Nothing in
-the graph engine assumes how leaves are updated — SGD, momentum and
-clipping all fall out of `p.Data`/`p.Grad` access.
-
-Roadmap (not implemented, no timeline): built-in optimizers and the CfC
-cell. When they land, the hand-rolled pattern above remains valid.
+the graph engine assumes how leaves are updated. The `optimizer` package
+(above) packages precisely this loop for the three common rules and is
+the recommended form for production training; the hand-rolled version
+stays the basis for understanding what `Step` does — and for every
+update rule the package does not cover (weight-decay variants, exotic
+schedules). Both forms share one discipline: clipping remains
+caller-owned (next section).
 
 ## Gradient clipping: do it
 
@@ -180,11 +293,12 @@ for _, p := range params {
 }
 ```
 
-Measured in a real LTC step (seed 42, units=8, unfolds=4, 6-step sequence):
-gradient norm `2.50` → update scale `0.019975` instead of `0.05` on the
-first iteration, with a maximum observed norm of about `6.0` over a
-250-iteration run. The clip engages on most early iterations and is the
-difference between converging and diverging on this task.
+Measured in `examples/ltc-sequence` (seed 42, units=8, unfolds=4, 12-step
+sequence): gradient norm `2.50` → update scale `0.019975` instead of
+`0.05` on the first iteration, with a maximum observed norm of `6.04`
+over the full 250-iteration run. The clip engages on most early
+iterations and is the difference between converging and diverging on
+this task.
 
 ### Optional: momentum
 
@@ -207,6 +321,12 @@ Verified: minimizing `(w - 5)²` from a random start with `lr=0.05`,
 stores *unscaled* gradients in `vel`; if you combine it with norm
 clipping, apply the same `scale` to the gradient before adding it to the
 velocity, or clip the velocity itself — pick one and be consistent.
+
+`optimizer.NewMomentum(0.05, 0.9)` is this snippet packaged: it stores
+unscaled gradients in its velocity buffer with the same arithmetic, and
+reaches the same `w = 5.0007` (the library's own
+`TestMomentumMatchesDocExample` regression-tests the two against each
+other).
 
 ## Why did my training diverge?
 

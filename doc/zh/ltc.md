@@ -24,42 +24,60 @@ cm · dv/dt = −gleak · (v − vleak) + Σⱼ actⱼ · (erevⱼ − v)
 - `cm` — 膜电容；`gleak`/`vleak` — 漏电导及其反转电位（reversal potential）。
 - 来自突触前源 `v_pre` 的突触（synapse）`j` 以一个*sigmoid 激活函数*激活，中心在 `μⱼ`、陡峭度 `σⱼ`，按权重 `wⱼ` 缩放；`(erevⱼ − v)` 是朝该突触反转电位的驱动力（`erev = +1` 为兴奋性，`−1` 为抑制性）。
 
-`LTC` 类型的文档注释（`nn/ltc.go:12-26`）以论文的另一种形式 `dv/dt = −(1/tau + f(v, I))·v + f(v, I)·A` 陈述了同一个模型。
+`LTC` 类型的文档注释（`nn/ltc.go:15-29`）以论文的另一种形式 `dv/dt = −(1/tau + f(v, I))·v + f(v, I)·A` 陈述了同一个模型。
 
 ## 论文符号 → 代码行号对照（nn/ltc.go）
 
 | 论文概念 | 代码 | 行号 |
 |---|---|---|
-| ODE 陈述 + 积分方案（文档） | `LTC` 类型注释 | 12–26 |
-| 构造函数、校验 | `NewLTC` | 54–71 |
-| 参数初始化区间 | `NewLTC` 字面量 | 87–105 |
-| `eps`（分母保护）= `1e-8` | `eps` 字段初始化 | 88 |
-| 可训练参数集（13 个张量） | `Parameters()` | 126–133 |
-| 一次 RNN 步进 | `Step` | 139–178 |
-| `ts` 契约检查（正且有限） | `Step` 防护 | 144–146 |
-| 仿射输入映射 `inputs = x⊙inW + inB` | `Step` | 153 |
-| 对 `cm, w, sW`（加 `gleak`）的 softplus 约束 | `Step` | 156–159 |
-| 感知突触电流（每步一次） | `synapses(inputs, sMu, sSigma, sW, sErev, …)` | 162 |
-| ODE 展开（unroll）循环（`unfolds` 个子步） | `for t := 0; t < c.unfolds; t++` | 166–174 |
-| 循环突触电流（每个子步重算） | `synapses(v, mu, sigma, w, erev, …)` | 167 |
-| `num = cm_t⊙v + gleak⊙vleak + Σ actⱼ·erevⱼ` | `num := …` | 169–170 |
-| `den = cm_t + gleak + Σ actⱼ` | `den := …` | 171–172 |
-| `v ← num / (den + eps)` | `v = autograd.Div(num, Add(den, epsV))` | 173 |
-| 仿射输出映射 `out = v⊙outW + outB` | `Step` | 176 |
-| `cm_t = softplus(cm)·unfolds/ts`，带溢出安全缩放 | `scaledCapacitance` | 194–207 |
-| 突触激活 `w·σ(σp·(vpre−μ))·mask` 与电流累加 | `synapses` | 215–238 |
+| ODE 陈述 + 积分方案（文档） | `LTC` 类型注释 | 15–29 |
+| 构造函数、校验 | `NewLTC` | 75–92 |
+| 参数初始化区间 | `NewLTC` 字面量 | 108–134 |
+| `eps`（分母保护）= `1e-8` | `ltcEps` 常量；`eps` 字段初始化 | 12–13；109 |
+| 构造期图常量（折叠掩码、稀疏归约指示矩阵） | `NewLTC` 字面量；`sumIndicator`；`reversalIndicator` | 128–137；160–168；174–182 |
+| 可训练参数集（13 个张量） | `Parameters()` | 189–196 |
+| 一次 RNN 步进 | `Step` | 202–251 |
+| `ts` 契约检查（正且有限） | `Step` 防护 | 207–209 |
+| 仿射输入映射 `inputs = x⊙inW + inB` | `Step` | 216 |
+| 对 `cm, w, sW`（加 `gleak`）的 softplus 约束；掩码每 Step 一次折叠进权重 | `Step` | 221–224 |
+| 感知突触电流（每步一次） | `synapses(inputs, sMu, sSigma, sWm, denReduceS, numReduceS)` | 227 |
+| Step 不变的循环参数行，切片一次 | `rows(c.mu/c.sigma/wM)`（助手 `rows` 在 287–293） | 231–233 |
+| Step 常量膜项（`eps` 提升进 `denBase`） | `numConst`、`denBase` | 238–239 |
+| ODE 展开（unroll）循环（`unfolds` 个子步） | `for t := 0; t < c.unfolds; t++` | 242–247 |
+| 循环突触电流（每个子步重算） | `synapsesRows(v, muRs, sigRs, wmRs, denReduceR, numReduceR)` | 243 |
+| `num = cm_t⊙v + gleak⊙vleak + Σ actⱼ·erevⱼ` | `num := …` | 245 |
+| `den = cm_t + gleak + Σ actⱼ (+ eps)` | `denBase` + `denR` | 239、246 |
+| `v ← num / (den + eps)` | `v = autograd.Div(num, Add(denBase, denR))` | 246 |
+| 仿射输出映射 `out = v⊙outW + outB` | `Step` | 249 |
+| `cm_t = softplus(cm)·unfolds/ts`，带溢出安全缩放 | `scaledCapacitance` | 267–280 |
+| 逐突触前神经元激活块 + 两次指示矩阵 MatMul 收缩 | `synapses` / `synapsesRows` | 318–331 / 336–358 |
 
-在 `synapses` 内部，对每个突触前神经元 `i`（每个参数矩阵的第 `i` 行参数化*从* `i` *出发*的突触）：
+### 突触驱动向量化
+
+`synapses`/`synapsesRows`（`nn/ltc.go:318-358`）以每个突触前神经元一个向量块计算电流，不再是逐突触对的循环。每个参数矩阵的第 `i` 行仍然参数化*从*神经元 `i` *出发*的突触：
 
 ```go
-act := Sigmoid(Hadamard(sigR, Sub(preCol, muR))) // σᵢⱼ·(v_pre,i − μᵢⱼ)，再过 sigmoid
-act  = Hadamard(act, wR)                         // × wᵢⱼ
-act  = Hadamard(act, Const(maskRow(i)))          // × 接线掩码
-rev  = Hadamard(act, erevR)                      // actᵢⱼ · erevᵢⱼ
-num += rev;  den += act                          // 累加电流
+// 每个突触前神经元 i 一个 [batch, units] 激活块
+// （synapsesRows，nn/ltc.go:341-346）：
+preCol := Col(pre, i)                              // [batch, 1]
+z := Hadamard(sigRs[i], Sub(preCol, muRs[i]))      // σᵢⱼ·(v_pre,i − μᵢⱼ)
+blocks[i] = Hadamard(Sigmoid(z), wmRs[i])          // × wᵢⱼ·maskᵢⱼ
+
+// 块并置为 [batch, pre·units]；与构造期稀疏指示矩阵（indicator matrix）
+// 做两次 MatMul，收缩突触前轴（nn/ltc.go:347-357）：
+den = MatMul(flat, denReduce)                      // den[:,j] = Σᵢ blocksᵢ[:,j]
+num = MatMul(flat, numReduce)                      // num[:,j] = Σᵢ blocksᵢ[:,j]·erev[i,j]
 ```
 
-（`nn/ltc.go:226-235`。）
+相对最初的逐突触循环，有三处结构性变化：
+
+- **掩码移出热路径。** 接线掩码以每 Step 一次矩阵 Hadamard 折叠进正值约束后的权重——`wm = softplus(w)⊙mask`（`nn/ltc.go:223-224`）——而不是每个子步每个突触一次带掩码的乘法。
+- **指示矩阵收缩。** `denReduce`/`numReduce` 是稀疏的 `[pre·units, units]` 指示矩阵（indicator matrix），构造时构建一次（`sumIndicator`，`nn/ltc.go:160-168`）；`numReduce` 还把常量 ±1 反转电位焙入其非零元（`reversalIndicator`，`nn/ltc.go:174-182`），因此 `erev` 再也不以逐突触图节点的形式出现。MatMul 跳过零表项，因此尽管指示矩阵有 `[pre·units, units]` 的规模，每次收缩的代价都是 O(batch·pre·units)。
+- **循环参数行每 Step 只切一次。** `mu`、`sigma` 与掩码后的权重矩阵都是 Step 不变量；`rows`（`nn/ltc.go:287-293`）切片一次，展开循环复用这些行，使每个矩阵 `units·(unfolds−1)` 个 `SliceRow` 节点留在图外。
+
+**等价性在 Step 层面是 ULP 级的——不是逐位。** 孤立的向量化驱动与旧的逐突触循环逐位相同（`nn/ltc_test.go` 的 `TestLTCSynapsesVectorizedEquivalence` 以严格 `==` 回归测试：mask ∈ {0,1} 加上升序收缩次序精确复现旧的 `Add` 链，舍入次序无任何变化）。但整个 `Step` 把 `eps` 和 Step 常量项（`gleak⊙vleak`、感知电流）提升到展开循环之外，改变了 `float32` 的结合次序。红队的独立 oracle——从 git 历史提取重写前的 `ltc.go`，在 13 组随机化配置上差分测试——实测最大差：前向 **1.79e-7**、全参数 BPTT 梯度 **1.19e-7**：ULP 级、良性，但不是"逐位"。
+
+实测的开销降幅（同机，`-benchtime=100x`，复验过）：`LTCStep` 7,360 → **3,440 allocs/op（−53.3%）**；`UnrollBackward` 120,163 → **68,688 allocs/op（−42.8%）**。每个 unfold 的图节点从 O(units²) 个逐突触节点降为 O(units) 个向量块加两次收缩；example 的首轮 loss 仍是 `0.690761`，与重写前逐位一致。
 
 ## 半隐式欧拉的推导
 
@@ -82,7 +100,7 @@ v_{k+1}  =  ──────────────────────�
              cm/dt + gleak + Σⱼ actⱼ                        den
 ```
 
-代码逐元素计算 `v ← num / (den + eps)`（`nn/ltc.go:169-173`），其中 `cm/dt = softplus(cm)·unfolds/ts` 由 `scaledCapacitance` 构建。所有量都是按单元的向量，因此每个运算都是逐元素或广播；退化情形（所有接线掩码为零）精确约化为一个漏电积分器 `v ← (a·v + b·vleak)/(a + b + eps)`，其中 `a = softplus(cm)·unfolds/ts`、`b = softplus(gleak)`——由 `nn/ltc_test.go` 中的 `TestLTCZeroMasksLeakyIntegrator` 以闭式做了回归测试。
+代码逐元素计算 `v ← num / (den + eps)`（`nn/ltc.go:245-246`），其中 `cm/dt = softplus(cm)·unfolds/ts` 由 `scaledCapacitance` 构建。所有量都是按单元的向量，因此每个运算都是逐元素或广播；退化情形（所有接线掩码为零）精确约化为一个漏电积分器 `v ← (a·v + b·vleak)/(a + b + eps)`，其中 `a = softplus(cm)·unfolds/ts`、`b = softplus(gleak)`——由 `nn/ltc_test.go` 中的 `TestLTCZeroMasksLeakyIntegrator` 以闭式做了回归测试。
 
 因为求解对 `v` 是隐式的，该更新在大 `ts` 下是稳定的（状态朝稳态弛豫而不是爆炸），这正是该细胞的可变步长区制可用的原因。
 
@@ -106,7 +124,7 @@ v_{k+1}  =  ──────────────────────�
 | `erev` | `[units, units]` | 随机 ±1 | **固定——不可训练** | 循环反转电位 |
 | `sErev` | `[inDim, units]` | 随机 ±1 | **固定——不可训练** | 感知反转电位 |
 
-`Parameters()` 返回这 13 个可训练张量；`erev`/`sErev` 被刻意排除在外（`nn/ltc.go:126-133`）。学习反转电位会让突触在兴奋性与抑制性极性之间翻转，把 LTC 退化为普通可塑网络——±1 的符号模式是结构性的，在构造时抽取一次。
+`Parameters()` 返回这 13 个可训练张量；`erev`/`sErev` 被刻意排除在外（`nn/ltc.go:189-196`）。学习反转电位会让突触在兴奋性与抑制性极性之间翻转，把 LTC 退化为普通可塑网络——±1 的符号模式是结构性的，在构造时抽取一次。
 
 与参考实现的已知偏差：`inW`/`outW` 恰好初始化为 1、`inB`/`outB` 为 0，而 ncps 使用 U(0.9, 1.1)/U(−0.1, 0.1)。两个映射都可训练，差异在训练中会被冲掉；只影响第 0 步。
 
@@ -114,7 +132,7 @@ v_{k+1}  =  ──────────────────────�
 
 `Step(x, h, ts)` 在 `ts` 个单位的时间跨度上积分 ODE，分 `unfolds` 个子步（`dt = ts/unfolds`）。这是网络"液态"的部分：由调用方驱动时间，事件驱动、逐步可变——小 `ts` 几乎不推进膜，大 `ts` 让它们弛豫向稳态。它对应 ncps 的 `elapsed_time`。
 
-**契约：`ts` 必须为正且有限。** `NaN`、`+Inf`、`-Inf`、零和负值都会 panic（`nn/ltc.go:144-146`）：
+**契约：`ts` 必须为正且有限。** `NaN`、`+Inf`、`-Inf`、零和负值都会 panic（`nn/ltc.go:207-209`）：
 
 ```go
 _, _ = cell.Step(x, nil, 0.01)  // 没问题：快速动态
@@ -123,7 +141,7 @@ cell.Step(x, nil, math.Inf(1))  // panic：无限时间跨度被拒绝
 cell.Step(x, nil, math.NaN())   // panic
 ```
 
-实现的有限性域（`scaledCapacitance`，`nn/ltc.go:194-207`）：
+实现的有限性域（`scaledCapacitance`，`nn/ltc.go:267-280`）：
 
 | `ts` 区间 | 行为 |
 |---|---|
@@ -167,10 +185,10 @@ ys, hN := nn.Unroll(cell, []*autograd.Variable{x, x, x}, nil, 0.1)
 | ncps 概念 | lnn 对应 |
 |---|---|
 | 带 `units`、`unfolds`（默认 6）的 LTC 层 | `NewLTC(inDim, units, wiring, unfolds, rng)` |
-| ODE 求解器：`unfolds` 个子步上的半隐式欧拉 | 相同方案（`Step` 循环，`nn/ltc.go:166-174`） |
+| ODE 求解器：`unfolds` 个子步上的半隐式欧拉 | 相同方案（`Step` 循环，`nn/ltc.go:242-247`） |
 | `implicit_param_constraints`（softplus 正值性） | 对 `cm`、`gleak`、`w`、`sW` 的 softplus |
 | 参数初始化区间 | 原样采用（上表） |
 | 来自接线的固定 ±1 反转电位 | `erev`/`sErev`，不在 `Parameters()` 中 |
 | 每步 `elapsed_time`（可变步长/事件驱动训练） | `Step`/`Unroll` 的 `ts float64` 参数（选 float64 是为了与 ncps 一致，并让 `unfolds/ts` 对微小 `ts` 保持安全） |
 | 感知 vs 循环突触划分 | `sMu/sSigma/sW/sErev` vs `mu/sigma/w/erev` + 接线掩码 |
-| CfC（闭式连续时间）细胞 | **路线图——未实现** |
+| CfC（闭式连续时间）细胞 | **已实现**为 `nn.CfC`（`nn/cfc.go`）：同一条 ODE、同一套 13 参数突触参数化，改用 Lemma 1 闭式解推进而非本欧拉循环——见 [cfc.md](cfc.md) |

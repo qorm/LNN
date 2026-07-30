@@ -61,8 +61,9 @@ Storage is `float32` everywhere; there is no overflow detection and no
 | `Softplus(x)` | exactly `x` for `x > 20` (stable branch), otherwise `log1p(exp)` |
 | `SoftmaxRows`/`LogSoftmaxRows` | internally stabilized (max-subtracted); safe for large logits |
 
-Stabilized internals exist only where listed (plus `Sigmoid`, and LTC's
-`ts` scaling — see [ltc.md](ltc.md)). Everything else is your problem:
+Stabilized internals exist only where listed (plus `Sigmoid`, LTC's `ts`
+scaling — see [ltc.md](ltc.md) — and the CfC's exprel decay factor and
+`ts` scaling, see [cfc.md](cfc.md)). Everything else is your problem:
 keep logits bounded, clamp inputs to `Log`, and clip gradients
 ([training.md](training.md)). Once a single `NaN` exists, it propagates
 through elementwise paths for the rest of the iteration.
@@ -169,9 +170,13 @@ separately (roadmap). Full tables and workarounds in
 ## 9. The graph is the memory model
 
 Every intermediate tensor stays alive until `Backward` completes. One LTC
-step unrolls `unfolds` ODE iterations of O(units²) synapse ops; a sequence
-of `T` steps multiplies that by `T`. Memory grows with ops per iteration,
-not just parameters — keep `units`, `unfolds` and sequence length modest.
+step unrolls `unfolds` ODE iterations, each O(units) vector blocks plus
+two MatMul contractions since the phase-6 synapse vectorization (down
+from O(units²) per-synapse nodes — see [ltc.md](ltc.md)); a sequence of
+`T` steps multiplies that by `T`. Memory grows with ops per iteration,
+not just parameters — keep `units`, `unfolds` and sequence length
+modest, or use the `CfC` cell ([cfc.md](cfc.md)), whose closed-form
+step has no `unfolds` factor.
 
 ## Roadmap and technical debt
 
@@ -182,9 +187,12 @@ gradients):
 | item | status |
 |---|---|
 | `autograd.Div` closed form | **done:** single graph node with quotient-rule backward (`da = g/b`, `db = −g·a/b²`, `autograd/ops.go:171-194`). Note the inherent `1/b²` gradient amplification for small divisors remains — with LTC's `eps = 1e-8` floor that is up to ~`1e16` — so gradient clipping stays recommended |
+| LTC synapse vectorization | **done (phase 6):** masks folded out of the hot path; per-presynaptic-neuron vector blocks + two construction-time indicator-matrix MatMul contractions ([ltc.md](ltc.md)). `LTCStep` 7,360 → 3,440 allocs/op (−53.3%), `UnrollBackward` 120,163 → 68,688 (−42.8%). The whole `Step` is ULP-equivalent to the pre-rewrite loop (forward ≤ 1.79e-7, gradients ≤ 1.19e-7, independent red-team oracle); bitwise identity holds only for the isolated `synapses()` drive |
+| Further `UnrollBackward` compression (autograd-layer fusion) | future: profiling puts ~80% of the remaining allocations in per-node fixed overhead (`tensor.New`/`Clone`/broadcast closures); fusing the Sigmoid–Hadamard backward, in-place `addGrad` and closure removal would all require `autograd` changes |
+| CfC `erev` dead gradients | informational: the CfC's reversal potentials enter the graph as `Var` leaves, so backward work is spent on gradients nobody reads (`Parameters()` excludes them; optimizers cannot reach them). The LTC pays no such cost — it bakes ±1 into `Const` indicator matrices — and the CfC could adopt the same trick |
 | Unify reduction shape conventions (`SumRows`/`SumCols`, 1D promotion) | separate evaluation; API-breaking |
 | `tensor.Stack` | experimental: yields 3D tensors that no other op consumes (`tensor/tensor.go:165`); kept for compatibility |
-| CfC (Closed-form Continuous-time) cell | not implemented |
-| Built-in optimizers | not implemented; hand-rolled SGD is the supported pattern |
+| CfC (Closed-form Continuous-time) cell | **done (phase 6):** `nn.CfC` (`nn/cfc.go`) — same ODE and synapse parameterization as the LTC, driven by the Lemma 1 closed form; paper↔code correspondence and verification trail in [cfc.md](cfc.md). New API: may still evolve |
+| Built-in optimizers | **done (phase 6):** the `optimizer` package (SGD/Momentum/Adam, 100% coverage); the hand-rolled loop remains the supported pattern for understanding and for rules the package does not cover — [training.md](training.md) covers both |
 | Serialization (Save/Load) | not implemented; parameters are plain `[]float32` buffers — snapshot `p.Data.Data` yourself |
-| Benchmarks/CI tooling beyond `make test` | in progress |
+| Benchmarks/CI tooling | **done:** `make bench` (13 benchmarks) + GitHub Actions CI (gofmt gate, vet, build, `test -race`, example smoke test) |

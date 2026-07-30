@@ -6,9 +6,11 @@
 //
 // The task needs cross-step memory, so it genuinely exercises the liquid
 // dynamics rather than a static input/output map. Training is hand-rolled
-// SGD (lnn has no optimizer package yet) with global gradient-norm clipping,
-// and the program doubles as an end-to-end integration smoke test: fixed
-// seed, deterministic output, loss printed as it falls.
+// SGD (kept hand-rolled deliberately as the readable baseline; the
+// lnn/optimizer package offers SGD/Momentum/Adam for production loops)
+// with global gradient-norm clipping, and the program doubles as an
+// end-to-end integration smoke test: fixed seed, deterministic output,
+// loss printed as it falls.
 package main
 
 import (

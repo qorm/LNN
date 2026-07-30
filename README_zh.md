@@ -14,7 +14,8 @@ lnn 小而显式。它宁可牺牲覆盖面，也要保证内核可读、可审�
 |---|---|
 | `lnn/tensor` | 稠密行主序 `float32` 张量，聚焦 1D/2D 的算子集：矩阵乘、带有限广播（broadcasting）的逐元素运算、激活、归约、切片、随机初始化。 |
 | `lnn/autograd` | 动态计算图（computation graph）引擎。每个算子在其输出 `Variable` 上记录一个反向闭包；`Backward` 按逆拓扑序遍历计算图，将梯度累加（gradient accumulation）到叶节点（leaf）。 |
-| `lnn/nn` | 神经网络构件：`Linear` 层、`Wiring` 突触（synapse）拓扑、`LTC` 液态细胞，以及在序列上驱动循环细胞的 `Cell`/`Unroll` 抽象。 |
+| `lnn/nn` | 神经网络构件：`Linear` 层、`Wiring` 突触（synapse）拓扑、`LTC` 液态细胞及其闭式（closed-form）兄弟细胞 `CfC`，以及在序列上驱动循环细胞的 `Cell`/`Unroll` 抽象。 |
+| `lnn/optimizer` | 作用于 `autograd` 的显式参数更新规则：SGD、经典重球动量（momentum）Momentum、Adam（Kingma & Ba，含偏差校正（bias correction））。一次 `Step(params)` 调用替换手写更新循环。 |
 
 ## 文档
 
@@ -22,9 +23,10 @@ lnn 小而显式。它宁可牺牲覆盖面，也要保证内核可读、可审�
 
 | 指南 | 内容 |
 |---|---|
-| [doc/zh/training.md](doc/zh/training.md) | 手写训练循环、朴素 SGD、梯度裁剪（gradient clipping）、发散排查清单 |
+| [doc/zh/training.md](doc/zh/training.md) | 手写训练循环与 `optimizer` 包（SGD/Momentum/Adam）、梯度裁剪（gradient clipping）、发散排查清单 |
 | [doc/zh/shapes-and-broadcasting.md](doc/zh/shapes-and-broadcasting.md) | 广播规则表、归约输出形状、非对称约定 |
 | [doc/zh/ltc.md](doc/zh/ltc.md) | LTC 论文↔代码对照、参数表、`ts` 契约、接线（wiring） |
+| [doc/zh/cfc.md](doc/zh/cfc.md) | CfC 闭式细胞：Lemma 1 论文对照、exprel 稳定化、与 LTC 的关系 |
 | [doc/zh/architecture.md](doc/zh/architecture.md) | 三层设计、计算图机制、`float32` 约束 |
 | [doc/zh/pitfalls.md](doc/zh/pitfalls.md) | 并发契约、溢出场景、残余风险、路线图 |
 
@@ -55,7 +57,7 @@ replace lnn => ../LNN
 
 ## 快速上手
 
-本库刻意不附带优化器——训练循环就是对着 `autograd` 手写的，这正是本库的设计用途。下面的程序用一个手搓的线性模型配合朴素 SGD 拟合 `y = 2x + 1`，只用到 `tensor` 和 `autograd`，`go run` 即可运行。
+训练循环就是对着 `autograd` 手写的——这是理解本库的基础——而 `optimizer` 包把同一个循环打包成 SGD/Momentum/Adam 供生产使用。下面的程序用一个手搓的线性模型配合朴素 SGD 拟合 `y = 2x + 1`，只用到 `tensor` 和 `autograd`，`go run` 即可运行。把手写更新替换为 `optimizer.NewSGD(lr)` + `Step(params)`，输出完全一致——见 [doc/zh/training.md](doc/zh/training.md)。
 
 朴素的 `float32` SGD 没有任何内置稳定化措施：请使用温和的学习率；在稍大的问题上考虑对全局梯度范数做裁剪（`examples/ltc-sequence` 将最大范数裁剪到 1.0）。
 
@@ -146,6 +148,11 @@ out, h := cell.Step(x, nil, 0.1)     // x: [batch,4], nil = 零初始状态, 时
 // 在序列上展开任意 nn.Cell；整条序列都留在计算图里，
 // 因此在 ys 上构建的损失只需一次 Backward 就能对时间求导。
 ys, hN := nn.Unroll(cell, xs, nil, 0.1) // xs: []*autograd.Variable，每个为 [batch,4]
+
+// CfC 是闭式兄弟细胞：同一条 ODE、同一套 13 参数突触参数化，
+// 但没有 unfolds——Lemma 1 闭式解一步推进整个时间跨度 ts（doc/zh/cfc.md）。
+cfc := nn.NewCfC(4, 8, nil, rng)
+out2, h2 := cfc.Step(x, nil, 0.1)
 ```
 
 `examples/ltc-sequence` 把这些拼成了一个完整的训练循环（对 `nn.ParametersOf(cell, readout)` 做手写 SGD），任务是一个玩具序列任务——运行方式：`go run ./examples/ltc-sequence`。
@@ -163,7 +170,7 @@ ys, hN := nn.Unroll(cell, xs, nil, 0.1) // xs: []*autograd.Variable，每个为 
 
   其他任何组合都会 panic，并附说明性消息。
 - **形状约定并非完全对称**（例如 `SumRows` 返回 `[1,n]` 而 `SumCols` 返回 `[m]`，1D⊕1D 的结果会被提升为 `[1,n]`）。依赖某个归约的输出形状之前，请先读 `tensor/ops.go` 里的文档注释。
-- **计算图保留到 `Backward` 为止。** 每个中间张量都被计算图持有，因此内存随算子数量增长。一次 LTC step 会把 `unfolds` 轮 ODE 迭代、每轮 O(units²) 个突触算子展开进图——在这个引擎上，`units` 和 `unfolds` 请保持适度。
+- **计算图保留到 `Backward` 为止。** 每个中间张量都被计算图持有，因此内存随算子数量增长。一次 LTC step 会把 `unfolds` 轮 ODE 迭代展开进图，自突触向量化起每轮是 O(units) 个向量块加两次 MatMul 收缩——从 O(units²) 个逐突触节点降下来（`LTCStep` 3,440 allocs/op，−53%；`UnrollBackward` 68,688，−43%）。在这个引擎上，`units`、`unfolds` 和序列长度请保持适度；`CfC` 细胞（[doc/zh/cfc.md](doc/zh/cfc.md)）则完全没有 `unfolds` 因子。
 
 ## 并发契约
 
@@ -183,9 +190,10 @@ ys, hN := nn.Unroll(cell, xs, nil, 0.1) // xs: []*autograd.Variable，每个为 
 |---|---|
 | `tensor` | 核心稳定、测试充分（约 90% 行覆盖率）。部分防御性检查（溢出安全的尺寸计算、空输入边界情形）仍在加固中。 |
 | `autograd` | 稳定、测试充分（约 98% 行覆盖率）；已覆盖路径上的梯度均通过有限差分检验。 |
-| `nn` | 可用、测试充分（约 98% 行覆盖率）：LTC 前向/反向路径有回归测试，包括闭式退化情形检验、微小/NaN `ts` 防护和接线校验。反转电位是固定的 ±1 常量，不可训练。API 仍可能演进。 |
+| `nn` | 可用、测试充分（约 99% 行覆盖率）：LTC 与 CfC 的前向/反向路径有回归测试，包括闭式退化情形检验、微小/NaN `ts` 防护和接线校验。两个细胞的反转电位都是固定的 ±1 常量，不可训练。CfC 是阶段 6 的新特性，API 仍可能演进。 |
+| `optimizer` | 稳定，100% 行覆盖率：三条更新规则均与独立参考实现对照验证（SGD 逐位一致，Adam 对 float64 参考最大偏差约 1.6e-6），指针键状态语义有回归测试。 |
 
-路线图（尚未实现）：CfC（Closed-form Continuous-time）细胞和内置优化器。序列展开由通用的 `nn.Unroll` 助手覆盖，`examples/ltc-sequence` 展示了受支持的手写 SGD 训练范式。
+CfC（Closed-form Continuous-time）细胞与内置优化器已在阶段 6 落地：`nn.CfC`（[doc/zh/cfc.md](doc/zh/cfc.md)）是 API 仍可能演进的新特性，`optimizer` 包（SGD/Momentum/Adam）已稳定——手写循环依然有效，也仍是理解引擎的基础。序列展开由通用的 `nn.Unroll` 助手覆盖，`examples/ltc-sequence` 展示了端到端训练范式。剩余路线图：序列化（Save/Load）——完整的技术债表追踪于 [doc/zh/pitfalls.md](doc/zh/pitfalls.md)。
 
 修复计划与进展追踪见 `PLAN.md` 和 `PROGRESS.md`。
 

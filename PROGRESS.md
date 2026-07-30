@@ -159,8 +159,20 @@
 | 实施 F-A | 特性 | `optimizer/` 新包：SGD/Momentum/Adam，显式 struct，状态按参数指针隔离 | ✅ 已回报 |
 | 实施 F-B | 特性 | `nn/cfc.go`：CfC 闭式连续时间细胞（Hasani 2022），取证 ncps 参考实现，向量化自包含 | ✅ 已回报 |
 | 实施 P-A | 性能 | `nn/ltc.go` synapses 向量化 + 掩码出热路径；门禁：allocs −50% 且三重正确性验证 | ✅ 已回报 |
-| 红队验证 | 验证 | CfC 论文符合度 + optimizer 更新式 + P-A 等价性（等 6a 落地） | ⏳ 待启动 |
-| 文档同步 | 双语 | doc/ 与 doc/zh/ 全量同步 + README 路线图改写（等红队后，代码定型） | ⏳ 待启动 |
+| 红队验证 | 验证 | CfC 论文符合度 + optimizer 更新式 + P-A 等价性（等 6a 落地） | ✅ 3/3 全部回报（三裁决皆 ✅） |
+| 文档同步 | 双语 | doc/ 与 doc/zh/ 全量同步 + README 路线图改写（等红队后，代码定型） | ⏳ 待启动（工单已锁定：7+ 处"无优化器"旧文案、CfC 新篇、ltc.md 行号表刷新、性能数字；optimizer/doc.go 别名警示与 sgd.go +Inf 注释两处代码注释修正） |
+
+### 红队验证回报（6b）
+
+**CfC 组（✅ 忠实且可信）**：
+- **取证（含自纠）**：双版论文 PDF 全文 + ncps/raminmh 两仓完整 tarball + 上游 LTC 论文 + 公网，六路 grep **"liquid cubic" 零命中**——实施方拒采成立；NMI 发表版核验 Theorem 1/Eq.(8)/Lemma 1/Algorithm 1 **俱在**（本组初审据 arXiv v2 曾怀疑引用瑕疵，经发表版交叉验证**自我证伪并撤回**，留档示透明）
+- **方程级对照**：源 ODE（arXiv Eq.1 原文）↔ cfc.go 的 `cm·dv/dt=−G(v−A)` 逐项恒等；Lemma 1 闭式解 `v=A+(v₀−A)e^{−κt}` ↔ Step 的 A/κ/F 代数恒等（含"冻结激活=分段常数输入"前提）；Algorithm 1「逐突触编译、允许任意稀疏 WAdj」↔ drive() + wiring 掩码结构同构。裁决：**比官方 pure 模式（MLP 代理闭式解）更贴方程**
+- **数值对抗 10/10 全过**：阈值 1e-2 跨越 8001 点扫描跳变 ≤2.98e-8（容差的 1/300）；全参数 gradcheck 零失败（worstAbs 6e-6）；掩码置零突触梯度 9/9 恰为 0.0；极端 ts 8/8 有限（ts=1e-300 ⇒ v 逐位不动、ts=1e300 ⇒ v→A）；dt→0 收敛阶 p≈1.89（O(h²)，优于要求）；**CfC vs LTC 同 ODE 一阶收敛 p≈1.0**（"同一 ODE 两种积分器"宣称成立）；同种子 CfC/LTC 13 参数+erev 逐位同构
+- 新发现均 Info：①erev 以 Var 叶入图产生死梯度（Parameters 排除故优化器不可达，微量浪费，留档）；②`v+(A−v)F` 在敌对巨态下抵消丢精度（动力学不可达：A 有界+凸组合 ⇒ 状态永有界）；③平方损失+病理参数溢出毒化反向（损失侧本性，非 cell 缺陷）
+
+**optimizer 组（✅ 正确且干净）**：自撰三套参考实现（f64 教科书式 / f32 同序镜像 / 闭式解），随机梯度流（含 10⁻³–10³ 尺度跳变）对照——SGD 镜像**逐位一致**、Adam 对 f64 Algorithm 1 最大偏差 **1.63e-6**、t=1 闭式 rel=**0 精确**；**鉴别力校验**：错误 t 公式偏离 0.74–1.6%、Eps 位置判别实验（√v̂+ε 偏差 0 / √(v̂+ε) 偏差 0.386）证明测试非空转。状态对抗五场景（指针别名/同指针换 Data/nil-Grad 跳步不推进 t/finalizer 实证 map 钉住无泄漏/双重 Step 精确双应用）全部与文档逐字相符。Adam 在 autograd 手构 Rosenbrock 2D 2000 步 24.2→7.9e-4 无 NaN；SGD 大 lr 发散为干净 ±Inf 零 panic；19 例非法超参全 panic 带值；覆盖率 100% 实测为真。**新发现**：①中/文档——**全库 7+ 处仍宣称"无优化器"**（README×2/training/pitfalls/nn doc.go/module.go），与新包直接矛盾（6c 文档同步的头号工单）；②低——optimizer/doc.go 宜补"别名 Variable 经 Data 共享耦合更新"警示；③低——`NewSGD(+Inf)` 被字面校验放行（信任模型自洽，建议注释）；④低——构造后字段可改非法值（已披露的信任取舍）；⑤Info——手设短 Grad 触发 index panic（autograd 路径不可达）
+
+**性能组（✅ 等价且属实）**：从 git 历史（66d4adf）提取重写前 ltc.go 作独立 oracle，13 组随机化配置差分——前向最大差 **1.79e-7**、全参数+BPTT 梯度最大差 **1.19e-7**（远优于门禁）；掩码置零突触梯度 `==0` 精确断言 352 位 0 违规；指示矩阵白盒核对（含 erev 符号焙入手算例，极性正确）；基准同机复测 **−53.3%/−42.8% 逐字复现**；9 种形状对抗探测 allocs **全部严格更优**无反例；`ltc_test.go` 只增 157 行/删 0 行、导出符号零变更。**唯一保留**：「逐位等价」仅对孤立 `synapses()` 严格成立，整 Step 为 ULP 级等价（eps/常量项结合律重排，~1e-7 良性，非缺陷）——实施报告的措辞应修正为"synapses 逐位、整 Step ULP 级"。
 
 ### 实施回报摘要
 
@@ -203,6 +215,8 @@ Git 历史：`87ccf77` 基线 → `08aba45` 阶段3a → `102af40` 阶段3b → 
 | 7 | nn 热路径分配量（LTCStep 7372 allocs/op、Unroll 12 万 allocs/op） | D2 基准量化 | 🟢 | 已有基准尺子，图算子融合/掩码预施加为后续优化方向 |
 | 8 | 三份源码内旧包注释与 doc.go 并存 | D3 发现 | 🟢 | go 1.26 下 doc.go 胜出、用户无感，未来可清理 |
 | 9 | Backward 阶段逐节点固定开销（tensor.New 46%/Clone 20%/broadcast 闭包 14%） | P-A pprof | 🟢 | UnrollBackward 再压缩需 autograd 层改动（Sigmoid-Hadamard 融合反向、addGrad 原地写入、去闭包），独立工单候选 |
+| 10 | CfC 的 erev/sErev 以 Var 叶入图产生死梯度 | CfC 红队 | Info | LTC 已焙入 Const 指示阵；CfC 可同法优化，正确性无碍（Parameters 排除⇒优化器不可达），微量浪费 |
+| 11 | `NewSGD(+Inf)` 被字面校验放行；构造后字段可改非法值 | optimizer 红队 | Info | 信任模型自洽且已文档化，sgd.go 拟补注释（6c 工单） |
 
 ## 变更日志
 

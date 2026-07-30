@@ -46,6 +46,14 @@
 // its state (documented and tested); resizing a parameter in place
 // panics rather than silently corrupting the step.
 //
+// Aliased variables couple. State is keyed by pointer identity, not by
+// the underlying storage: two Variables constructed over the same Tensor
+// (sharing one Data slice) are distinct map keys but one buffer, so
+// stepping both applies each update to the shared storage — with SGD at
+// LR=0.1 and unit gradients, a single aliased pair steps the value by
+// 2*0.1, not 0.1. Treat aliased variables as one parameter and step it
+// once.
+//
 // # Numerics
 //
 // float32 everywhere, per the library convention: updates and all

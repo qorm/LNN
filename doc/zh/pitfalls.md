@@ -46,7 +46,7 @@ wg.Wait()
 | `Softplus(x)` | `x > 20` 时恰为 `x`（稳定分支），否则为 `log1p(exp)` |
 | `SoftmaxRows`/`LogSoftmaxRows` | 内部已稳定化（减去最大值）；大 logit 安全 |
 
-稳定化的内部实现只存在于上表所列之处（外加 `Sigmoid`，以及 LTC 的 `ts` 缩放——见 [ltc.md](ltc.md)）。其余都是你自己的问题：保持 logit 有界、钳制 `Log` 的输入、裁剪梯度（[training.md](training.md)）。一旦存在一个 `NaN`，它就会在本轮迭代的剩余时间里沿逐元素路径扩散。
+稳定化的内部实现只存在于上表所列之处（外加 `Sigmoid`、LTC 的 `ts` 缩放——见 [ltc.md](ltc.md)——以及 CfC 的 exprel 衰减因子（decay factor）与 `ts` 缩放，见 [cfc.md](cfc.md)）。其余都是你自己的问题：保持 logit 有界、钳制 `Log` 的输入、裁剪梯度（[training.md](training.md)）。一旦存在一个 `NaN`，它就会在本轮迭代的剩余时间里沿逐元素路径扩散。
 
 **一个需要知道的非对称 NaN 行为：** `MatMul` 在内层循环里跳过零乘数（`tensor/ops.go:20`），因此 `0 * NaN` 贡献 `0` 而不是毒化乘积：
 
@@ -117,7 +117,7 @@ fmt.Println(m.Grad.Data) // [1 0 0 1] —— 依然正确
 
 ## 9. 图就是内存模型
 
-每个中间张量都保持存活，直到 `Backward` 完成。一次 LTC step 展开 `unfolds` 轮 ODE 迭代、每轮 O(units²) 个突触算子；`T` 步的序列会把这一切再乘以 `T`。内存随每次迭代的算子数增长，而不仅仅随参数增长——`units`、`unfolds` 和序列长度都要保持适度。
+每个中间张量都保持存活，直到 `Backward` 完成。一次 LTC step 展开 `unfolds` 轮 ODE 迭代，自阶段 6 的突触向量化起每轮是 O(units) 个向量块加两次 MatMul 收缩（从 O(units²) 个逐突触节点降下来——见 [ltc.md](ltc.md)）；`T` 步的序列会把这一切再乘以 `T`。内存随每次迭代的算子数增长，而不仅仅随参数增长——`units`、`unfolds` 和序列长度都要保持适度；或者改用 `CfC` 细胞（[cfc.md](cfc.md)），它的闭式步进没有 `unfolds` 因子。
 
 ## 路线图与技术债
 
@@ -126,9 +126,12 @@ fmt.Println(m.Grad.Data) // [1 0 0 1] —— 依然正确
 | 条目 | 状态 |
 |---|---|
 | `autograd.Div` 闭式化 | **已完成：** 单图节点 + 商法则反向（`da = g/b`、`db = −g·a/b²`，`autograd/ops.go:171-194`）。注意小除数固有的 `1/b²` 梯度放大依然存在——以 LTC 的 `eps = 1e-8` 下限计，最高约 `1e16` 倍——因此仍建议梯度裁剪 |
+| LTC 突触向量化 | **已完成（阶段 6）：** 掩码折叠出热路径；逐突触前神经元向量块 + 两次构造期指示矩阵（indicator matrix）MatMul 收缩（[ltc.md](ltc.md)）。`LTCStep` 7,360 → 3,440 allocs/op（−53.3%）、`UnrollBackward` 120,163 → 68,688（−42.8%）。整 `Step` 与重写前循环为 ULP 级等价（前向 ≤ 1.79e-7、梯度 ≤ 1.19e-7，红队独立 oracle）；逐位一致仅对孤立的 `synapses()` 驱动成立 |
+| `UnrollBackward` 的进一步压缩（autograd 层融合） | 后续方向：剖析显示剩余分配约 80% 是逐节点固定开销（`tensor.New`/`Clone`/广播闭包）；融合 Sigmoid–Hadamard 反向、`addGrad` 原地写入、去闭包都需要改动 `autograd` |
+| CfC 的 `erev` 死梯度 | 信息级：CfC 的反转电位以 `Var` 叶入图，反向计算花在无人读取的梯度上（`Parameters()` 将其排除，优化器不可达）。LTC 分文不付——它把 ±1 焙入 `Const` 指示矩阵——CfC 也可照搬同一手法 |
 | 统一归约形状约定（`SumRows`/`SumCols`、1D 提升） | 单独评估；API 破坏性 |
 | `tensor.Stack` | 实验性：产出没有其他算子消费的 3D 张量（`tensor/tensor.go:165`）；为兼容保留 |
-| CfC（Closed-form Continuous-time）细胞 | 未实现 |
-| 内置优化器 | 未实现；手写 SGD 是受支持的范式 |
+| CfC（Closed-form Continuous-time）细胞 | **已完成（阶段 6）：** `nn.CfC`（`nn/cfc.go`）——与 LTC 同一 ODE、同一套突触参数化，以 Lemma 1 闭式解驱动；论文↔代码对照与验证留痕见 [cfc.md](cfc.md)。新 API：仍可能演进 |
+| 内置优化器 | **已完成（阶段 6）：** `optimizer` 包（SGD/Momentum/Adam，覆盖率 100%）；手写循环依然是理解引擎以及实现该包未覆盖规则的受支持范式——[training.md](training.md) 覆盖两种形态 |
 | 序列化（Save/Load） | 未实现；参数就是朴素的 `[]float32` 缓冲区——请自行快照 `p.Data.Data` |
-| `make test` 之外的基准/CI 工具 | 进行中 |
+| 基准/CI 工具 | **已完成：** `make bench`（13 项基准）+ GitHub Actions CI（gofmt 门禁、vet、build、`test -race`、example 冒烟） |

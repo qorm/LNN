@@ -24,7 +24,14 @@ type SGD struct {
 }
 
 // NewSGD returns a plain SGD optimizer. It panics unless lr > 0 (NaN
-// fails the check and panics too).
+// fails the check and panics too). The constructor check is a convenience,
+// not a full invariant: literal +Inf satisfies lr > 0 and is accepted,
+// after which every Step produces ±Inf updates — or NaN where a gradient
+// element is exactly zero, since Inf*0 is NaN. Step likewise trusts the
+// LR field as written, so writing an invalid value into SGD.LR after
+// construction yields exactly the arithmetic asked for. This is the same
+// trust model as a hand-rolled loop trusting its lr constant: validate
+// once at the boundary, then run without re-checking.
 func NewSGD(lr float32) *SGD {
 	if !(lr > 0) {
 		panic(fmt.Sprintf("optimizer.NewSGD: learning rate must be positive, got %v", lr))

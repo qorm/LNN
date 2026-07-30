@@ -55,14 +55,27 @@
 // neuron j. See doc/ltc.md for the equation-to-code correspondence and
 // doc/pitfalls.md for the numeric fine print.
 //
+// # Closed-form Continuous-time cells
+//
+// CfC implements the Closed-form Continuous-time cell of Hasani et al.
+// (2022), "Closed-form continuous-time neural networks" (Nature Machine
+// Intelligence 4, 992-1003): the very membrane ODE the LTC integrates
+// numerically, advanced over the step's time span by its Lemma 1
+// closed-form solution instead of the semi-implicit Euler loop. NewCfC
+// shares the LTC's synapse parameterization (the same 13 trainable
+// tensors, fixed +/-1 reversal potentials, wiring masks, ts contract) and
+// satisfies the same Cell interface, so Unroll drives it unchanged. See
+// doc/cfc.md for the paper-to-code correspondence.
+//
 // # Training
 //
-// The library ships no optimizer: training loops are written by hand over
-// Parameters() — ZeroGrad, forward, Backward, then an explicit parameter
-// update. Plain SGD plus global gradient-norm clipping is the supported
-// pattern; see doc/training.md and examples/ltc-sequence for complete
-// loops. Roadmap (not yet implemented): the CfC (Closed-form
-// Continuous-time) cell and built-in optimizers.
+// Training loops are written over Parameters() — ZeroGrad, forward,
+// Backward, then the parameter update. The hand-rolled update loop (plain
+// Go over p.Data/p.Grad) remains the basis for understanding the engine;
+// the optimizer package (SGD, Momentum, Adam) packages exactly that loop
+// and is the recommended form for production training. Global
+// gradient-norm clipping stays caller-owned in both forms. See
+// doc/training.md and examples/ltc-sequence for complete loops.
 //
 // # Concurrency
 //

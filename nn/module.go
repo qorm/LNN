@@ -2,10 +2,12 @@
 // the Linear layer, Wiring synapse topologies, the LTC liquid cell, and the
 // Cell/Unroll abstractions for driving recurrent cells over sequences.
 //
-// Roadmap (not yet implemented): the CfC (Closed-form Continuous-time) cell
-// and built-in optimizers. Hand-rolled SGD over Parameters() is the
-// supported pattern today; see examples/ltc-sequence for an end-to-end
-// training loop.
+// Two update styles are supported: the hand-rolled loop over Parameters()
+// (plain Go over p.Data/p.Grad — the basis for understanding the engine)
+// and the optimizer package (SGD/Momentum/Adam), which packages that same
+// loop and is the recommended form for production training. See
+// examples/ltc-sequence for an end-to-end training loop and doc/training.md
+// for both styles.
 //
 // Concurrency contract: lnn is single-threaded by design. Backward mutates
 // the Grad buffers of a graph's leaf variables without synchronization, so

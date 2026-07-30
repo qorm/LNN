@@ -14,7 +14,7 @@ dependencies beyond the standard library.
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │  your code                                                   │
-│  data, model assembly, loss, hand-rolled optimizer loop      │
+│  data, model, loss, update loop (hand-rolled or optimizer)   │
 └───────────────┬──────────────────────────────────────────────┘
                 │  Step/Forward, Unroll, ParametersOf,
                 │  ZeroGrad → Backward → explicit param update
@@ -41,13 +41,18 @@ dependencies beyond the standard library.
 
 Import direction is strictly downward (`nn → autograd → tensor`); there are
 no cycles and no cross-layer shortcuts except that `nn` calls `tensor`
-directly for constants (wiring masks, epsilon) that need no gradient.
+directly for constants (wiring masks, epsilon, sparse reduction
+indicators) that need no gradient. The `optimizer` package (SGD,
+Momentum, Adam) sits beside `nn` on top of `autograd` — it imports only
+`autograd` and writes the same plain-Go in-place updates a hand-rolled
+loop would ([training.md](training.md)).
 
 | Layer | Responsibility | What it deliberately lacks |
 |---|---|---|
 | `tensor` | Dense buffers and numeric kernels; validation by panic | strides, views, in-place ops, broadcasting beyond an enumerated subset |
 | `autograd` | Eager forward + recorded backward closures; reverse-mode `Backward` | tape/session objects, graph optimization, higher-order derivatives |
-| `nn` | Layers, cells, wiring, sequence unrolling, parameter aggregation | optimizers, serialization, CfC cells (roadmap) |
+| `nn` | Layers, cells (LTC and CfC), wiring, sequence unrolling, parameter aggregation | serialization (roadmap); built-in optimizers live in the separate `optimizer` package |
+| `optimizer` | SGD/Momentum/Adam as explicit structs over `autograd` leaves | state beyond per-parameter velocity/moments; lr schedules (caller-owned fields) |
 
 ## Data flow of one training iteration
 
@@ -140,8 +145,14 @@ a defined safety net, not a feature to build on
 Every intermediate tensor stays alive — referenced by its node's closure —
 until `Backward` completes. Memory therefore scales with the number of ops
 per iteration, not just with parameter size. One LTC `Step` unrolls
-`unfolds` ODE iterations of O(units²) synapse ops into the graph, so keep
-`units`, `unfolds` and sequence length modest on this engine.
+`unfolds` ODE iterations into the graph; since the phase-6 synapse
+vectorization each iteration is O(units) vector blocks plus two MatMul
+contractions against construction-time indicator matrices
+([ltc.md](ltc.md)) — down from O(units²) per-synapse nodes (measured:
+`LTCStep` 3,440 allocs/op, −53% vs the original loop; `UnrollBackward`
+68,688, −43%). Memory still grows with `units · unfolds · sequence
+length`, so keep all three modest on this engine; a `CfC` step
+([cfc.md](cfc.md)) avoids the `unfolds` factor entirely.
 
 ## float32 is a global constraint
 
