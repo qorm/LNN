@@ -2,6 +2,9 @@
 
 > [简体中文](README_zh.md)
 
+[![CI](https://github.com/qorm/LNN/actions/workflows/ci.yml/badge.svg)](https://github.com/qorm/LNN/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/qorm/LNN.svg)](https://pkg.go.dev/github.com/qorm/LNN)
+
 A pure-Go numerical computation library: dense `float32` tensors, reverse-mode
 automatic differentiation, and Liquid Time-Constant (LTC) neural cells —
 with **zero third-party dependencies** (the standard library is the only

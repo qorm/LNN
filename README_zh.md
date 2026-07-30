@@ -2,6 +2,9 @@
 
 # lnn
 
+[![CI](https://github.com/qorm/LNN/actions/workflows/ci.yml/badge.svg)](https://github.com/qorm/LNN/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/qorm/LNN.svg)](https://pkg.go.dev/github.com/qorm/LNN)
+
 一个纯 Go 数值计算库：稠密 `float32` 张量（tensor）、反向模式自动微分，以及液态时间常数（Liquid Time-Constant，LTC）神经细胞——**零第三方依赖**（唯一的导入就是标准库）。LTC 实现遵循 Hasani 等人的论文
 [Liquid Time-constant Networks](https://ojs.aaai.org/index.php/AAAI/article/view/17017)
 （AAAI 2021）及参考实现 [`mlech26l/ncps`](https://github.com/mlech26l/ncps)。
