@@ -8,6 +8,7 @@ import (
 	"math"
 	"math/rand"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -964,5 +965,38 @@ func TestSaveStateDeterministic(t *testing.T) {
 		if !bytes.Equal(b1.Bytes(), b2.Bytes()) {
 			t.Errorf("%s: two saves of identical state produced different bytes", names[i])
 		}
+	}
+}
+
+// TestCountToUint32 pins SaveState's count guard as the pure function it was
+// extracted into: a genuinely oversized params slice (2^32 pointers, 32 GiB)
+// can never exist in a test, so the boundary, the wrapped-negative rejection
+// and the error wording are asserted here directly, while SaveState runs the
+// same call on every save.
+func TestCountToUint32(t *testing.T) {
+	// The in-range side of the boundary converts exactly, boundary included.
+	for _, n := range []int{0, 1, 4096, int(uint32(math.MaxUint32))} {
+		got, err := countToUint32(n)
+		if err != nil || got != uint32(n) {
+			t.Fatalf("countToUint32(%d) = (%d, %v), want (%d, nil)", n, got, err, uint32(n))
+		}
+	}
+	// The out-of-range side, expressible only where int is 64-bit.
+	if strconv.IntSize == 64 {
+		for _, n := range []int{1 << 32, 1<<32 + 17, math.MaxInt64} {
+			if got, err := countToUint32(n); err == nil {
+				t.Fatalf("countToUint32(%d) = %d, want the stream count limit error", n, got)
+			}
+		}
+		if _, err := countToUint32(1 << 32); err.Error() !=
+			"4294967296 parameters exceed the stream count limit 4294967295" {
+			t.Fatalf("countToUint32 boundary error %q reworded", err)
+		}
+	}
+	// Negatives are unreachable from the len() call site but expressible on
+	// the pure function: they wrap to >= 2^63 under the uint64 conversion and
+	// are rejected by the same comparison.
+	if _, err := countToUint32(-1); err == nil {
+		t.Fatal("countToUint32(-1) accepted")
 	}
 }

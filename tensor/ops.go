@@ -224,10 +224,16 @@ func broadcastBinary(a, b *Tensor, f func(x, y float32) float32) *Tensor {
 				orow[j] = f(av, bd[bb+j])
 			}
 		default: // both constant across the row
+			// cols == 1 always holds in this arm: reaching it requires both
+			// operands to broadcast with stride zero (bcastScalar or bcastCol
+			// modes), and under those modes every broadcastShapeFresh arm
+			// resolves to a single-column shape — an operand shape [m, 1], a
+			// size-1 shape (every dimension 1, at any rank), or the [1, 1]
+			// lift of a 1D scalar pair; [1, 1] x [1, 1] itself is intercepted
+			// by the SameShape fast path above, and any rank-3+ non-scalar
+			// operand panics in bcastMode before the loop. The j >= 1 fill
+			// that once stood here could never execute and was removed.
 			orow[0] = f(ad[ab], bd[bb])
-			for j := 1; j < cols; j++ {
-				orow[j] = orow[0]
-			}
 		}
 	}
 	return out

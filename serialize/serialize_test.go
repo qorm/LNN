@@ -399,6 +399,71 @@ func (w *limitWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// TestWriteTensorsReportsHeaderFailureOnEmptyStream covers the post-loop error
+// report: with at least one tensor, a failed header write surfaces through
+// bw.tensor's in-loop return, so the "writing stream" wrap is only reachable
+// on an empty stream whose header write fails.
+func TestWriteTensorsReportsHeaderFailureOnEmptyStream(t *testing.T) {
+	// Limit 5: the 4-byte magic and 1-byte version pass, the 4-byte count
+	// write fails like a full disk — and with no tensors the loop never runs,
+	// so the accumulated error is reported after it.
+	err := WriteTensors(&limitWriter{limit: 5}, nil)
+	if err == nil {
+		t.Fatal("header short write accepted on an empty stream")
+	}
+	if !strings.Contains(err.Error(), "serialize: writing stream") || !strings.Contains(err.Error(), "space") {
+		t.Errorf("error %q loses the wrap or the underlying cause", err)
+	}
+}
+
+// TestReadTensorsRejectsCountTruncation covers a stream that ends inside the
+// 4-byte tensor count field: magic and version arrive intact and the count
+// read itself is what fails.
+func TestReadTensorsRejectsCountTruncation(t *testing.T) {
+	for _, keep := range []int{0, 1, 3} { // bytes of the 4-byte count delivered
+		stream := frame(count(1)[:keep])
+		_, err := ReadTensors(bytes.NewReader(stream))
+		if !errors.Is(err, io.ErrUnexpectedEOF) || !strings.Contains(err.Error(), "reading tensor count") {
+			t.Errorf("count cut to %d bytes: got %v, want a reading-tensor-count ErrUnexpectedEOF", keep, err)
+		}
+	}
+}
+
+// lyingLen reports a Len() far larger than the bytes its reader can actually
+// deliver, then fails mid-payload: it defeats floats' up-front
+// remaining-bytes check (the payload claim appears to fit), so the in-loop
+// read failure is what reports.
+type lyingLen struct {
+	r   io.Reader
+	len int
+}
+
+func (l *lyingLen) Read(p []byte) (int, error) { return l.r.Read(p) }
+func (l *lyingLen) Len() int                   { return l.len }
+
+// TestReadTensorsReportsMidPayloadReadFailure covers the error arm inside
+// floats' known-length chunk loop: the remaining-bytes pre-check passes
+// because the reader lies about its length, and the underlying read then
+// fails inside the payload.
+func TestReadTensorsReportsMidPayloadReadFailure(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteTensors(&buf, []*tensor.Tensor{tensor.FromData([]float32{1, 2, 3, 4}, 4)}); err != nil {
+		t.Fatal(err)
+	}
+	// magic + version + count + rank + one int64 shape = 18 header bytes,
+	// then the 16-byte payload that never arrives.
+	raw := buf.Bytes()
+	boom := errors.New("mid-payload failure")
+	r := &lyingLen{
+		r:   io.MultiReader(bytes.NewReader(raw[:18]), &errReader{err: boom}),
+		len: 1 << 20,
+	}
+	_, err := ReadTensors(r)
+	if !errors.Is(err, boom) || !strings.Contains(err.Error(), "reading data") {
+		t.Errorf("got %v, want the in-loop reading-data failure wrapping %v", err, boom)
+	}
+}
+
 func TestParametersRoundTripInPlaceKeepsGraphUsable(t *testing.T) {
 	w := autograd.Var(tensor.FromData([]float32{2, 0, 0, 3}, 2, 2))
 	b := autograd.Var(tensor.FromData([]float32{0.5, -1}, 2))

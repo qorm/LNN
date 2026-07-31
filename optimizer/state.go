@@ -225,6 +225,22 @@ func betaPow(beta float32, t int) float32 {
 	return p
 }
 
+// countToUint32 bounds a parameter count to the stream format's uint32 count
+// field. The sole caller passes len(params), which cannot be negative and
+// cannot reach 2^32 under any realistic allocation; the guard is extracted
+// here so its rejection semantics — the exact boundary, the error wording,
+// and the treatment of negatives — are pinnable by direct unit tests, since
+// a genuinely oversized params slice (2^32 pointers, 32 GiB) can never exist
+// in a test. Negative inputs (unreachable from len() but expressible on the
+// pure function) wrap to >= 2^63 under the uint64 conversion and are
+// rejected by the same comparison.
+func countToUint32(n int) (uint32, error) {
+	if uint64(n) > math.MaxUint32 {
+		return 0, fmt.Errorf("%d parameters exceed the stream count limit %d", n, uint32(math.MaxUint32))
+	}
+	return uint32(n), nil
+}
+
 // checkStateParams guards the parameter slice both paths index into.
 func checkStateParams(op string, params []*autograd.Variable) error {
 	for i, p := range params {
@@ -262,14 +278,15 @@ func SaveState(w io.Writer, o Optimizer, params []*autograd.Variable) error {
 	if err := checkStateParams("SaveState", params); err != nil {
 		return err
 	}
-	if uint64(len(params)) > math.MaxUint32 {
-		return fmt.Errorf("optimizer: SaveState: %d parameters exceed the stream count limit %d", len(params), uint32(math.MaxUint32))
+	count, err := countToUint32(len(params))
+	if err != nil {
+		return fmt.Errorf("optimizer: SaveState: %w", err)
 	}
 	sw := &stateWriter{w: w}
 	sw.write(stateMagic[:])
 	sw.u8(stateVersion)
 	sw.u8(kind)
-	sw.u32(uint32(len(params)))
+	sw.u32(count)
 
 	ts := make([]*tensor.Tensor, 0, len(params))
 	switch o := o.(type) {

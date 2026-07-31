@@ -260,6 +260,8 @@ func TestRecoverTensorPanicContracts(t *testing.T) {
 			"tensor.SliceRow: invalid row 0 for shape [3]"},
 		{"SumToShape irreducible", func() { SumToShape(New(2, 2), []int{3}) },
 			"tensor.SumToShape: cannot reduce shape [2 2] to [3]"},
+		{"Reshape negative", func() { New(4).Reshape(2, -2) },
+			"tensor.Reshape: negative dimension -2 in shape [2 -2]"},
 		{"must2D on 1D", func() { New(3).Rows() },
 			"tensor: expected 2D tensor, got shape [3]"},
 		{"must2D on 3D", func() { New(2, 2, 2).Cols() },
@@ -284,6 +286,47 @@ func TestRecoverFromRowsEmpty(t *testing.T) {
 	e := FromRows()
 	if !reflect.DeepEqual(e.Shape, []int{0, 0}) || len(e.Data) != 0 {
 		t.Fatalf("FromRows() = shape %v data-len %d, want [0 0] / 0", e.Shape, len(e.Data))
+	}
+}
+
+// TestRecoverUseShapeHeapFallback covers useShape's rank > maxInlineRank
+// branch. Nothing in the ordinary flow reaches it — the library's operators
+// top out at rank 2, and serialize constructs its rank-8 tensors directly
+// without going through useShape — but New, Reshape and Clone are exported
+// for arbitrary ranks, so rank 5+ must fall back to a copied heap slice.
+// White-box assertions pin where Shape points: heap-backed beyond
+// maxInlineRank, the embedded shapeBuf at or below it, with values intact
+// and no aliasing between the two.
+func TestRecoverUseShapeHeapFallback(t *testing.T) {
+	hi := New(1, 1, 1, 1, 1)
+	checkShape(t, hi, 1, 1, 1, 1, 1)
+	if len(hi.Data) != 1 {
+		t.Fatalf("rank-5 unit tensor has %d elements, want 1", len(hi.Data))
+	}
+	if &hi.Shape[0] == &hi.shapeBuf[0] {
+		t.Fatal("rank-5 shape stored inline in shapeBuf; want the heap fallback")
+	}
+
+	lo := New(2, 3)
+	if &lo.Shape[0] != &lo.shapeBuf[0] {
+		t.Fatal("rank-2 shape heap-allocated; want the inline shapeBuf")
+	}
+
+	r := New(1)
+	r.Reshape(1, 1, 1, 1, 1)
+	checkShape(t, r, 1, 1, 1, 1, 1)
+	if &r.Shape[0] == &r.shapeBuf[0] {
+		t.Fatal("reshaped rank-5 shape stored inline; want the heap fallback")
+	}
+
+	c := hi.Clone()
+	checkShape(t, c, 1, 1, 1, 1, 1)
+	if &c.Shape[0] == &c.shapeBuf[0] {
+		t.Fatal("cloned rank-5 shape stored inline; want the heap fallback")
+	}
+	c.Shape[0] = 9
+	if c.shapeBuf[0] == 9 {
+		t.Fatal("heap shape copy aliases shapeBuf")
 	}
 }
 
