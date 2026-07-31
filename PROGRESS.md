@@ -21,7 +21,7 @@
 | 11 | 发布打磨：上手审计 + 长时 fuzz 浸泡 + GitHub Releases + pkg.go.dev 验证 | ✅ 完成（1.3 亿次 fuzz 零失败 · 新手审计零阻断 · 六版 Releases · pkg.go.dev 上线） |
 | 12 | 覆盖率净化至诚实终值 | ✅ 完成（v0.4.1：四包正当 100.0% + optimizer 99.6% 诚实残余 1/231） |
 | 13 | 文档完善：cookbook 任务式食谱 + FAQ + examples 扩充 + godoc 逐符号审计 + api.md 速查（双语） | ✅ 完成 |
-| 14 | parents 定长槽化（留档唯一性能余项，库主选定跑完） | 🔄 进行中（P-E 已派发） |
+| 14 | parents 定长槽化（留档唯一性能余项，库主选定跑完） | ✅ 完成（v0.4.3：allocs −10~−22% 逐位等价，15,360 图独立差分验证，性能留档全部关闭） |
 
 ## 阶段 1：并行分析（已完成）
 
@@ -423,6 +423,9 @@ Git 历史：`87ccf77` 基线 → `08aba45` 阶段3a → `102af40` 阶段3b → 
   - **主控终局核验**：D3 移交缺口全补（shapes 表补 MatMulTransA/B 双语、doc/README godoc 入口补 optimizer 双语）；zh README 训练配方链接修正至 cookbook；EN README 补 cookbook 指引；**全文档链接零断链**、hello 链串联实测通过（x=0.35 预测 1.701≈真值 1.70）、五包测试绿
 - 2026-07-31：**阶段 13 关闭**。文档终态：双语指南 **22 篇**（概念 7×2 + cookbook×2 + faq×2 + api×2）+ 五包完整 godoc + **6 个难度梯度 examples**（hello×2/训练×2/进阶×2）+ README 三档导引。全部十三个阶段关闭、38 个 agent。文档纪律全程：代码示例全部实测、输出逐字嵌入、断言回源核对
 - 2026-07-31：库主正名——项目名统一为 **LNN**（大写）：README/文档/godoc 散文全量替换（BSD sed 无 \b 支持致首轮静默空转，perl 词界重做，残留 0；错误消息字符串零命中无行为面；examples 文件名常量 hello-LNN-model 双程序联动；PLAN/PROGRESS 档案保留历史裸名）；v0.1.0 Release note 同步修正；**补发 v0.4.2 文档版本**（此前阶段 13 与正名改动仅在 main 未 tag，pkg.go.dev 仍呈 v0.4.1 旧态——@latest 实测已解析 v0.4.2）
+- 2026-07-31：阶段 14（库主选定跑完唯一性能余项）——P-E parents 定长槽化：pprof 先量化（parents 切片占总分配 11.7% 为收益上限）→ 2 槽内联 + 变参溢出（槽数据 22 算子父节点数分布取定：15 一元/6 二元/唯一变参 ConcatCol 库内 0 调用）；**踩中逃逸陷阱并修复**（首版溢出直存致参数流判污、构造器字面量依旧逃逸，改 append 拷贝后 -gcflags=-m 实证 21 处 does not escape）。实测五基准 allocs **−10.0~−21.6%**（UnrollBackward 31,994→28,274 / LTCStep 2,707→2,122，与上限 11.7% 闭合于 0.1pp）；pprof 构造器位点 flat 全归零；**墙钟持平**（初测 +11.7% 经 5000x×5 轮复测证伪为计时噪声——与 #12 的 −6.1% 证伪完全同型）；两 example 全文 diff 空、五包 -race 绿、fuzz-smoke 8 目标绿（FuzzLoadLTC 单次瞬时失败五连绿复核）；附带堵死 ConcatCol 脚枪（构造后改 caller 切片腐蚀图 → 拷贝语义免疫）
+- 2026-07-31：**独立验证轮裁决全部属实**：15,360 图自写差分 fuzz（23 算子全覆盖、ConcatCol arity {1,2,3,4,6} 槽内/溢出双路径、±0/双 NaN 载荷/±Inf/钻石复用/手设非叶种子）前向+叶梯度+二次 Backward **零差异**；深层多父交叉图（8~16 层）次序专项逐位不变；ConcatCol 脚枪新旧对照实锤（oracle v0.4.2 确腐蚀、当前免疫）；五基准数字逐字复核属实；TestDivSingleNodeGraph 适配纯机械替换、断言一一对应无削弱
+- 2026-07-31：**发布 v0.4.3**（tag + 推送 + Release）。**全部十四个阶段关闭、性能留档全部销账**。留档表余项仅剩接受风险/信息级与两项低优先结构候选（#12 tensor.New 双分配——实测同型结论已表明其价值上限即 GC 卫生；ops.go 拆分——纯可维护性）。项目累计：五包库 + 9 个版本标签（v0.1.0-v0.4.3）+ 22 篇双语指南 + 6 梯度示例 + 13 基准 + CI（含 fuzz 冒烟）+ 8 轮对抗验证、40 个 agent
 - 2026-07-31：阶段 10 启动——Q-A fuzzing 基建完成（8 目标 × 96 手工种子 + 7 条沉淀回归语料，本机 1.3–3.6M 执行/10s 全 0 panic，发现全部为 oracle 校准问题非库缺陷）+ Q-B API 设计评估备忘完成（主仓库零写入 + /tmp 原型实测四项：#12 内嵌 backing −18~−26% allocs 而墙钟 ±2% 噪声内持平 / #3 统一成本量化 / Stack 零调用 / SumToShapeTake 5 内部调用点）；**用户拍板四项全采纳推荐**（#12② 内嵌 backing / #3 冻结 + 强化文档 / Stack 删除 / SumToShapeTake 内移 autograd，组合外部破坏面 0）
 - 2026-07-31：**10b API 决策实施完成**（外部破坏面 0）：shapeBuf [4]int 内嵌 + useShape 单一收口 + 导出 Reshape（唯一 API 新增，含负维校验）；Stack 函数/测试/Q-A 三探针全删（留 tombstone）；SumToShapeTake 内移 autograd 非导出（语义+契约+panic 文案逐字保持，5 调用点重路由）。五基准 allocs −17.9%~−25.8%（本机复验终值 LTCStep 2,707 / UnrollBackward 31,994，累计 −63%/−73%），墙钟持平、字节 +3%；门禁五绿（两 example 逐字 / 五包 -race / 断言 diff 空 / fuzz-smoke 8 目标 / go doc 四符号核验）
 - 2026-07-31：**10c 双语文档同步完成**（Q-B §5 文档清单五项 + 10b 同步，14 文件双语同构）：Stack 文档四处清除（tensor/doc.go panic 列表 + pitfalls/shapes 双版）、SumToShapeTake 内移同步（architecture 所有权节 + shapes 归约节）、#12 决策留档（architecture 性能节新增「内嵌形状 backing」专节 + pitfalls 路线图表）、#3 冻结留档（shapes 诚实专节补决策依据 + SumRows/SumCols godoc 各补不对称指引）、README 双版阶段 10 语境 + 领衔改写；行号回源 44 处（autograd/ops.go 漂移修正 4 处：Div 793-810→829-846、GatherRows 855→891；nn 引用零漂移全验）。终检全绿：gofmt 空 / build / vet / test 五包 / 零断链 / .go 非注释行 diff 空自证。**v0.4.0 文档关口闭合，待打 tag**
