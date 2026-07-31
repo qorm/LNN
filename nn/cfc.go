@@ -295,9 +295,15 @@ func (c *CfC) drive(
 // a +0-seeded ascending fold of the blocks (the denominator) and of the
 // blocks scaled by their reversal rows (the numerator), each ended by a
 // MatMul against the units×units identity that replicates the former
-// indicator MatMul's zero-skip in the backward pass. The single-source
-// denominator shortcut is preserved: with one presynaptic row the indicator
-// was the identity, so den is the raw block.
+// indicator MatMul's zero-skip in the backward pass. That normalization
+// holds on the multi-source path; the single-source corner (inDim=1 or
+// units=1, a zero-valued incoming gradient, an erev of -1) can leave a -0
+// sign on a zero gradient via the numerator fold's Hadamard backward —
+// the value is 0 and nothing downstream can observe the sign, a
+// deliberately accepted corner; ltc.go's contract comment carries the full
+// analysis, and red-team scans measured zero trajectory divergence for the
+// CfC. The single-source denominator shortcut is preserved: with one
+// presynaptic row the indicator was the identity, so den is the raw block.
 func (c *CfC) contract(blocks, erevRows []*autograd.Variable) (num, den *autograd.Variable) {
 	if len(blocks) == 1 {
 		den = blocks[0]

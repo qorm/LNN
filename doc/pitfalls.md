@@ -191,17 +191,20 @@ separately (roadmap). Full tables and workarounds in
 ## 9. The graph is the memory model
 
 Every intermediate tensor stays alive until `Backward` completes. One LTC
-step unrolls `unfolds` ODE iterations, each O(units) vector blocks plus
-two MatMul contractions since the phase-6 synapse vectorization (down
-from O(units²) per-synapse nodes — see [ltc.md](ltc.md)), and the
-phase-7 backward overhaul halved the per-node allocation count again,
-with the phase-8 Sigmoid–Hadamard fusion taking it further still
-(`UnrollBackward` 31,983 allocs/op, −73% cumulative from the original
-loop — see [architecture.md](architecture.md)); a sequence of
-`T` steps multiplies that by `T`. Memory grows with ops per iteration,
-not just parameters — keep `units`, `unfolds` and sequence length
-modest, or use the `CfC` cell ([cfc.md](cfc.md)), whose closed-form
-step has no `unfolds` factor.
+step unrolls `unfolds` ODE iterations, each O(units) activation blocks
+since the phase-6 synapse vectorization (down from O(units²) per-synapse
+nodes), with the presynaptic reduction folded — `+0`-seeded, ended by
+normalizing MatMuls — since the phase-9 sparse contraction eliminated
+the dense `[units², units]` indicator matrices (see
+[ltc.md](ltc.md)), and the phase-7 backward overhaul halved the
+per-node allocation count, with the phase-8 Sigmoid–Hadamard fusion
+taking it further still (`UnrollBackward` 41,588 allocs/op, −65%
+cumulative from the original loop; the phase-9 step raised allocs ~30%
+but cut wall-clock ~13% — see [architecture.md](architecture.md)); a
+sequence of `T` steps multiplies that by `T`. Memory grows with ops
+per iteration, not just parameters — keep `units`, `unfolds` and
+sequence length modest, or use the `CfC` cell ([cfc.md](cfc.md)),
+whose closed-form step has no `unfolds` factor.
 
 ## 10. Persistence treats model files as untrusted input
 
@@ -233,6 +236,12 @@ proportion to the bytes it actually delivers. The contract in brief:
   edges, survive) and deliberately does not touch `Grad`. Call
   `ZeroGrad` before reusing loaded variables in a new graph — exactly
   as before any training step.
+- **`optimizer.SaveState`/`LoadState` follow the same discipline:**
+  the `"LNO1"` state stream is validate-all-then-apply (a failing load
+  leaves the optimizer bit-for-bit as it was), errors never panic, and
+  hostile size claims stay within a tested byte budget. With state
+  saved, resumed training is bit-identical to uninterrupted training —
+  see the optimizer state section of [persistence.md](persistence.md).
 
 Format spec, API guide and the complete contract — including the
 versioning rule (version 1 only; unknown versions error out rather than
@@ -247,12 +256,13 @@ gradients):
 | item | status |
 |---|---|
 | `autograd.Div` closed form | **done:** single graph node with quotient-rule backward (`da = g/b`, `db = −g·a/b²`, `autograd/ops.go:793-810`). Note the inherent `1/b²` gradient amplification for small divisors remains — with LTC's `eps = 1e-8` floor that is up to ~`1e16` — so gradient clipping stays recommended |
-| LTC synapse vectorization | **done (phase 6):** masks folded out of the hot path; per-presynaptic-neuron vector blocks + two construction-time indicator-matrix MatMul contractions ([ltc.md](ltc.md)). `LTCStep` 7,360 → 3,440 allocs/op (−53.3%), `UnrollBackward` 120,163 → 68,688 (−42.8%). The whole `Step` is ULP-equivalent to the pre-rewrite loop (forward ≤ 1.79e-7, gradients ≤ 1.19e-7, independent red-team oracle); bitwise identity holds only for the isolated `synapses()` drive |
+| LTC synapse vectorization | **done (phase 6; contraction re-done in phase 9):** masks folded out of the hot path; per-presynaptic-neuron vector blocks ([ltc.md](ltc.md)). Phase 6 contracted the presynaptic axis with indicator-matrix MatMuls (`LTCStep` 7,360 → 3,440 allocs/op, `UnrollBackward` 120,163 → 68,688); phase 9 replaced the indicators with a `+0`-seeded sparse fold ended by a normalizing identity MatMul — bitwise-identical to the indicator implementation in forward and backward (1,164-config differential vs the published oracle + independent red-team rerun), while the whole `Step` remains ULP-equivalent to the *original* per-synapse loop (forward ≤ 1.79e-7, gradients ≤ 1.19e-7). Current values `LTCStep` 3,296 / `UnrollBackward` 41,588 allocs/op: phase 9 raised allocs ~43%/~30% (fold-stage cloning) but cut ns/op ~21%/~13% — wall-clock is a net benefit |
 | Autograd backward overhaul (closures, fusion, `addGrad` cloning) | **done (phase 7):** per-node backward closures replaced by op-kind tag dispatch; `addGrad` first-contribution ownership transfer (Clone share ~20% → ~1%); unary backward chains fused (Sigmoid/Tanh 4→1 nodes), MatMul transpose buffers removed, product-and-reduce fused — all gated bitwise against the pre-rewrite oracle on 52k differential graphs, with an arm64 FMA conversion barrier keeping fused loops two-rounding-exact ([architecture.md](architecture.md)). `UnrollBackward` 68,688 → 33,963 allocs/op (−50.55%); four other benchmarks −23%…−58%, zero regressions. Remaining per-node overhead is tracked in the `tensor.New` item below |
 | `tensor.New` fixed per-node overhead | future: profiling puts 64.9% of the remaining allocations in each node's forward output plus its `Shape`/`Data` double allocation; further compression needs fixed-capacity parent slots (blocked by existing structural-assertion tests) and a fixed-rank `Tensor` shape (public-API break) |
-| Sigmoid–Hadamard fused backward (LTC hot-path pattern) | **done (phase 8):** `autograd.SigmoidHadamard(z, w)` fuses the hot-path `Hadamard(Sigmoid(z), w)` into one node (adopted at `nn/ltc.go:347`). The forward is bitwise by construction (it runs the same two tensor ops), and the regular 2D backward reaches bitwise equivalence with the legacy two-node chain by rounding the `g⊙w` product at the very same site; irregular shapes or manually seeded gradients fall back to the legacy composition verbatim (quirks and panic contract preserved). `LTCStep` 2,442 → **2,306** allocs/op (−5.6%), `UnrollBackward` 33,963 → **31,983** (−5.8%) — a single-digit gain, and the measured structural ceiling: each site saves exactly one graph node plus one backward intermediate, the rest being `tensor.New`'s per-node overhead (previous item). See [architecture.md](architecture.md) |
-| CfC `erev` dead gradients | **done (phase 8):** the CfC's reversal potentials are now baked into construction-time indicator matrices — the LTC's trick, adopted. The `erev`/`sErev` fields are plain `*tensor.Tensor` with no gradient to compute, so the dead gradient is *structurally impossible* rather than merely zero; `drive()` collapses to two MatMul contractions. Bitwise-equivalent to the former `Var`-leaf drive (red-team differential test), and the load path rebuilds the indicators from the streamed polarities ([persistence.md](persistence.md)) |
-| Indicator-matrix O(units³) materialization | **load side closed (phase 8), root fix open:** the dense `[pre·units, units]` reduction indicators make construction- and load-time memory O(units³) while the header that controls it is only 9–13 bytes. `LoadLTC`/`LoadCfC` now cap `units`/`inDim` at 256 (≤ 256 MiB of indicator matrices per loaded cell, ~320 MiB peak), turning a 13-byte units=4096 attack stream that used to attempt ~550 GB until the OS killed the process into a valued error. The root fix — sparse contractions that never materialize the `[units², units]` indicators, on the constructor side too — remains open ([persistence.md](persistence.md)) |
+| Sigmoid–Hadamard fused backward (LTC hot-path pattern) | **done (phase 8):** `autograd.SigmoidHadamard(z, w)` fuses the hot-path `Hadamard(Sigmoid(z), w)` into one node (adopted at `nn/ltc.go:423`). The forward is bitwise by construction (it runs the same two tensor ops), and the regular 2D backward reaches bitwise equivalence with the legacy two-node chain by rounding the `g⊙w` product at the very same site; irregular shapes or manually seeded gradients fall back to the legacy composition verbatim (quirks and panic contract preserved). `LTCStep` 2,442 → **2,306** allocs/op (−5.6%), `UnrollBackward` 33,963 → **31,983** (−5.8%) — a single-digit gain, and the measured structural ceiling: each site saves exactly one graph node plus one backward intermediate, the rest being `tensor.New`'s per-node overhead (previous item). See [architecture.md](architecture.md) |
+| CfC `erev` dead gradients | **done (phase 8; indicators removed in phase 9):** the CfC's reversal potentials no longer enter the graph — the ±1 signs ride row-view constants sharing the `erev`/`sErev` storage. The fields are plain `*tensor.Tensor` with no gradient to compute, so the dead gradient is *structurally impossible* rather than merely zero; `drive()` ends in the same sparse fold as the LTC (`nn/cfc.go`'s contract is line-for-line isomorphic). Bitwise-equivalent to the former `Var`-leaf drive (red-team differential test), and `LoadCfC` overwrites the `erev`/`sErev` storage in place, which the row views pick up with no rebuild ([persistence.md](persistence.md)) |
+| ~~Indicator-matrix O(units³) materialization~~ | **done (phase 9, root fix landed):** the sparse contraction ([ltc.md](ltc.md)) never materializes a `[units², units]` indicator, in the constructor OR the load path — construction of a fully-wired `units = 1024` cell costs ~32 MB (measured 36.4 MiB), not the old ~8 GiB cliff. The `maxUnits`/`maxInDim` load caps were re-derived on the new O(units²) memory model: `256 → 2048` (peak `92·U² B` ≈ 368 MiB at the cap — the same ~320 MiB budget class as the old regime, 8× the capacity), and a minimal attack stream now peaks at ~1.5× its delivered bytes, so the F1 contract (hostile streams allocate in proportion to delivered bytes) is honored at the root rather than bandaged ([persistence.md](persistence.md)) |
+| Optimizer state persistence | **done (phase 9):** `optimizer.SaveState`/`LoadState` (`"LNO1"` state streams) — resumed training is bit-identical to uninterrupted training (50+50 vs 100 steps, per-parameter trajectories and losses, all three optimizers). Untrusted-stream discipline: validate-all-then-apply with zero side effects, errors never panics, hostile claims within a tested byte budget, `maxT = 2²⁴` load-only cap on Adam's update count. Format spec and contracts in [persistence.md](persistence.md) |
 | Unify reduction shape conventions (`SumRows`/`SumCols`, 1D promotion) | separate evaluation; API-breaking |
 | `tensor.Stack` | experimental: yields 3D tensors that no other op consumes (`tensor/tensor.go:170`); kept for compatibility |
 | CfC (Closed-form Continuous-time) cell | **done (phase 6):** `nn.CfC` (`nn/cfc.go`) — same ODE and synapse parameterization as the LTC, driven by the Lemma 1 closed form; paper↔code correspondence and verification trail in [cfc.md](cfc.md). New API: may still evolve |

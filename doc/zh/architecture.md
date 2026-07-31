@@ -34,7 +34,7 @@
 └──────────────────────────────────────────────────────────────┘
 ```
 
-导入方向严格向下（`nn → autograd → tensor`）；没有环，也没有跨层捷径——唯一的例外是 `nn` 会直接调用 `tensor` 来构造不需要梯度的常量（接线掩码（mask）、epsilon、稀疏归约指示矩阵（indicator matrix））。`optimizer` 包（SGD、Momentum、Adam）与 `nn` 并列坐在 `autograd` 之上——它只导入 `autograd`，写的就是手写循环会写的朴素 Go 原地更新（[training.md](training.md)）。`serialize` 包（持久化）与它们并列，坐在 `tensor` 与 `autograd` 之上——它是 `nn` 六个 Save/Load 函数背后的存储层，单独暴露是为了让线上格式（wire format）及其不可信流（untrusted stream）安全契约可以被独立审计（[persistence.md](persistence.md)）。
+导入方向严格向下（`nn → autograd → tensor`）；没有环，也没有跨层捷径——唯一的例外是 `nn` 会直接调用 `tensor` 来构造不需要梯度的常量（接线掩码（mask）、epsilon、稀疏收缩（sparse contraction）播种用的单位阵与 `+0` 标量、反转电位行视图）。`optimizer` 包（SGD、Momentum、Adam）与 `nn` 并列坐在 `autograd` 之上——它只导入 `autograd`，写的就是手写循环会写的朴素 Go 原地更新（[training.md](training.md)）。`serialize` 包（持久化）与它们并列，坐在 `tensor` 与 `autograd` 之上——它是 `nn` 六个 Save/Load 函数背后的存储层，单独暴露是为了让线上格式（wire format）及其不可信流（untrusted stream）安全契约可以被独立审计（[persistence.md](persistence.md)）。
 
 | 层 | 职责 | 刻意不具备的东西 |
 |---|---|---|
@@ -122,7 +122,7 @@ func mul32(a, b float32) float32 {
 
 ### Sigmoid–Hadamard 融合：阶段 8 的收尾
 
-阶段 8 的 `autograd.SigmoidHadamard(z, w)`（`autograd/ops.go`）把 LTC 热路径模式 `Hadamard(Sigmoid(z), w)`——两个图节点——融合为一个，采纳于 `synapsesRows` 感知/循环共用的唯一入口（`nn/ltc.go:347`）。它是反向深改的收尾之作，因为它是唯一一个需要*新算子*而非既有算子重组的融合，其等价性叙事有三段彼此不同：
+阶段 8 的 `autograd.SigmoidHadamard(z, w)`（`autograd/ops.go`）把 LTC 热路径模式 `Hadamard(Sigmoid(z), w)`——两个图节点——融合为一个，采纳于 `synapsesRows` 感知/循环共用的唯一入口（`nn/ltc.go:423`）。它是反向深改的收尾之作，因为它是唯一一个需要*新算子*而非既有算子重组的融合，其等价性叙事有三段彼此不同：
 
 - **前向逐位为构造性。** 它逐字调用旧组合所跑的同一批 tensor 算子——先 `tensor.Sigmoid`，再 `tensor.Hadamard`——因此形状、广播与数值按定义相同，而非靠测量得出。sigmoid 缓冲被保存在节点的 `aux` 槽里，反向直接复用而不重算。
 - **常规反向以舍入位点对齐达成逐位。** 在 2D 路径（LTC 热路径）上，反向以一个融合循环传播 `dz = g⊙w⊙s⊙(1−s)`，并以 Hadamard 反向所用的同一个 `hadamardReduce` 传播 `dw = g⊙s`。这*并非*设计成逐位的——设计书预期的是一个容差门禁——但结果却是逐位的：把 `g⊙w` 乘积恰在旧 Hadamard 反向把中间张量交给 sigmoid 节点的那个位点经 `mul32` 舍入，便复刻了旧中间张量的舍入；外层 `mul32(gw, s⊙(1−s))` 的分组则复刻了 opSigmoid 的融合循环。结果在常规路径上与旧双节点链逐位相同（由测试钉住），这也正是两个 example 的训练轨迹一位都不曾漂移的原因。
@@ -136,7 +136,7 @@ func mul32(a, b float32) float32 {
 
 ### 图就是内存模型
 
-每个中间张量都保持存活——被其节点引用——直到 `Backward` 完成。因此内存随每次迭代的算子数量扩展，而不仅仅随参数规模。一次 LTC `Step` 会把 `unfolds` 轮 ODE 迭代展开进图；自阶段 6 的突触向量化起，每轮是 O(units) 个向量块加两次对构造期指示矩阵（indicator matrix）的 MatMul 收缩（见 [ltc.md](ltc.md)）——从 O(units²) 个逐突触节点降下来，阶段 7 的反向深改（见上）又把逐节点分配数砍掉一半，阶段 8 的 Sigmoid–Hadamard 融合再进一步。当前实测：`LTCStep` 2,306 allocs/op、`UnrollBackward` 31,983——较最初的逐突触循环（7,360 / 120,163）累计 −69% 与 −73%。内存仍然随 `units · unfolds · 序列长度` 增长，所以在这个引擎上三者都要保持适度；`CfC` 细胞（[cfc.md](cfc.md)）的闭式步进则完全没有 `unfolds` 因子。
+每个中间张量都保持存活——被其节点引用——直到 `Backward` 完成。因此内存随每次迭代的算子数量扩展，而不仅仅随参数规模。一次 LTC `Step` 会把 `unfolds` 轮 ODE 迭代展开进图；自阶段 6 的突触向量化起，每轮是 O(units) 个激活块；自阶段 9 的稀疏收缩（sparse contraction）起，突触前轴归约是 `+0` 播种、末端归一化 MatMul 收尾的折叠（fold）（见 [ltc.md](ltc.md)）——从 O(units²) 个逐突触节点降下来，也告别了阶段 9 所消灭的稠密 `[units², units]` 指示矩阵（indicator matrix）（那会在构造期*与*加载期实体化 O(units³) 个 float32；见 [persistence.md](persistence.md)）。阶段 7 的反向深改（见上）把逐节点分配数砍掉一半，阶段 8 的 Sigmoid–Hadamard 融合再进一步。当前实测：`LTCStep` **3,296 allocs/op**、`UnrollBackward` **41,588**——较最初的逐突触循环（7,360 / 120,163）累计 **−55% 与 −65%**。阶段 9 这一步是诚实的权衡：allocs 相对阶段 8 数值（2,306 / 31,983）*上升*约 43%/30%（折叠每级的克隆），但 ns/op *下降*约 21%/13%（红队独立复测），因为稠密指示阵 MatMul 对零行的 O(units³) 空转内层循环与反向大分配消失了——**分配次数换走了无用算力，墙钟净受益**。同一改动还消除了*构造期*内存悬崖：`units = 1024` 全接线细胞现在分配约 32 MB（实测：`NewLTC` 36.4 MiB、`NewCfC` 32.4 MiB；红队复测一致），而不再是旧的约 8 GiB 指示阵。图内存仍然随 `units · unfolds · 序列长度` 增长，所以在这个引擎上三者都要保持适度；`CfC` 细胞（[cfc.md](cfc.md)）的闭式步进则完全没有 `unfolds` 因子。
 
 ## float32 是全局约束
 

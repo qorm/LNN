@@ -462,7 +462,21 @@ func (c *LTC) synapsesRows(
 //     Backward, the terminal MatMul against ident runs the genuine
 //     tensor.MatMulTransB, whose av==0 branch normalizes a zero incoming
 //     gradient to a +0 contribution — bit for bit what the indicator
-//     MatMul's backward computed for flat's gradient.
+//     MatMul's backward computed for flat's gradient. That normalization
+//     covers the multi-source path, where both contractions end in a
+//     normalizing MatMul (any -0 the numerator's Hadamard backward
+//     contributes sums with the denominator's +0: (+0)+(-0) = +0). It
+//     does not cover the single-source corner — inDim=1 or units=1 —
+//     where den takes the raw-block shortcut below: with a zero-valued
+//     incoming gradient and an erev of -1, the numerator fold's Hadamard
+//     backward forms (-0)*(-1) = -0 and no normalizing MatMul washes the
+//     sign out, so that zero gradient keeps its sign bit (red team F9-1;
+//     four differential configurations, the value 0 in every case).
+//     Nothing downstream can observe it: p - LR*(-0) is bit-identical to
+//     p for any p that is not itself -0, optimizer accumulators normalize
+//     (+0)+(-0) = +0, and the red team measured zero training-trajectory
+//     divergence — a deliberately accepted sign-bit corner, not worth a
+//     per-step normalizing MatMul on the single-source den path.
 //  4. +0 accumulator. The fold seeds from zeroV (scalar +0), mirroring
 //     MatMul's fresh zero-filled output buffer. This is what keeps a fully
 //     masked postsynaptic column at +0 (0x00000000) instead of -0 (red

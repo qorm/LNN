@@ -65,15 +65,15 @@ v_new = A + (v − A)·e^{−κ·ts},   κ = G/cm
 `F ∈ [0, 1]`, so `v_new` is a convex combination of the old state `v`
 and the instantaneous reversal state `A`: the state stays bounded with
 no solver unfolds at all. The code follows the second form
-(`nn/cfc.go`, `Step`, lines 201–244):
+(`nn/cfc.go`, `Step`, lines 210–253):
 
 | quantity | code | lines |
 |---|---|---|
-| `G = gleak + Σ actⱼ` | `g := autograd.Add(gleak, autograd.Add(denS, denR))` | 228 |
-| `A = (gleak·vleak + Σ actⱼ·erevⱼ) / (G + eps)` | `a := autograd.Div(…, autograd.Add(g, epsV))` | 230–233 |
-| `B = κ·ts`, overflow/sign-capped | `b := c.decayRate(g, cm, epsV, ts)` | 235 |
-| `F(B) = 1 − e^{−B}`, exprel-stabilized | `f := c.decayFactor(b)` | 237 |
-| `v_new = v + (A − v)·F` | `vNew := autograd.Add(h, autograd.Hadamard(autograd.Sub(a, h), f))` | 240 |
+| `G = gleak + Σ actⱼ` | `g := autograd.Add(gleak, autograd.Add(denS, denR))` | 237 |
+| `A = (gleak·vleak + Σ actⱼ·erevⱼ) / (G + eps)` | `a := autograd.Div(…, autograd.Add(g, epsV))` | 239–242 |
+| `B = κ·ts`, overflow/sign-capped | `b := c.decayRate(g, cm, epsV, ts)` | 244 |
+| `F(B) = 1 − e^{−B}`, exprel-stabilized | `f := c.decayFactor(b)` | 246 |
+| `v_new = v + (A − v)·F` | `vNew := autograd.Add(h, autograd.Hadamard(autograd.Sub(a, h), f))` | 249 |
 
 One honest code-level deviation from the paper's bare equations: the
 divisors are guarded, `κ = G/(cm + eps)` and `A = …/(G + eps)` with
@@ -86,21 +86,29 @@ invisible; it exists to keep adversarial parameter draws from producing
 
 The paper's Algorithm 1 compiles an LTC into its closed-form update
 synapse by synapse, allowing arbitrary sparse adjacency. lnn mirrors
-that structure with the same vectorized contraction the LTC uses:
-`drive()` (`nn/cfc.go:268-294`) builds one `[batch, units]` activation
-block per presynaptic neuron `i` — the column⊙row outer product gated by
-wiring mask row `i` — concatenates the blocks to `[batch, n·units]`, and
-contracts the presynaptic axis with two MatMuls against the sparse
-construction-time indicators (`denReduce`/`numReduce`), the `±1` reversal
-potentials baked into `numReduce` by the very `reversalIndicator` scheme
-of `ltc.go`. It is therefore bitwise-equivalent to the former
-per-presynaptic Add-of-Hadamards drive in both forward and backward, with
-the single `±0` sign-bit corner documented in [ltc.md](ltc.md) (a
-fully-masked postsynaptic column lands at `+0` instead of the old chain's
-`−0`; `(±0)² = +0` keeps it unobservable downstream). Because the
-potentials are baked into the indicators, `erev`/`sErev` no longer enter
-the graph at all — the dead gradient is structurally gone, not merely
-zero. The convention and the binary wiring masks are the LTC's, so
+that structure with the same sparse contraction the LTC uses:
+`drive()` (`nn/cfc.go:274-291`) builds one `[batch, units]` activation
+block per presynaptic neuron `i` — the column⊙row outer product gated
+by wiring mask row `i` — and `contract` (`nn/cfc.go:307-323`) reduces
+the presynaptic axis as a `+0`-seeded ascending fold of the blocks (the
+denominator) and of the blocks scaled by their reversal rows (the
+numerator), each ended by a MatMul against the units×units identity.
+The fixed `±1` reversal potentials are carried by row-view constants
+sharing the `erev`/`sErev` storage (`erevRowViews`, shared from
+`ltc.go`), so they never enter the graph as leaves. The contraction is
+line-for-line isomorphic to the LTC's `contract` — the same four
+constraints, the same bit-equivalence proof (see the sparse
+contraction section of [ltc.md](ltc.md)) — including its `±0` corners:
+a fully-masked postsynaptic column lands at `+0` instead of the old
+Add chain's `−0` (unobservable downstream, `(±0)² = +0`); the
+multi-source backward normalizes zero gradients to `+0`; and the
+single-source corner (`inDim = 1` or `units = 1`, a zero-valued
+gradient, `erev = −1`) can carry `−0` on a zero gradient — the value
+is 0 and unobservable, and red-team scans measured zero trajectory
+divergence for the CfC. Because the potentials are row views rather
+than graph leaves, `erev`/`sErev` do not enter the graph at all — the
+dead gradient is structurally gone, not merely zero. The convention
+and the binary wiring masks are the LTC's, so
 `NewCfC(inDim, units, wiring, rng)` accepts exactly the `Wiring`
 topologies `NewLTC` does (`nil` means fully connected).
 
@@ -145,7 +153,7 @@ solution with this library's LTC parameterization, it is.
 The famous closed-form-CT trap is the raw quotient `(1 − e^{−B})/B` at
 `B → 0`: `1 − e^{−B}` cancels to 0 in finite precision and dividing by
 `B` yields garbage (and a dead gradient). `decayFactor`
-(`nn/cfc.go:344-369`) sidesteps it by computing the whole product
+(`nn/cfc.go:373-398`) sidesteps it by computing the whole product
 `F(B) = B·exprel(B)` with a per-element branch:
 
 | branch | formula | why |
@@ -162,7 +170,7 @@ value and slope at the threshold (red-team scan of 8001 points crossing
 `1e-2`: jump `≤ 2.98e-8`; regression-tested by
 `TestCfCExprelBoundaryContinuity`).
 
-`B` itself is protected upstream in `decayRate` (`nn/cfc.go:307-320`):
+`B` itself is protected upstream in `decayRate` (`nn/cfc.go:336-349`):
 the time scale is computed in `float64` and capped at `1e30` before
 conversion, and the conductance ratio gets the same smooth
 differentiable cap the LTC uses for its capacitance scaling
@@ -172,7 +180,7 @@ a negative decay rate would turn `e^{−B}` into a blow-up.
 ## The time span `ts`
 
 The contract is the LTC's: `ts` must be positive and finite; `NaN`,
-`±Inf`, zero and negative values panic (`nn/cfc.go:204-206`). Behavior
+`±Inf`, zero and negative values panic (`nn/cfc.go:213-215`). Behavior
 at the extremes:
 
 | `ts` | behavior |
@@ -203,7 +211,7 @@ constraints — see [ltc.md](ltc.md) for the derivation of each range):
 | `sErev` | `[inDim, units]` | random ±1 | **fixed — not trainable** | sensory reversal potentials |
 
 `Parameters()` returns the same 13 trainable tensors as the LTC
-(`nn/cfc.go:188-195`); `erev`/`sErev` are excluded for the same
+(`nn/cfc.go:197-204`); `erev`/`sErev` are excluded for the same
 structural reason as in the LTC — learning them would flip synapse
 polarity.
 
@@ -372,14 +380,22 @@ requires cross-step memory.
   classes panic), `TestCfCDeterministicSameSeed`,
   `TestCfCParametersExcludeErev`.
 - **`erev` dead gradients — fixed (phase 8):** `erev`/`sErev` no longer
-  enter the graph at all. They are baked into the construction-time
-  `numReduce` indicator matrices (the LTC's `reversalIndicator` scheme,
-  above), so the `erev`/`sErev` fields are plain `*tensor.Tensor` with no
-  gradient to compute — the dead gradient is *structurally impossible*
-  rather than merely zero, which a reflection check on the field types
-  confirms. The bake is bitwise-equivalent to the former `Var`-leaf drive
-  (red-team differential test across CfC configurations: forward and all
-  13 parameter gradients bit-identical), and `LoadCfC` rebuilds the
-  indicators from the streamed polarities — an all-flipped ±1 pattern
-  still loads, and demonstrably changes the output, which is exactly the
-  regression `TestLoadCfCAcceptsFlippedReversalPattern` pins.
+  enter the graph at all. The ±1 signs enter via row-view constants
+  sharing the `erev`/`sErev` storage (phase 8 first carried them in
+  construction-time indicator matrices; the phase-9 sparse contraction
+  — see the sparse contraction section of [ltc.md](ltc.md) — replaced
+  the indicators with the `+0`-seeded fold ended by a MatMul against
+  the identity), so the `erev`/`sErev` fields are plain `*tensor.Tensor`
+  with no gradient to compute — the dead gradient is *structurally
+  impossible* rather than merely zero, which a reflection check on the
+  field types confirms (`TestCfCReversalPotentialsCarryNoGradient`).
+  The scheme is bitwise-equivalent to the former `Var`-leaf drive
+  (`TestCfCDriveBakeMatchesLegacyBitExact`; red-team differential test
+  across CfC configurations: forward and all 13 parameter gradients
+  bit-identical), and `LoadCfC` overwrites the `erev`/`sErev` storage
+  in place — the row views share that storage, so the contraction
+  picks the streamed polarities up **with no rebuild** (the pre-phase-9
+  design re-materialized the dense indicators here) — an all-flipped
+  ±1 pattern still loads, and demonstrably changes the output, which
+  is exactly the regression `TestLoadCfCAcceptsFlippedReversalPattern`
+  pins.

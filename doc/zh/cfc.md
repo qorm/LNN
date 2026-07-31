@@ -38,21 +38,21 @@ v_new = A + (v − A)·e^{−κ·ts},   κ = G/cm
       = v + (A − v)·F(B),        B = κ·ts,   F(B) = 1 − e^{−B}
 ```
 
-`F ∈ [0, 1]`，因此 `v_new` 是旧状态 `v` 与瞬时反转状态 `A` 的凸组合：状态天然有界，完全不需要求解器展开（unfold）。代码采用第二种形式（`nn/cfc.go`，`Step`，201–244 行）：
+`F ∈ [0, 1]`，因此 `v_new` 是旧状态 `v` 与瞬时反转状态 `A` 的凸组合：状态天然有界，完全不需要求解器展开（unfold）。代码采用第二种形式（`nn/cfc.go`，`Step`，210–253 行）：
 
 | 量 | 代码 | 行号 |
 |---|---|---|
-| `G = gleak + Σ actⱼ` | `g := autograd.Add(gleak, autograd.Add(denS, denR))` | 228 |
-| `A = (gleak·vleak + Σ actⱼ·erevⱼ) / (G + eps)` | `a := autograd.Div(…, autograd.Add(g, epsV))` | 230–233 |
-| `B = κ·ts`，带溢出/符号钳制 | `b := c.decayRate(g, cm, epsV, ts)` | 235 |
-| `F(B) = 1 − e^{−B}`，exprel 稳定化 | `f := c.decayFactor(b)` | 237 |
-| `v_new = v + (A − v)·F` | `vNew := autograd.Add(h, autograd.Hadamard(autograd.Sub(a, h), f))` | 240 |
+| `G = gleak + Σ actⱼ` | `g := autograd.Add(gleak, autograd.Add(denS, denR))` | 237 |
+| `A = (gleak·vleak + Σ actⱼ·erevⱼ) / (G + eps)` | `a := autograd.Div(…, autograd.Add(g, epsV))` | 239–242 |
+| `B = κ·ts`，带溢出/符号钳制 | `b := c.decayRate(g, cm, epsV, ts)` | 244 |
+| `F(B) = 1 − e^{−B}`，exprel 稳定化 | `f := c.decayFactor(b)` | 246 |
+| `v_new = v + (A − v)·F` | `vNew := autograd.Add(h, autograd.Hadamard(autograd.Sub(a, h), f))` | 249 |
 
 相对论文裸方程的一处诚实偏差：除数带保护，`κ = G/(cm + eps)`、`A = …/(G + eps)`，`eps = 1e-8`。在任何真实训练区制里，两个除数都被 softplus 正值性顶离零，保护在数值上不可见；它的存在只是为了让对抗性参数抽取不会制造 `Inf`/`NaN` 梯度。
 
 ## Algorithm 1：把 LTC 编译为闭式
 
-论文的 Algorithm 1 把 LTC 逐突触编译成闭式更新，允许任意稀疏邻接。lnn 以 LTC 所用的同一套向量化收缩与之同构：`drive()`（`nn/cfc.go:268-294`）为每个突触前神经元 `i` 构建一个 `[batch, units]` 激活块——以接线（wiring）掩码（mask）第 `i` 行门控的「列⊙行」外积——把各块并置为 `[batch, n·units]`，再对稀疏的构造期指示矩阵（`denReduce`/`numReduce`）做两次 MatMul 收缩突触前轴，常量 `±1` 反转电位由 `ltc.go` 的同一 `reversalIndicator` 手法焙入 `numReduce`。因此它在正向与反向上都与旧的逐突触前 Add-of-Hadamards 驱动逐位等价，唯一的 `±0` 符号位角落见 [ltc.md](ltc.md)（全掩蔽突触后列落在 `+0` 而非旧链的 `−0`；`(±0)² = +0` 使其下游不可观测）。由于电位已焙入指示阵，`erev`/`sErev` 完全不再入图——死梯度从结构上消失，而不仅仅为零。约定与二值接线掩码都沿用 LTC，因此 `NewCfC(inDim, units, wiring, rng)` 接受的 `Wiring` 拓扑与 `NewLTC` 完全相同（`nil` 即全连接）。
+论文的 Algorithm 1 把 LTC 逐突触编译成闭式更新，允许任意稀疏邻接。lnn 以 LTC 所用的同一套稀疏收缩（sparse contraction）与之同构：`drive()`（`nn/cfc.go:274-291`）为每个突触前神经元 `i` 构建一个 `[batch, units]` 激活块——以接线（wiring）掩码（mask）第 `i` 行门控的「列⊙行」外积——`contract`（`nn/cfc.go:307-323`）以 `+0` 播种的升序折叠（fold）收缩突触前轴：分母折叠各块，分子折叠按反转电位行加权的各块，二者都以与 units×units 单位阵的 MatMul 收尾。常量 `±1` 反转电位由共享 `erev`/`sErev` 存储的行视图常量承载（`erevRowViews`，与 `ltc.go` 共享），从不以叶节点入图。该收缩与 LTC 的 `contract` 逐行同构——同样四条约束、同一份逐位等价证明（见 [ltc.md](ltc.md) 稀疏收缩一节）——`±0` 角落也相同：全掩蔽突触后列落在 `+0` 而非旧 `Add` 链的 `−0`（下游不可观测，`(±0)² = +0`）；多源反向把零梯度归一为 `+0`；单源角落（`inDim = 1` 或 `units = 1`、零值梯度、`erev = −1`）可令零梯度携带 `−0`——值为 0 且不可观测，红队对 CfC 的全扫描未测出轨迹分歧。由于电位是行视图而非图叶，`erev`/`sErev` 完全不再入图——死梯度从结构上消失，而不仅仅为零。约定与二值接线掩码都沿用 LTC，因此 `NewCfC(inDim, units, wiring, rng)` 接受的 `Wiring` 拓扑与 `NewLTC` 完全相同（`nil` 即全连接）。
 
 ## 与 LTC 的关系：同一 ODE，两种积分器
 
@@ -73,7 +73,7 @@ v_new = A + (v − A)·e^{−κ·ts},   κ = G/cm
 
 ## exprel 稳定化
 
-闭式连续时间著名的陷阱是 `B → 0` 处的裸商 `(1 − e^{−B})/B`：`1 − e^{−B}` 在有限精度下抵消为 0，再除以 `B` 得到垃圾（外加一条死梯度）。`decayFactor`（`nn/cfc.go:344-369`）以逐元素分支计算整个乘积 `F(B) = B·exprel(B)` 来绕开它：
+闭式连续时间著名的陷阱是 `B → 0` 处的裸商 `(1 − e^{−B})/B`：`1 − e^{−B}` 在有限精度下抵消为 0，再除以 `B` 得到垃圾（外加一条死梯度）。`decayFactor`（`nn/cfc.go:373-398`）以逐元素分支计算整个乘积 `F(B) = B·exprel(B)` 来绕开它：
 
 | 分支 | 公式 | 理由 |
 |---|---|---|
@@ -82,11 +82,11 @@ v_new = A + (v − A)·e^{−κ·ts},   κ = G/cm
 
 exprel 商里对 `B` 的除法在进入计算图之前就与外层的 `B` 因子**解析相消**——图中**根本没有除以 `B` 的节点**，自然无需防护。分支掩码是由 `B` 的数据构造的逐元素常量，梯度恰好流过激活的分支；两个分支在阈值处函数值与斜率都吻合到 `~1e-10`（红队以 8001 个点跨越 `1e-2` 扫描：跳变 `≤ 2.98e-8`；回归测试见 `TestCfCExprelBoundaryContinuity`）。
 
-`B` 本身在上游 `decayRate`（`nn/cfc.go:307-320`）就受保护：时间缩放以 `float64` 计算、转换前钳制在 `1e30`，电导之比则套用 LTC 电容缩放所用的同一个光滑可微封顶（`cap(k) = k − softplus(k − hi)`），它同时保证 `B` 非负——负的衰减率会把 `e^{−B}` 变成爆炸。
+`B` 本身在上游 `decayRate`（`nn/cfc.go:336-349`）就受保护：时间缩放以 `float64` 计算、转换前钳制在 `1e30`，电导之比则套用 LTC 电容缩放所用的同一个光滑可微封顶（`cap(k) = k − softplus(k − hi)`），它同时保证 `B` 非负——负的衰减率会把 `e^{−B}` 变成爆炸。
 
 ## 时间跨度 `ts`
 
-契约与 LTC 相同：`ts` 必须为正且有限；`NaN`、`±Inf`、零和负值都会 panic（`nn/cfc.go:204-206`）。极端处的行为：
+契约与 LTC 相同：`ts` 必须为正且有限；`NaN`、`±Inf`、零和负值都会 panic（`nn/cfc.go:213-215`）。极端处的行为：
 
 | `ts` | 行为 |
 |---|---|
@@ -114,7 +114,7 @@ exprel 商里对 `B` 的除法在进入计算图之前就与外层的 `B` 因子
 | `erev` | `[units, units]` | 随机 ±1 | **固定——不可训练** | 循环反转电位 |
 | `sErev` | `[inDim, units]` | 随机 ±1 | **固定——不可训练** | 感知反转电位 |
 
-`Parameters()` 返回与 LTC 相同的 13 个可训练张量（`nn/cfc.go:188-195`）；`erev`/`sErev` 因与 LTC 相同的结构性理由被排除——学习它们会翻转突触极性。
+`Parameters()` 返回与 LTC 相同的 13 个可训练张量（`nn/cfc.go:197-204`）；`erev`/`sErev` 因与 LTC 相同的结构性理由被排除——学习它们会翻转突触极性。
 
 ## 一个完整的训练循环
 
@@ -259,4 +259,4 @@ first=0.620651 last=0.029091
 
 - **红队裁决：忠实且可信。** 对 NMI 发表版做方程级审计（Theorem 1 / Eq. (8) / Lemma 1 / Algorithm 1 逐一交叉核验），外加数值对抗 10/10 全过：8001 点跨阈值扫描（跳变 `≤ 2.98e-8`）、极端 `ts` 有限性（8/8）、掩码置零突触梯度恰为 0（9/9）、全参数 gradcheck 零失败。
 - **库内回归测试**（`nn/cfc_test.go`）：`TestCfCGradcheckAllParameters`（全 13 参数有限差分检验，最大相对误差 `8.63e-3`——在 `float32` 中心差分噪声之内）、`TestCfCZeroMasksPureLeakClosedForm`（全零接线退化为纯泄漏闭式，`1e-4`）、`TestCfCDecayFactorExprelStability` 与 `TestCfCExprelBoundaryContinuity`（`1e-2` 分支边界）、`TestCfCStepTinyTsFixedPoint`（`ts = 1e-40` 时 `v` 逐位不动）、`TestCfCStepRejectsBadTs`（五类非法 `ts` panic）、`TestCfCDeterministicSameSeed`、`TestCfCParametersExcludeErev`。
-- **`erev` 死梯度——已修复（阶段 8）：** `erev`/`sErev` 现已完全不再入图。它们被焙入构造期的 `numReduce` 指示矩阵（indicator matrix，即上文 LTC 的 `reversalIndicator` 手法），因此 `erev`/`sErev` 字段是不带梯度的普通 `*tensor.Tensor`——死梯度从*结构上不可能*，而不仅仅为零；对字段类型做反射检查即可证实。焙入与旧的 `Var` 叶驱动逐位等价（红队对多组 CfC 配置差分测试：前向与全 13 参数梯度逐位相同），且 `LoadCfC` 按流内极性重建指示阵——整谱符号翻转的 ±1 模式照样能加载，并且确实改变输出，这正是 `TestLoadCfCAcceptsFlippedReversalPattern` 所钉住的回归。
+- **`erev` 死梯度——已修复（阶段 8）：** `erev`/`sErev` 现已完全不再入图。±1 符号经由共享 `erev`/`sErev` 存储的行视图常量入图（阶段 8 最初以构造期指示矩阵（indicator matrix）承载；阶段 9 的稀疏收缩——见 [ltc.md](ltc.md) 稀疏收缩一节——以 `+0` 播种、末端单位阵 MatMul 的折叠（fold）取代了指示阵），因此 `erev`/`sErev` 字段是不带梯度的普通 `*tensor.Tensor`——死梯度从*结构上不可能*，而不仅仅为零；对字段类型做反射检查即可证实（`TestCfCReversalPotentialsCarryNoGradient`）。该手法与旧的 `Var` 叶驱动逐位等价（`TestCfCDriveBakeMatchesLegacyBitExact`；红队对多组 CfC 配置差分测试：前向与全 13 参数梯度逐位相同），且 `LoadCfC` 原位覆写 `erev`/`sErev` 存储——行视图与之共享存储，因此收缩**无需任何重建**即拾取流内极性（阶段 9 之前的设计在此处重新实体化稠密指示阵）——整谱符号翻转的 ±1 模式照样能加载，并且确实改变输出，这正是 `TestLoadCfCAcceptsFlippedReversalPattern` 所钉住的回归。

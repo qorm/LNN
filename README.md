@@ -23,7 +23,7 @@ no code generation, no GPU backend, no operator overloading tricks — just Go.
 | `github.com/qorm/LNN/tensor` | Dense row-major `float32` tensors with a 1D/2D-focused op set: matmul, elementwise math with limited broadcasting, activations, reductions, slicing, random initialization. |
 | `github.com/qorm/LNN/autograd` | A dynamic computation-graph engine. Each op tags its output `Variable` with an op kind; `Backward` walks the graph in reverse topological order, dispatches each node's gradient propagation, and accumulates gradients into leaves. |
 | `github.com/qorm/LNN/nn` | Neural-network building blocks: `Linear` layers, `Wiring` synapse topologies, the `LTC` liquid cell and its closed-form sibling `CfC`, and the `Cell`/`Unroll` abstractions for driving recurrent cells over sequences. |
-| `github.com/qorm/LNN/optimizer` | Explicit parameter-update rules over `autograd`: SGD, heavy-ball Momentum, and Adam (Kingma & Ba, bias-corrected). One `Step(params)` call replaces the hand-rolled update loop. |
+| `github.com/qorm/LNN/optimizer` | Explicit parameter-update rules over `autograd`: SGD, heavy-ball Momentum, and Adam (Kingma & Ba, bias-corrected). One `Step(params)` call replaces the hand-rolled update loop. State persistence (`SaveState`/`LoadState`, `"LNO1"` streams) makes resumed training bit-identical to uninterrupted training. |
 | `github.com/qorm/LNN/serialize` | Versioned binary persistence: a compact little-endian tensor stream (`"LNNS"`, version 1) whose load path treats input as untrusted — every failure an error (never a panic), size claims validated before allocation, progressive allocation on unknown-length readers. The storage layer behind `nn`'s six Save/Load functions. |
 
 ## Documentation
@@ -33,7 +33,7 @@ Guides for building on the library live in [`doc/`](doc/):
 | Guide | Covers |
 |---|---|
 | [doc/training.md](doc/training.md) | Hand-rolled training loops and the `optimizer` package (SGD/Momentum/Adam), gradient clipping, a divergence checklist |
-| [doc/persistence.md](doc/persistence.md) | The `"LNNS"` wire format spec, the six Save/Load functions, the untrusted-stream safety contract, a runnable train→save→load→resume example |
+| [doc/persistence.md](doc/persistence.md) | The `"LNNS"` wire format spec, the six Save/Load functions, optimizer state persistence (`"LNO1"` streams, bit-exact resume), the untrusted-stream safety contract, runnable train→save→load→resume examples |
 | [doc/shapes-and-broadcasting.md](doc/shapes-and-broadcasting.md) | The broadcasting rule table, reduction output shapes, asymmetric conventions |
 | [doc/ltc.md](doc/ltc.md) | The LTC paper↔code correspondence, parameter table, `ts` contract, wiring |
 | [doc/cfc.md](doc/cfc.md) | The CfC closed-form cell: Lemma 1 paper correspondence, exprel stabilization, relation to the LTC |
@@ -213,12 +213,16 @@ recommended production form — caller-owned gradient-norm clipping plus
 - **The graph is retained until `Backward`.** Every intermediate tensor is
   kept alive by the computation graph, so memory grows with the number of
   ops. An LTC step unrolls `unfolds` ODE iterations into the graph, each
-  `O(units)` vector blocks plus two MatMul contractions — down from
-  `O(units²)` per-synapse nodes since the synapse vectorization; the
-  phase-7 backward overhaul halved the per-node allocations again, and the
-  phase-8 Sigmoid–Hadamard fusion trimmed them further
-  (measured: `LTCStep` 2,306 allocs/op, `UnrollBackward` 31,983 —
-  cumulative −69%/−73% from the original loop). Keep `units`, `unfolds`
+  `O(units)` activation blocks plus a sparse presynaptic contraction — a
+  `+0`-seeded fold ended by normalizing MatMuls; the phase-9 sparse
+  contraction eliminated the dense `[units², units]` indicator matrices
+  entirely (construction of a fully-wired `units = 1024` cell costs
+  ~32 MB, not the old ~8 GiB). The phase-7 backward overhaul halved the
+  per-node allocations, and the phase-8 Sigmoid–Hadamard fusion trimmed
+  them further (measured: `LTCStep` 3,296 allocs/op, `UnrollBackward`
+  41,588 — cumulative −55%/−65% from the original loop; the phase-9 step
+  raised allocs ~43%/~30% but cut wall-clock ~21%/~13% — allocation
+  counts were traded away for useless compute). Keep `units`, `unfolds`
   and sequence length modest on this engine; the `CfC` cell
   ([doc/cfc.md](doc/cfc.md)) has no `unfolds` factor at all.
 
@@ -246,9 +250,9 @@ Honest maturity assessment as of this commit (coverage measured with
 |---|---|
 | `tensor` | Core is stable and well tested (~99.7% line coverage). The single residual uncovered statement is a double-constant fill-loop body in `broadcastBinary` that is argued unreachable (its column count is always `1` on that path, so the loop never executes, and the `[1,1]×[1,1]` case is intercepted by the same-shape fast path first); it is documented rather than padded with a contrived test. The transpose-aware MatMul kernels added in phase 7 are exercised through the `autograd` package's tests. |
 | `autograd` | Stable and well tested (100% line coverage); gradients pass finite-difference and bitwise-differential checks across the covered paths, including the phase-7 legacy-composition fallback branches for irregular manually seeded gradients and the phase-8 Sigmoid–Hadamard fusion's regular and fallback paths. |
-| `nn` | Functional and well tested (100% line coverage): the LTC and CfC forward/backward paths are regression-tested, including closed-form degenerate-case checks, tiny/NaN `ts` guards, wiring validation, and Save/Load round-trips. Reversal potentials are fixed ±1 constants in both cells, baked into construction-time indicator matrices — not trainable, and with no dead gradient. CfC is a phase-6 feature and its API may still evolve. |
-| `optimizer` | Stable, 100% line coverage: the three update rules are verified against independent reference implementations (SGD bit-for-bit, Adam ~1.6e-6 vs a float64 reference), and the pointer-keyed state semantics are regression-tested. |
-| `serialize` | Stable, 97.8% line coverage: round-trip bit-exactness (NaN and −0 included) is regression-tested and byte-pinned by committed golden vectors; the hostile-stream contract — fixed limits validated before allocation (including the load-path `units`/`inDim` cap of 256 that bounds the O(units³) indicator matrices), progressive allocation on unknown-length readers — is pinned by allocation-count and byte-budget tests; and red-team mutation fuzzing produced zero panics across 7,500 mutants, plus a further 1,200 after the resource-exhaustion hardening. The resource bounds are documented in [doc/persistence.md](doc/persistence.md). |
+| `nn` | Functional and well tested (100% line coverage): the LTC and CfC forward/backward paths are regression-tested, including closed-form degenerate-case checks, tiny/NaN `ts` guards, wiring validation, and Save/Load round-trips (a legitimate `units = 2048` stream round-trips at the load limit). Reversal potentials are fixed ±1 constants in both cells, carried by row-view constants over the sparse contraction — not trainable, and with no dead gradient (structurally impossible). The phase-9 sparse contraction is regression-tested bitwise against the former indicator-matrix implementation, with a large-cell memory gate. CfC is a phase-6 feature and its API may still evolve. |
+| `optimizer` | Stable, ~99.6% line coverage (the sole uncovered statement is a physically unreachable parameter-count guard): the three update rules are verified against independent reference implementations (SGD bit-for-bit, Adam ~1.6e-6 vs a float64 reference), the pointer-keyed state semantics are regression-tested, and state persistence (`SaveState`/`LoadState`, `"LNO1"` streams) is pinned by bit-exact resume tests (50+50 vs 100 steps, all three optimizers) and hostile-stream tests (validate-all-then-apply with zero side effects, byte-budget gates). |
+| `serialize` | Stable, 97.8% line coverage: round-trip bit-exactness (NaN and −0 included) is regression-tested and byte-pinned by committed golden vectors; the hostile-stream contract — fixed limits validated before allocation (including the load-path `units`/`inDim` cap of 2048, re-derived for the phase-9 sparse contraction's O(units²) load-time memory), progressive allocation on unknown-length readers — is pinned by allocation-count and byte-budget tests; and red-team mutation fuzzing produced zero panics across 7,500 mutants, plus a further 1,200 after the resource-exhaustion hardening. The resource bounds are documented in [doc/persistence.md](doc/persistence.md). |
 
 The CfC (Closed-form Continuous-time) cell and built-in optimizers
 shipped in phase 6, and serialization plus the autograd backward
@@ -264,10 +268,15 @@ same task with the CfC cell and the recommended optimizer form (loss
 `0.621 → 0.029`). Phase 8 closed the Sigmoid–Hadamard fused backward
 (#13) and the CfC's `erev` dead gradients (#10), and added the
 serialization golden vectors plus the load-path `units`/`inDim` caps.
-The remaining roadmap is the technical-debt table in
-[doc/pitfalls.md](doc/pitfalls.md) — headlined by the indicator-matrix
-O(units³) materialization (#14, whose load side those caps already
-close) and `tensor.New`'s fixed per-node overhead (#12).
+Phase 9 closed #14 at the root — the sparse contraction eliminated the
+O(units³) indicator matrices (construction ~32 MB at `units = 1024`,
+not ~8 GiB; the load caps were re-derived `256 → 2048` on the new
+O(units²) model, honoring the proportional-allocation contract at the
+root) — and added optimizer state persistence (`SaveState`/`LoadState`,
+`"LNO1"` streams, bit-exact resume for all three optimizers). The
+remaining roadmap is the technical-debt table in
+[doc/pitfalls.md](doc/pitfalls.md) — headlined by `tensor.New`'s fixed
+per-node overhead (#12).
 
 Track the remediation plan and progress in `PLAN.md` and `PROGRESS.md`.
 

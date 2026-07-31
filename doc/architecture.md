@@ -41,8 +41,9 @@ dependencies beyond the standard library.
 
 Import direction is strictly downward (`nn → autograd → tensor`); there are
 no cycles and no cross-layer shortcuts except that `nn` calls `tensor`
-directly for constants (wiring masks, epsilon, sparse reduction
-indicators) that need no gradient. The `optimizer` package (SGD,
+directly for constants (wiring masks, epsilon, the identity matrix and
+`+0` scalar seeding the sparse contraction, the reversal row views) that
+need no gradient. The `optimizer` package (SGD,
 Momentum, Adam) sits beside `nn` on top of `autograd` — it imports only
 `autograd` and writes the same plain-Go in-place updates a hand-rolled
 loop would ([training.md](training.md)). The `serialize` package
@@ -234,7 +235,7 @@ benchmarks all down with zero regressions: `ChainForwardBackward`
 The phase-8 `autograd.SigmoidHadamard(z, w)` (`autograd/ops.go`) fuses
 the LTC hot-path pattern `Hadamard(Sigmoid(z), w)` — two graph nodes —
 into one, and is adopted at the single shared sensory/recurrent entry of
-`synapsesRows` (`nn/ltc.go:347`). It is the capstone of the backward
+`synapsesRows` (`nn/ltc.go:423`). It is the capstone of the backward
 overhaul because it is the one fusion that needed a new operator rather
 than a reorganization of existing ones, and its equivalence story has
 three distinct parts:
@@ -291,14 +292,28 @@ Every intermediate tensor stays alive — referenced by its node — until
 `Backward` completes. Memory therefore scales with the number of ops
 per iteration, not just with parameter size. One LTC `Step` unrolls
 `unfolds` ODE iterations into the graph; since the phase-6 synapse
-vectorization each iteration is O(units) vector blocks plus two MatMul
-contractions against construction-time indicator matrices
-([ltc.md](ltc.md)) — down from O(units²) per-synapse nodes, the
-phase-7 backward overhaul (above) halved the per-node allocation count
-again, and the phase-8 Sigmoid–Hadamard fusion took it further still.
-Measured now: `LTCStep` 2,306 allocs/op and `UnrollBackward`
-31,983 — cumulative −69% and −73% from the original per-synapse loop
-(7,360 / 120,163). Memory still grows with `units · unfolds · sequence
+vectorization each iteration is O(units) activation blocks, and since
+the phase-9 sparse contraction the presynaptic reduction is a
+`+0`-seeded fold ended by normalizing MatMuls ([ltc.md](ltc.md)) —
+down from O(units²) per-synapse nodes, and from the dense
+`[units², units]` indicator matrices phase 9 eliminated (those
+materialized O(units³) float32s, at construction *and* at load time;
+see [persistence.md](persistence.md)). The phase-7 backward overhaul
+(above) halved the per-node allocation count, and the phase-8
+Sigmoid–Hadamard fusion took it further still. Measured now: `LTCStep`
+**3,296 allocs/op** and `UnrollBackward` **41,588** — cumulative
+**−55% and −65%** from the original per-synapse loop
+(7,360 / 120,163). The phase-9 step is an honest trade: allocs went
+*up* ~43%/~30% over the phase-8 values (2,306 / 31,983; the fold's
+per-stage cloning) but ns/op went *down* ~21%/~13% (independent
+red-team rerun), because the dense indicator MatMuls' O(units³) idle
+inner loops over zero rows and their large backward allocations are
+gone — allocation counts were traded away for useless compute, and
+wall-clock is a net benefit. The same change removed the
+*construction-time* memory cliff: a fully-wired `units = 1024` cell
+now allocates ~32 MB (measured: 36.4 MiB for `NewLTC`, 32.4 MiB for
+`NewCfC`; red-team re-verification agrees), not the old ~8 GiB of
+indicators. Graph memory still grows with `units · unfolds · sequence
 length`, so keep all three modest on this engine; a `CfC` step
 ([cfc.md](cfc.md)) avoids the `unfolds` factor entirely.
 

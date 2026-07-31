@@ -205,8 +205,18 @@ func stateKindName(k uint8) string {
 // betaPow returns beta^t computed as t sequential float32 multiplications
 // from 1 — the exact rounding path Adam.Step maintains in its pow1/pow2
 // fields, so the result agrees with the optimizer's running power bit for
-// bit. The early zero exit is exact: once the running product underflows
-// to zero it stays zero, so no later rounding can occur.
+// bit. The early zero exit is exact but narrow: it only engages for betas
+// whose running product reaches a true zero (0.5, say: 0.5^t = 2^-t
+// underflows to exactly 0 at t = 150, and once zero it stays zero, so no
+// later rounding can occur). Other betas settle into a subnormal FIXED
+// POINT instead: 0.9 pins at 0x00000004 from t ~= 965 (4 ULP * 0.9 = 3.6
+// ULP rounds back to 4 ULP) and 0.999 pins at 0x000001f4 from
+// t ~= 96,900, so for them the exit never fires and the loop runs all t
+// multiplications — bounded by maxT on the load path — arriving at the
+// same bits Adam.Step's running product pins at. The behavior is correct
+// either way, and since the stream stores pow1/pow2 bit for bit, betaPow
+// is only ever a load-time consistency check (it also catches a beta
+// mismatch); the stored power is what gets restored.
 func betaPow(beta float32, t int) float32 {
 	p := float32(1)
 	for i := 0; i < t && p != 0; i++ {
