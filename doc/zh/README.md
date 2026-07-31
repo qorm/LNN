@@ -26,4 +26,4 @@
 6. **[architecture.md](architecture.md)** —— 调试与扩展所需的心智模型。
 7. **[pitfalls.md](pitfalls.md)** —— 上线之前必读。
 
-仓库根目录的 `README.md`（中文版 `README_zh.md`）有快速上手示例；`examples/ltc-sequence` 与 `examples/cfc-sequence` 是同一玩具序列任务上两个完整、可运行的训练循环（分别为手写 SGD 与 optimizer 包范式）。
+仓库根目录的 `README.md`（中文版 `README_zh.md`）有快速上手示例；`examples/ltc-sequence` 与 `examples/cfc-sequence` 是同一玩具序列任务上两个完整、可运行的训练循环（分别为手写 SGD 与 optimizer 包范式）。示例是仓库的一部分：克隆仓库（`git clone https://github.com/qorm/LNN.git`）后在仓库根目录运行。

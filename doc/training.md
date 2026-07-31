@@ -131,7 +131,9 @@ for it := 0; it < iters; it++ {
 `examples/ltc-sequence` is this pattern complete, on a task that requires
 cross-step memory (a bounded accumulator): `go run ./examples/ltc-sequence`
 trains for 250 iterations and prints the loss falling from `0.690761` to
-`0.041996`.
+`0.041996`. The examples live in the repository — clone it
+(`git clone https://github.com/qorm/LNN.git`) and run from the repository
+root.
 
 ## Using the optimizer package
 
@@ -300,6 +302,39 @@ over the full 250-iteration run. The clip engages on most early
 iterations and is the difference between converging and diverging on
 this task.
 
+With `optimizer.Step`, clip the same way but rescale the gradients
+themselves — `Step` applies its own learning rate, so accumulate the
+norm in `float64` and, when it exceeds `maxNorm`, multiply every element
+of every `p.Grad.Data` by `maxNorm/norm` **before** the `Step` call:
+
+```go
+var norm2 float64
+for _, p := range params {
+	if p.Grad == nil {
+		continue
+	}
+	for _, g := range p.Grad.Data {
+		norm2 += float64(g) * float64(g)
+	}
+}
+if norm := math.Sqrt(norm2); norm > maxNorm {
+	s := float32(maxNorm / norm)
+	for _, p := range params {
+		if p.Grad == nil {
+			continue
+		}
+		for i := range p.Grad.Data {
+			p.Grad.Data[i] *= s
+		}
+	}
+}
+opt.Step(params)
+```
+
+The complete train → save → load → resume example in
+[persistence.md](persistence.md) shows exactly this form in a full
+program.
+
 ### Optional: momentum
 
 Momentum is the same five lines with a velocity buffer; nothing else
@@ -337,7 +372,7 @@ A checklist ordered by how often each cause appears:
 | loss → `NaN` within a few steps | lr too large; parameters overshoot into `Exp`/`Log` overflow | reduce lr 3–10x; add norm clipping |
 | sudden `NaN` after many good steps | a `Log(x)` saw `x ≤ 0`, or a `Div` saw a zero divisor (`+Inf` forward, `Inf` gradients backward) | clamp inputs to `Log`; keep divisors bounded away from 0 |
 | LTC loss spikes/diverges | gradient spike from the `1/(den+eps)` division (`den` can approach `eps = 1e-8`) | global norm clipping (above); smaller lr |
-| everything `NaN` after a step | `float32` overflow propagated: once one element is `NaN`, MatMul-free paths carry it through the whole graph | clip; check `ts` is sane (`ts ≥ 1e-3` keeps full physical fidelity — see [ltc.md](ltc.md)) |
+| everything `NaN` after a step | `float32` overflow propagated: once one element is `NaN`, MatMul-free paths carry it through the whole graph | clip; check `ts` is sane (anchor it to the task's sampling interval — one time unit per step means `ts = 1.0`; `ts ≥ 1e-3` keeps full physical fidelity — see [ltc.md](ltc.md)) |
 | gradients exactly 2x too big | `Backward` called twice on the same graph, or `ZeroGrad` missing | one `Backward` per fresh graph; `ZeroGrad` all params first |
 | gradients finite but wrong | parameter `Data` mutated between forward and backward | update strictly after `Backward` |
 | slow creep, no convergence | lr too small, or loss averaging hides progress | sanity-check with the quick-start program in the root README |

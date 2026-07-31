@@ -73,7 +73,7 @@ for _, p := range params {
 
 ## 一个完整的例子：训练 → 保存 → 加载 → 续训
 
-下面的程序在与 `examples/cfc-sequence`（[cfc.md](cfc.md)）相同的有界累加器任务上训练一个 `CfC`，保存细胞与读出层，把它们加载进以*不同* seed 构建的*全新*模型，验证 `Step` 输出逐位相同，然后从检查点续训——配合 optimizer 包（[training.md](training.md)）与调用方负责的梯度裁剪：
+下面的程序在与 `examples/cfc-sequence`（[cfc.md](cfc.md)；示例位于仓库内——`git clone https://github.com/qorm/LNN.git` 后在仓库根目录运行）相同的有界累加器任务上训练一个 `CfC`，保存细胞与读出层，把它们加载进以*不同* seed 构建的*全新*模型，验证 `Step` 输出逐位相同，然后从检查点续训——配合 optimizer 包（[training.md](training.md)）与调用方负责的梯度裁剪：
 
 ```go
 package main

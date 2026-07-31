@@ -35,3 +35,5 @@ A complete Simplified Chinese mirror of these guides lives in [`zh/`](zh/README.
 The repository root `README.md` has the quick start; `examples/ltc-sequence`
 and `examples/cfc-sequence` are complete, runnable training loops on a toy
 sequence task (hand-rolled SGD and the optimizer-package form, respectively).
+They are part of the repository: clone it (`git clone https://github.com/qorm/LNN.git`)
+and run them from the repository root.

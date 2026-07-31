@@ -93,7 +93,9 @@ Two contracts come with it:
 ## A complete example: train → save → load → resume
 
 The program below trains a `CfC` on the same bounded-accumulator task as
-`examples/cfc-sequence` ([cfc.md](cfc.md)), saves the cell and readout,
+`examples/cfc-sequence` ([cfc.md](cfc.md); the examples live in the
+repository — `git clone https://github.com/qorm/LNN.git` and run from
+the repository root), saves the cell and readout,
 loads them into *fresh* models built with a *different* seed, verifies
 bit-identical `Step` output, and resumes training from the checkpoint —
 with the optimizer package ([training.md](training.md)) and caller-owned

@@ -113,7 +113,7 @@ for it := 0; it < iters; it++ {
 }
 ```
 
-`examples/ltc-sequence` 就是这个范式的完整版，任务需要跨步记忆（一个有界累加器）：`go run ./examples/ltc-sequence` 训练 250 轮迭代，损失从 `0.690761` 降到 `0.041996`。
+`examples/ltc-sequence` 就是这个范式的完整版，任务需要跨步记忆（一个有界累加器）：`go run ./examples/ltc-sequence` 训练 250 轮迭代，损失从 `0.690761` 降到 `0.041996`。示例都在仓库内——克隆仓库（`git clone https://github.com/qorm/LNN.git`）后在仓库根目录运行。
 
 ## 使用 optimizer 包
 
@@ -216,6 +216,34 @@ for _, p := range params {
 
 实测（`examples/ltc-sequence` 的首轮迭代，seed 42，units=8，unfolds=4，12 步序列）：梯度范数 `2.50` → 更新缩放 `0.019975`，而不是 `0.05`。全部 250 轮迭代中观测到的最大梯度范数为 `6.04`；裁剪在大多数早期迭代中都会触发——这正是该任务上收敛与发散的分界线。
 
+与 `optimizer.Step` 组合时裁剪方式相同，但要缩放梯度本身——`Step` 自己施加学习率，因此用 `float64` 累范数，超过 `maxNorm` 时把每个 `p.Grad.Data` 的全部元素乘以 `maxNorm/norm`，**在 `Step` 调用之前**完成：
+
+```go
+var norm2 float64
+for _, p := range params {
+	if p.Grad == nil {
+		continue
+	}
+	for _, g := range p.Grad.Data {
+		norm2 += float64(g) * float64(g)
+	}
+}
+if norm := math.Sqrt(norm2); norm > maxNorm {
+	s := float32(maxNorm / norm)
+	for _, p := range params {
+		if p.Grad == nil {
+			continue
+		}
+		for i := range p.Grad.Data {
+			p.Grad.Data[i] *= s
+		}
+	}
+}
+opt.Step(params)
+```
+
+[persistence.md](persistence.md) 的「训练 → 保存 → 加载 → 续训」完整示例在一个完整程序里逐字演示了这种形态。
+
 ### 可选：动量
 
 动量就是同样的五行代码加一个速度缓冲；别无其他：
@@ -244,7 +272,7 @@ for i := range w.Data.Data {
 | 几步之内 loss → `NaN` | lr 过大；参数过冲进入 `Exp`/`Log` 溢出区 | lr 缩小 3–10 倍；加范数裁剪 |
 | 许多正常步之后突然 `NaN` | 某个 `Log(x)` 遇到了 `x ≤ 0`，或某个 `Div` 遇到了零除数（前向得 `+Inf`，反向得 `Inf` 梯度） | 钳制 `Log` 的输入；让除数远离 0 |
 | LTC 损失尖峰/发散 | 来自 `1/(den+eps)` 除法的梯度尖峰（`den` 可以逼近 `eps = 1e-8`） | 全局范数裁剪（见上）；更小的 lr |
-| 一步之后全部 `NaN` | `float32` 溢出扩散：一旦有一个元素是 `NaN`，非 MatMul 路径会把它带过整张图 | 裁剪；检查 `ts` 合理（`ts ≥ 1e-3` 保持完整物理保真度——见 [ltc.md](ltc.md)） |
+| 一步之后全部 `NaN` | `float32` 溢出扩散：一旦有一个元素是 `NaN`，非 MatMul 路径会把它带过整张图 | 裁剪；检查 `ts` 合理（以任务的采样间隔为锚——每步对应一个时间单位即 `ts = 1.0`；`ts ≥ 1e-3` 保持完整物理保真度——见 [ltc.md](ltc.md)） |
 | 梯度恰好大了一倍 | 对同一张图调用了两次 `Backward`，或漏了 `ZeroGrad` | 每张新图一次 `Backward`；先对所有参数 `ZeroGrad` |
 | 梯度有限但错误 | 参数 `Data` 在前向与反向之间被修改 | 更新严格放在 `Backward` 之后 |
 | 缓慢蠕动、不收敛 | lr 过小，或损失的均值化掩盖了进展 | 用根目录 README 的快速上手程序做合理性检查 |

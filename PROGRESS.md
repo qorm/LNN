@@ -18,6 +18,7 @@
 | 8 | v0.2 双轨：融合反向 + 序列化版本化 → 覆盖率收复 → 红队总扫 → v0.2.0 | ✅ 完成（v0.2.0→v0.2.2：CI 跨平台红灯两轮修复后双绿） |
 | 9 | v0.3 双轨：#14 稀疏收缩（根因修复）+ 优化器状态持久化 → 红队 → v0.3.0 | ✅ 完成（v0.3.0 已发布） |
 | 10 | API 稳定窗口：fuzzing 基建 + API 决策实施 → v0.4.0 | ✅ 完成（v0.4.0 已发布，CI 双绿含 fuzz 冒烟跨平台首跑） |
+| 11 | 发布打磨：上手审计 + 长时 fuzz 浸泡 + GitHub Releases + pkg.go.dev 验证 | 🔄 进行中（Releases ✅ / pkg.go.dev ✅ / R-A·R-B 运行中） |
 
 ## 阶段 1：并行分析（已完成）
 
@@ -404,7 +405,8 @@ Git 历史：`87ccf77` 基线 → `08aba45` 阶段3a → `102af40` 阶段3b → 
 - 2026-07-31：阶段 9 v0.3 双轨——9a 稀疏收缩（#14 根因销账：units³ 指示阵消灭、1164 组 oracle 逐位、units=1024 8GiB→36MiB、maxUnits 256→2048 同预算 8× 容量、ns −10~−16% 而 allocs 诚实披露 +30~43%）+ 优化器状态持久化（LNO1、续训逐位等价）（528b87a）；9b 红队放行无阻断——522 组差分逮住 F9-1 单源 ±0 角（值 0 无轨迹影响，裁决文档化而非代码修补，沿用 F-RT1 判例）、F9-2 文档欠账清单、betaPow 亚正规不动点；9c 双语清偿 + 注释精确化 + 102 处行号回源。
 - 2026-07-31：**发布 v0.3.0**（tag + 推送；CI 双绿：v0.3.0 tag 流水线 + main 流水线均 success；tag 解析经 GOPROXY=direct 与 goproxy.cn 镜像实测通过，proxy.golang.org 当时对本环境网络抖动、同日 v0.2.x 经其正常）；前九个阶段关闭
 - 2026-07-31：阶段 10——Q-A Go 原生 fuzzing 基建（8 目标、零库缺陷、7 条 fuzzer 输入转常驻语料）+ Q-B API 设计评估备忘（#12 原型实测 −24% allocs 墙钟持平、#3 统一代价量化、Stack/Take 影响面枚举）→ **用户拍板四项全采纳推荐**（#12②内嵌 backing / #3 冻结 / Stack 删除 / Take 内移）→ 10b 实施（五基准 −17.9~−25.8% 复现、逐位门禁、API 面四符号核验、fuzz-smoke 全绿）→ 10c 双语文档同步（#12/#3 决策痕迹双语留档、44 处行号回源修 4 处漂移）
-- 2026-07-31：**发布 v0.4.0**（tag + 推送；**CI 双绿含 8 目标 fuzz 冒烟在 GitHub amd64 runner 首跑成功**——fuzz 基建跨平台验证附带完成；GOPROXY=direct 实测解析 v0.4.0、@latest 已指向 v0.4.0）。**全部十个阶段关闭**。Git 终态 6 个版本标签（+v0.4.0）、30 个 agent。留档表：#3/#12/#6-Stack 决策环路关闭，余项全部接受风险/信息级（领衔候选：图节点 parents 定长槽化，低优先）
+- 2026-07-31：**发布 v0.4.0**（tag + 推送；**CI 双绿含 8 目标 fuzz 冒烟在 GitHub amd64 runner 首跑成功**——fuzz 基建跨平台验证附带完成；GOPROXY=direct 实测解析 v0.4.0、@latest 已指向 v0.4.0）。前十个阶段关闭
+- 2026-07-31：阶段 11 发布打磨——**GitHub Releases 六个版本全部注释化**（v0.1.0-v0.4.0，各含变更要点与传承说明，v0.2.1 标注被 v0.2.2 取代）；**pkg.go.dev 实测呈现完整**（HTTP 200、v0.4.0 为最新、五包全部列出——库进入 Go 官方包发现入口）；R-A 新手视角上手审计（零先验知识、信息边界=pkg.go.dev 用户、可验证抱怨才算发现）与 R-B 长时 fuzz 浸泡（8 目标×120s，千万级执行，异架构补充 CI 的 amd64 冒烟）运行中
 - 2026-07-31：阶段 10 启动——Q-A fuzzing 基建完成（8 目标 × 96 手工种子 + 7 条沉淀回归语料，本机 1.3–3.6M 执行/10s 全 0 panic，发现全部为 oracle 校准问题非库缺陷）+ Q-B API 设计评估备忘完成（主仓库零写入 + /tmp 原型实测四项：#12 内嵌 backing −18~−26% allocs 而墙钟 ±2% 噪声内持平 / #3 统一成本量化 / Stack 零调用 / SumToShapeTake 5 内部调用点）；**用户拍板四项全采纳推荐**（#12② 内嵌 backing / #3 冻结 + 强化文档 / Stack 删除 / SumToShapeTake 内移 autograd，组合外部破坏面 0）
 - 2026-07-31：**10b API 决策实施完成**（外部破坏面 0）：shapeBuf [4]int 内嵌 + useShape 单一收口 + 导出 Reshape（唯一 API 新增，含负维校验）；Stack 函数/测试/Q-A 三探针全删（留 tombstone）；SumToShapeTake 内移 autograd 非导出（语义+契约+panic 文案逐字保持，5 调用点重路由）。五基准 allocs −17.9%~−25.8%（本机复验终值 LTCStep 2,707 / UnrollBackward 31,994，累计 −63%/−73%），墙钟持平、字节 +3%；门禁五绿（两 example 逐字 / 五包 -race / 断言 diff 空 / fuzz-smoke 8 目标 / go doc 四符号核验）
 - 2026-07-31：**10c 双语文档同步完成**（Q-B §5 文档清单五项 + 10b 同步，14 文件双语同构）：Stack 文档四处清除（tensor/doc.go panic 列表 + pitfalls/shapes 双版）、SumToShapeTake 内移同步（architecture 所有权节 + shapes 归约节）、#12 决策留档（architecture 性能节新增「内嵌形状 backing」专节 + pitfalls 路线图表）、#3 冻结留档（shapes 诚实专节补决策依据 + SumRows/SumCols godoc 各补不对称指引）、README 双版阶段 10 语境 + 领衔改写；行号回源 44 处（autograd/ops.go 漂移修正 4 处：Div 793-810→829-846、GatherRows 855→891；nn 引用零漂移全验）。终检全绿：gofmt 空 / build / vet / test 五包 / 零断链 / .go 非注释行 diff 空自证。**v0.4.0 文档关口闭合，待打 tag**
