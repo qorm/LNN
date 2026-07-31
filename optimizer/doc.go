@@ -65,7 +65,7 @@
 //
 // # Concurrency
 //
-// lnn is single-threaded by design: like Backward, Step mutates
+// LNN is single-threaded by design: like Backward, Step mutates
 // parameter Data (and optimizer state) without synchronization. Never
 // share an optimizer or its parameters across goroutines.
 package optimizer

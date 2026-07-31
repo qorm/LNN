@@ -85,7 +85,7 @@ invisible; it exists to keep adversarial parameter draws from producing
 ## Algorithm 1: compiling the LTC to closed form
 
 The paper's Algorithm 1 compiles an LTC into its closed-form update
-synapse by synapse, allowing arbitrary sparse adjacency. lnn mirrors
+synapse by synapse, allowing arbitrary sparse adjacency. LNN mirrors
 that structure with the same sparse contraction the LTC uses:
 `drive()` (`nn/cfc.go:274-291`) builds one `[batch, units]` activation
 block per presynaptic neuron `i` — the column⊙row outer product gated

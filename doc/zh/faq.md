@@ -1,4 +1,4 @@
-# lnn 常见问题（FAQ）
+# LNN 常见问题（FAQ）
 
 > [English](../faq.md) | 中文
 
@@ -222,7 +222,7 @@ Box-Muller 初始化实测 ≤ 6 ULP）。这是 Go 的行为——语言允许�
 | 消息 | 含义 | 处置 |
 |---|---|---|
 | `nn: stream holds model kind 1 (CfC), not LTC (kind 0)` | 用错加载器 | 改用 `nn.LoadCfC`——消息会点名文件实际是什么 |
-| `serialize: bad magic … not an lnn tensor stream` | 根本不是 lnn 文件 | 检查是不是指错了文件 |
+| `serialize: bad magic … not an LNN tensor stream` | 根本不是 LNN 文件 | 检查是不是指错了文件 |
 | `serialize: unsupported format version 99 (this build reads version 1): … newer version …` | 由更新的库写出 | 升级库 |
 | `…: no earlier layout exists, the stream is corrupt or forged` | version 字节低于 1 | 损坏——拒绝 |
 | `…: truncated stream: claims N data bytes but only M remain: unexpected EOF` | 文件被截短（用 `errors.Is(err, io.ErrUnexpectedEOF)` 匹配） | 重新传输；失败的加载不会动你的模型 |

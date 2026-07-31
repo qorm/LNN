@@ -2,7 +2,7 @@
 
 > English | [中文](zh/architecture.md)
 
-**Summary:** lnn is three layers — a `float32` numeric kernel (`tensor`), a
+**Summary:** LNN is three layers — a `float32` numeric kernel (`tensor`), a
 dynamic reverse-mode AD engine (`autograd`), and a model layer (`nn`) — each
 importing only the one below it, with no framework, no code generation and no
 dependencies beyond the standard library.

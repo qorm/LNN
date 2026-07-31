@@ -2,7 +2,7 @@
 
 > English | [中文](zh/shapes-and-broadcasting.md)
 
-**Summary:** lnn uses dense row-major shapes with an explicitly enumerated
+**Summary:** LNN uses dense row-major shapes with an explicitly enumerated
 broadcasting subset (five rules, anything else panics), and its reduction
 output shapes are *not* fully symmetric — read the tables below before
 relying on one.

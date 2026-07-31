@@ -371,7 +371,7 @@ ys, hN := nn.Unroll(cell, []*autograd.Variable{x, x, x}, nil, 0.1)
 
 ## Relation to the ncps reference
 
-| ncps concept | lnn counterpart |
+| ncps concept | LNN counterpart |
 |---|---|
 | LTC layer with `units`, `unfolds` (default 6) | `NewLTC(inDim, units, wiring, unfolds, rng)` |
 | ODE solver: semi-implicit Euler over `unfolds` substeps | identical scheme (`Step` loop, `nn/ltc.go:324-329`) |

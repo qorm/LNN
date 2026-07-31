@@ -1,8 +1,8 @@
 > [English](../training.md) | 中文
 
-# 用 lnn 训练模型
+# 用 LNN 训练模型
 
-**摘要：** 用 lnn 训练就是一个四阶段循环（清零梯度 → 前向 → `Backward` → 参数更新）作用于 `Parameters()`，稳定性（学习率与梯度裁剪（gradient clipping））由你自己掌控。更新阶段有两条路：五行人手写的 Go——理解引擎的基础；或者一次 `optimizer.Step` 调用（`optimizer` 包提供 SGD/Momentum/Adam）——推荐的生产训练形态。本指南端到端地展示这两种范式。
+**摘要：** 用 LNN 训练就是一个四阶段循环（清零梯度 → 前向 → `Backward` → 参数更新）作用于 `Parameters()`，稳定性（学习率与梯度裁剪（gradient clipping））由你自己掌控。更新阶段有两条路：五行人手写的 Go——理解引擎的基础；或者一次 `optimizer.Step` 调用（`optimizer` 包提供 SGD/Momentum/Adam）——推荐的生产训练形态。本指南端到端地展示这两种范式。
 
 **读者对象：** 即将用本库训练第一个模型的工程师。
 

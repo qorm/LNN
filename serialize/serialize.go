@@ -20,7 +20,7 @@
 //
 // # Error contract (the exception domain)
 //
-// The rest of lnn reports misuse by panicking: its inputs come from the
+// The rest of LNN reports misuse by panicking: its inputs come from the
 // program itself, so a bad shape is a bug in the caller. Serialization is the
 // deliberate exception. A load path consumes bytes from outside the program
 // — files, networks, checkpoints from other versions — which may be corrupt,
@@ -374,7 +374,7 @@ func ReadTensors(r io.Reader) ([]*tensor.Tensor, error) {
 		return nil, fmt.Errorf("serialize: reading stream magic: %w", err)
 	}
 	if m != magic {
-		return nil, fmt.Errorf("serialize: bad magic % x, want % x (\"LNNS\"): not an lnn tensor stream", m[:], magic[:])
+		return nil, fmt.Errorf("serialize: bad magic % x, want % x (\"LNNS\"): not an LNN tensor stream", m[:], magic[:])
 	}
 	var vb [1]byte
 	if err := rd.full(vb[:]); err != nil {

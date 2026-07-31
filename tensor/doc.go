@@ -1,6 +1,6 @@
 // Package tensor provides a minimal dense float32 n-dimensional tensor type
 // with row-major layout, plus the small set of numeric operations the LNN
-// library needs. It is the numeric kernel of the lnn module: autograd builds
+// library needs. It is the numeric kernel of the LNN module: autograd builds
 // on it, and nn builds on autograd.
 //
 // # Memory layout
@@ -63,7 +63,7 @@
 //
 // # Concurrency
 //
-// Tensors carry no synchronization and expose their storage directly. lnn
+// Tensors carry no synchronization and expose their storage directly. LNN
 // is single-threaded by design: do not read or write one tensor from
 // multiple goroutines. Give each goroutine its own tensors (see the nn
 // package documentation for the full contract).

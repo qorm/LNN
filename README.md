@@ -1,4 +1,4 @@
-# lnn
+# LNN
 
 > [简体中文](README_zh.md)
 
@@ -13,7 +13,7 @@ import). The LTC implementation follows Hasani et al.,
 (AAAI 2021) and the reference implementation
 [`mlech26l/ncps`](https://github.com/mlech26l/ncps).
 
-lnn is small and explicit. It favors readable, auditable kernels over breadth:
+LNN is small and explicit. It favors readable, auditable kernels over breadth:
 no code generation, no GPU backend, no operator overloading tricks — just Go.
 
 ## Packages
@@ -265,7 +265,7 @@ losses, event-driven time steps, and more) are in
 
 ## Concurrency contract
 
-**lnn is single-threaded by design.**
+**LNN is single-threaded by design.**
 
 - `Backward` mutates the `Grad` buffers of leaf variables; running it
   concurrently on variables that share parameters is a data race and loses or
@@ -323,7 +323,7 @@ The full development history and audit trail is recorded in
 
 ## Acknowledgments
 
-lnn is an independent, from-scratch Go implementation built on the Liquid
+LNN is an independent, from-scratch Go implementation built on the Liquid
 Neural Networks research. We gratefully acknowledge:
 
 - **Ramin Hasani, Mathias Lechner, Alexander Amini, Daniela Rus, and

@@ -1,4 +1,4 @@
-# lnn cookbook
+# LNN cookbook
 
 > English | [中文](zh/cookbook.md)
 
@@ -1355,7 +1355,7 @@ func classify(err error) string {
 	case strings.Contains(err.Error(), "unsupported format version"):
 		return "format version skew — newer writer or corruption; update the library"
 	case strings.Contains(err.Error(), "bad magic"):
-		return "not an lnn stream at all — wrong file"
+		return "not an LNN stream at all — wrong file"
 	case strings.Contains(err.Error(), "load limit"):
 		return "model exceeds the load-path caps — hostile or oversized header"
 	default:

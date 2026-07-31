@@ -491,7 +491,7 @@ Adam stream into Momentum -> optimizer: state stream kind 2 (Adam) does not matc
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| 魔数 | `[4]byte` | 恰为 `L N N S`；其他值报 "not an lnn tensor stream" |
+| 魔数 | `[4]byte` | 恰为 `L N N S`；其他值报 "not an LNN tensor stream" |
 | 版本 | `uint8` | `1`（导出常量 `serialize.Version`）；其他值被拒绝 |
 | 数量 | `uint32` | 张量数；流中*恰好*编码这么多个——最后一个载荷之后的尾字节按损坏拒绝 |
 | 随后重复 count 次：秩 | `uint8` | `0 ≤ rank ≤ 8` |

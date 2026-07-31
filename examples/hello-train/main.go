@@ -63,7 +63,7 @@ func main() {
 	}
 
 	// 4. Save the model for hello-use to load.
-	path := filepath.Join(os.TempDir(), "hello-lnn-model.lnns")
+	path := filepath.Join(os.TempDir(), "hello-LNN-model.lnns")
 	f, err := os.Create(path)
 	must(err)
 	must(nn.SaveCfC(f, cell))

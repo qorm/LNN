@@ -1,8 +1,8 @@
 > [English](../README.md) | 中文
 
-# lnn 文档
+# LNN 文档
 
-面向工程师的 `lnn` 库使用指南。各包的 API 细节在 godoc 里（`go doc github.com/qorm/LNN/tensor`、`go doc github.com/qorm/LNN/autograd`、`go doc github.com/qorm/LNN/nn`、`go doc github.com/qorm/LNN/optimizer`、`go doc github.com/qorm/LNN/serialize`）——按 Go 社区惯例，godoc 注释保持英文；这些指南则覆盖签名背后的概念、约定与锋芒之处，中英双语对照。
+面向工程师的 `LNN` 库使用指南。各包的 API 细节在 godoc 里（`go doc github.com/qorm/LNN/tensor`、`go doc github.com/qorm/LNN/autograd`、`go doc github.com/qorm/LNN/nn`、`go doc github.com/qorm/LNN/optimizer`、`go doc github.com/qorm/LNN/serialize`）——按 Go 社区惯例，godoc 注释保持英文；这些指南则覆盖签名背后的概念、约定与锋芒之处，中英双语对照。
 
 文档有两条轴：**概念指南**（库是什么、为何如此）与**任务文档**
 （怎么做某件具体的事）。带着"我想做 X"来的话，从
@@ -26,7 +26,7 @@
 
 ## 按读者画像选路
 
-**① 第一次用 lnn。** 根目录 [`README.md`](../../README.md)（中文版
+**① 第一次用 LNN。** 根目录 [`README.md`](../../README.md)（中文版
 [`README_zh.md`](../../README_zh.md)）的快速上手（可复制即运行）→
 [training.md](training.md)（循环及其纪律）→ [cookbook.md](cookbook.md)
 前三条食谱（最小回路、optimizer 加裁剪、梯度累积）。读完即可开始
@@ -39,7 +39,7 @@
 §10。
 
 **③ 从 ncps / PyTorch 迁移。** [ltc.md](ltc.md) 与 [cfc.md](cfc.md)
-（「与 ncps 参考实现的关系」表把每个 ncps 概念映射到 lnn 对应物
+（「与 ncps 参考实现的关系」表把每个 ncps 概念映射到 LNN 对应物
 ——`elapsed_time` → `ts`、`implicit_param_constraints` → softplus、
 默认区间逐字采用）→ [shapes-and-broadcasting.md](shapes-and-broadcasting.md)
 （广播是*枚举子集*，不是 NumPy 的；归约形状不对称——迁移者最先

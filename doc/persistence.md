@@ -598,7 +598,7 @@ are IEEE-754 `float32`, little-endian.
 
 | field | type | notes |
 |---|---|---|
-| magic | `[4]byte` | exactly `L N N S`; anything else is "not an lnn tensor stream" |
+| magic | `[4]byte` | exactly `L N N S`; anything else is "not an LNN tensor stream" |
 | version | `uint8` | `1` (the exported `serialize.Version`); other values are rejected |
 | count | `uint32` | number of tensors; the stream encodes *exactly* this many — trailing bytes after the last payload are rejected as corruption |
 | then, `count` times: rank | `uint8` | `0 ≤ rank ≤ 8` |

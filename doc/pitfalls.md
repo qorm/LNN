@@ -8,9 +8,9 @@ contract, `float32` overflow, exact repeated-`Backward` semantics, the
 untrusted-stream contract of the persistence layer, and the
 technical-debt roadmap.
 
-**Audience:** read this before shipping anything on lnn.
+**Audience:** read this before shipping anything on LNN.
 
-## 1. lnn is single-threaded by design
+## 1. LNN is single-threaded by design
 
 `Backward` mutates the `Grad` buffers of leaf variables with plain
 `+=` and no synchronization (`autograd/variable.go`); tensors expose their

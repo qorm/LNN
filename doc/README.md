@@ -1,8 +1,8 @@
-# lnn documentation
+# LNN documentation
 
 > English | [中文](zh/README.md)
 
-Engineer-oriented guides for building on the `lnn` library. API details are
+Engineer-oriented guides for building on the `LNN` library. API details are
 in the godoc of each package (`go doc github.com/qorm/LNN/tensor`,
 `go doc github.com/qorm/LNN/autograd`, `go doc github.com/qorm/LNN/nn`,
 `go doc github.com/qorm/LNN/optimizer`, `go doc github.com/qorm/LNN/serialize`); these guides cover the concepts,
@@ -33,7 +33,7 @@ A complete Simplified Chinese mirror of these guides lives in [`zh/`](zh/README.
 
 ## Pick your path
 
-**① First time with lnn.** Root [`README.md`](../README.md) quick start
+**① First time with LNN.** Root [`README.md`](../README.md) quick start
 (copy-paste runnable) → [training.md](training.md) (the loop and its
 disciplines) → [cookbook.md](cookbook.md) recipes 1–3 (minimal loop,
 optimizer + clipping, gradient accumulation). You can train after this.
@@ -48,7 +48,7 @@ files from strangers.
 
 **③ Migrating from ncps / PyTorch.** [ltc.md](ltc.md) and
 [cfc.md](cfc.md) (the "Relation to the ncps reference" tables map each
-ncps concept to its lnn counterpart — `elapsed_time` → `ts`,
+ncps concept to its LNN counterpart — `elapsed_time` → `ts`,
 `implicit_param_constraints` → softplus, defaults adopted verbatim) →
 [shapes-and-broadcasting.md](shapes-and-broadcasting.md) (broadcasting
 is an *enumerated subset*, not NumPy's; reduction shapes are

@@ -17,7 +17,7 @@ import (
 )
 
 func main() {
-	path := filepath.Join(os.TempDir(), "hello-lnn-model.lnns")
+	path := filepath.Join(os.TempDir(), "hello-LNN-model.lnns")
 
 	// 1. Open the saved model.
 	f, err := os.Open(path)

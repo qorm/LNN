@@ -199,7 +199,7 @@ ys, hN := nn.Unroll(cell, []*autograd.Variable{x, x, x}, nil, 0.1)
 
 ## 与 ncps 参考实现的关系
 
-| ncps 概念 | lnn 对应 |
+| ncps 概念 | LNN 对应 |
 |---|---|
 | 带 `units`、`unfolds`（默认 6）的 LTC 层 | `NewLTC(inDim, units, wiring, unfolds, rng)` |
 | ODE 求解器：`unfolds` 个子步上的半隐式欧拉 | 相同方案（`Step` 循环，`nn/ltc.go:324-329`） |

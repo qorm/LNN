@@ -52,7 +52,7 @@ v_new = A + (v − A)·e^{−κ·ts},   κ = G/cm
 
 ## Algorithm 1：把 LTC 编译为闭式
 
-论文的 Algorithm 1 把 LTC 逐突触编译成闭式更新，允许任意稀疏邻接。lnn 以 LTC 所用的同一套稀疏收缩（sparse contraction）与之同构：`drive()`（`nn/cfc.go:274-291`）为每个突触前神经元 `i` 构建一个 `[batch, units]` 激活块——以接线（wiring）掩码（mask）第 `i` 行门控的「列⊙行」外积——`contract`（`nn/cfc.go:307-323`）以 `+0` 播种的升序折叠（fold）收缩突触前轴：分母折叠各块，分子折叠按反转电位行加权的各块，二者都以与 units×units 单位阵的 MatMul 收尾。常量 `±1` 反转电位由共享 `erev`/`sErev` 存储的行视图常量承载（`erevRowViews`，与 `ltc.go` 共享），从不以叶节点入图。该收缩与 LTC 的 `contract` 逐行同构——同样四条约束、同一份逐位等价证明（见 [ltc.md](ltc.md) 稀疏收缩一节）——`±0` 角落也相同：全掩蔽突触后列落在 `+0` 而非旧 `Add` 链的 `−0`（下游不可观测，`(±0)² = +0`）；多源反向把零梯度归一为 `+0`；单源角落（`inDim = 1` 或 `units = 1`、零值梯度、`erev = −1`）可令零梯度携带 `−0`——值为 0 且不可观测，红队对 CfC 的全扫描未测出轨迹分歧。由于电位是行视图而非图叶，`erev`/`sErev` 完全不再入图——死梯度从结构上消失，而不仅仅为零。约定与二值接线掩码都沿用 LTC，因此 `NewCfC(inDim, units, wiring, rng)` 接受的 `Wiring` 拓扑与 `NewLTC` 完全相同（`nil` 即全连接）。
+论文的 Algorithm 1 把 LTC 逐突触编译成闭式更新，允许任意稀疏邻接。LNN 以 LTC 所用的同一套稀疏收缩（sparse contraction）与之同构：`drive()`（`nn/cfc.go:274-291`）为每个突触前神经元 `i` 构建一个 `[batch, units]` 激活块——以接线（wiring）掩码（mask）第 `i` 行门控的「列⊙行」外积——`contract`（`nn/cfc.go:307-323`）以 `+0` 播种的升序折叠（fold）收缩突触前轴：分母折叠各块，分子折叠按反转电位行加权的各块，二者都以与 units×units 单位阵的 MatMul 收尾。常量 `±1` 反转电位由共享 `erev`/`sErev` 存储的行视图常量承载（`erevRowViews`，与 `ltc.go` 共享），从不以叶节点入图。该收缩与 LTC 的 `contract` 逐行同构——同样四条约束、同一份逐位等价证明（见 [ltc.md](ltc.md) 稀疏收缩一节）——`±0` 角落也相同：全掩蔽突触后列落在 `+0` 而非旧 `Add` 链的 `−0`（下游不可观测，`(±0)² = +0`）；多源反向把零梯度归一为 `+0`；单源角落（`inDim = 1` 或 `units = 1`、零值梯度、`erev = −1`）可令零梯度携带 `−0`——值为 0 且不可观测，红队对 CfC 的全扫描未测出轨迹分歧。由于电位是行视图而非图叶，`erev`/`sErev` 完全不再入图——死梯度从结构上消失，而不仅仅为零。约定与二值接线掩码都沿用 LTC，因此 `NewCfC(inDim, units, wiring, rng)` 接受的 `Wiring` 拓扑与 `NewLTC` 完全相同（`nil` 即全连接）。
 
 ## 与 LTC 的关系：同一 ODE，两种积分器
 

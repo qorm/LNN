@@ -1,6 +1,6 @@
 > [English](README.md) | 中文
 
-# lnn
+# LNN
 
 [![CI](https://github.com/qorm/LNN/actions/workflows/ci.yml/badge.svg)](https://github.com/qorm/LNN/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/qorm/LNN.svg)](https://pkg.go.dev/github.com/qorm/LNN)
@@ -9,7 +9,7 @@
 [Liquid Time-constant Networks](https://ojs.aaai.org/index.php/AAAI/article/view/17017)
 （AAAI 2021）及参考实现 [`mlech26l/ncps`](https://github.com/mlech26l/ncps)。
 
-lnn 小而显式。它宁可牺牲覆盖面，也要保证内核可读、可审计：没有代码生成，没有 GPU 后端，没有运算符重载技巧——只有 Go。
+LNN 小而显式。它宁可牺牲覆盖面，也要保证内核可读、可审计：没有代码生成，没有 GPU 后端，没有运算符重载技巧——只有 Go。
 
 ## 包结构
 
@@ -204,7 +204,7 @@ out2, h2 := cfc.Step(x, nil, 0.1)
 
 ## 并发契约
 
-**lnn 在设计上是单线程的。**
+**LNN 在设计上是单线程的。**
 
 - `Backward` 会修改叶变量的 `Grad` 缓冲区；在共享参数的变量上并发运行它属于数据竞争（data race），会丢失或损坏梯度（已在 `go test -race` 下实证）。
 - `Variable` 和 `Tensor` 直接暴露其存储（`Data`），且不带任何同步机制。不要从多个 goroutine 读写同一个张量。
@@ -230,7 +230,7 @@ CfC（Closed-form Continuous-time）细胞与内置优化器是最新加入的�
 
 ## 致谢
 
-lnn 是在液态神经网络（Liquid Neural Networks）研究成果之上独立重写的 Go 实现。诚挚感谢：
+LNN 是在液态神经网络（Liquid Neural Networks）研究成果之上独立重写的 Go 实现。诚挚感谢：
 
 - **Ramin Hasani、Mathias Lechner、Alexander Amini、Daniela Rus、Radu Grosu**——液态时间常数网络（AAAI 2021）与闭式连续时间神经网络（《自然·机器智能》4, 992–1003, 2022）的作者，本库实现的方程即出自这两篇论文；
 - **Mathias Lechner** 与 [`mlech26l/ncps`](https://github.com/mlech26l/ncps) 参考实现——本库 LTC 与接线语义的对照基准；

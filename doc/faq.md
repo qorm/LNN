@@ -1,4 +1,4 @@
-# lnn FAQ
+# LNN FAQ
 
 > English | [中文](zh/faq.md)
 
@@ -247,7 +247,7 @@ panic), and the message tells you the bucket. Read the prefix:
 | message | meaning | action |
 |---|---|---|
 | `nn: stream holds model kind 1 (CfC), not LTC (kind 0)` | wrong loader for this file | use `nn.LoadCfC` — the message names what the file actually is |
-| `serialize: bad magic … not an lnn tensor stream` | not an lnn file at all | check you pointed at the right file |
+| `serialize: bad magic … not an LNN tensor stream` | not an LNN file at all | check you pointed at the right file |
 | `serialize: unsupported format version 99 (this build reads version 1): … newer version …` | written by a newer library | update the library |
 | `…: no earlier layout exists, the stream is corrupt or forged` | version byte below 1 | corruption — reject |
 | `…: truncated stream: claims N data bytes but only M remain: unexpected EOF` | file cut short (match with `errors.Is(err, io.ErrUnexpectedEOF)`) | re-transfer; a failing load left your model untouched |

@@ -1,8 +1,8 @@
-# Training models with lnn
+# Training models with LNN
 
 > English | [中文](zh/training.md)
 
-**Summary:** training with lnn is a four-phase loop (zero grads → forward
+**Summary:** training with LNN is a four-phase loop (zero grads → forward
 → `Backward` → parameter update) over `Parameters()`, and you own
 stability (learning rate and gradient clipping). The update phase is
 either five hand-rolled lines of Go — the basis for understanding the

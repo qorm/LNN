@@ -79,7 +79,7 @@
 //
 // # Concurrency
 //
-// lnn is single-threaded by design. Backward mutates the Grad buffers of a
+// LNN is single-threaded by design. Backward mutates the Grad buffers of a
 // graph's leaf variables without synchronization, so running it
 // concurrently on variables that share parameters is a data race that loses
 // or corrupts gradients (verified under go test -race). Never share a
