@@ -20,7 +20,7 @@
 | 10 | API 稳定窗口：fuzzing 基建 + API 决策实施 → v0.4.0 | ✅ 完成（v0.4.0 已发布，CI 双绿含 fuzz 冒烟跨平台首跑） |
 | 11 | 发布打磨：上手审计 + 长时 fuzz 浸泡 + GitHub Releases + pkg.go.dev 验证 | ✅ 完成（1.3 亿次 fuzz 零失败 · 新手审计零阻断 · 六版 Releases · pkg.go.dev 上线） |
 | 12 | 覆盖率净化至诚实终值 | ✅ 完成（v0.4.1：四包正当 100.0% + optimizer 99.6% 诚实残余 1/231） |
-| 13 | 文档完善：cookbook 任务式食谱 + FAQ + examples 扩充 + godoc 逐符号审计 + api.md 速查（双语） | 🔄 进行中（D1/D2/D3 三路已派发） |
+| 13 | 文档完善：cookbook 任务式食谱 + FAQ + examples 扩充 + godoc 逐符号审计 + api.md 速查（双语） | ✅ 完成 |
 
 ## 阶段 1：并行分析（已完成）
 
@@ -413,7 +413,14 @@ Git 历史：`87ccf77` 基线 → `08aba45` 阶段3a → `102af40` 阶段3b → 
 - 2026-07-31：**R-B 长时 fuzz 浸泡（arm64 异架构补充 CI amd64）**：8 目标×120s = **130,023,708 次执行、零 panic 零断言失败零超时**；深度差比执行倍数更关键——ODE 类目标新覆盖 **88-89% 在 CI 30s 窗口之后**发现（LoadLTC 8/9 条、LoadCfC 7/8 条新语料需穿越首个积分停滞墙，60-120s 区间），浸泡首次把两目标推进到多墙之后覆盖区且零失败；autograd 目标 1,854 万次执行 corpus 零增长（202 种子完全饱和、抵消残差处理无泄漏）；浸泡后五包全量测试全绿、仓库语料 7→7 零扰动。**裁决：发布态在亿级规模下稳健**
 - 2026-07-31：前十一个阶段关闭
 - 2026-07-31：阶段 12 覆盖率净化（用户要求"都做到 100%"）——逐行三分类处置 7 处残余：**A 类**删除 broadcastBinary 死循环（附完整不可达证明：default 臂 ⟹ 两操作数 ∈{scalar,col} ⟹ 逐臂归纳输出第二维恒 1 ⟹ `j<cols` 永假，独立复核并扩展 Q-B 证明至任意 rank）；**B 类** SaveState 守卫重构为纯函数 `countToUint32`（边界 2³²−1/2³²/MaxInt64/负值全钉死，错误消息逐字节保持）；**C 类** 补 5 处实质测试（useShape 堆回退白盒指针断言、Reshape 负维 panic、lyingLen 读端中途失败、空流头写入失败、count 截断）。**终值：tensor 100.0 / autograd 100.0 / nn 100.0 / serialize 100.0 / optimizer 99.6（230/231）**——唯一残余为 SaveState 错误包装语句，**物理不可测**（需 >4.29G 元素切片 = 32GiB 指针阵 + 数百 GB 张量）且**不可删**（64 位 Go 理论允许超长切片，删除后 uint32 截断会使流计数说谎——正是线格式契约要防的腐败），判定语义已经纯函数 100% 覆盖，残余仅无法执行的那一次 return。此为诚实终值，不凑数
-- 2026-07-31：**发布 v0.4.1**（tag + 推送 + 注释化 Release；主控独立复验覆盖率数字与报告逐项吻合）。**全部十二个阶段关闭**。项目终态：五包发布库（github.com/qorm/LNN，pkg.go.dev 上线，CI 含 fuzz 冒烟，7 版 Releases）、六轮红队+新手审计+1.3 亿次 fuzz 浸泡、双语指南 16 篇、覆盖率 **100/100/100/100/99.6（诚实终值）**、34 个 agent。留档余项全部接受风险/信息级（领衔候选 parents 定长槽化，低优先）；**后续价值增量需 LNN 主项目需求输入（特性轨）**
+- 2026-07-31：**发布 v0.4.1**（tag + 推送 + 注释化 Release；主控独立复验覆盖率数字与报告逐项吻合）。前十二个阶段关闭
+- 2026-07-31：阶段 13 文档完善（库主要求"尽量完善、便捷易用" + "训练和使用示例都要有，最简方式"）四路交付：
+  - **D1 cookbook + FAQ + 导引**：`doc/cookbook.md`（及 zh）**12 条任务式食谱**（最小回路/optimizer+裁剪/梯度累积/断点续训/事件驱动变 ts/模型检查/自定义损失/LTC vs CfC 选型/多层组合/安全加载/学习率退火/确定性复现）——**每段代码 /tmp 独立模块实测、EN 文档程序块与实测程序逐字节一致、输出逐字嵌入**（续训食谱 100 步逐位等于不间断训练、变 ts 食谱 13 参数 BPTT 有限、掩码 MSE 对离群稳健而朴素 MSE 被拖垮等关键结论皆有实测背书）；`doc/faq.md`（及 zh）11 问（NaN 永久毒化实测、ts 弛豫实测表、92·U² 成本表、跨平台 ULP 分级表、6 行错误消息解读表）；doc/README（及 zh）**按读者画像四路选路**（第一次用/部署/ncps 迁移/审计贡献）
+  - **D2 进阶示例**：`examples/ltc-resume`（三幕：训练→保存模型+读出+Adam 状态三流→异种子加载逐位一致→续训 60 步与不间断 120 步**逐步 loss 逐位相等**）；`examples/gradient-inspect`（每参数梯度范数/NaN 计数/参数变化量/同轮裁剪前后对比 + 头部诊断解读指南）
+  - **D2b 入门示例对**（库主"最简方式"要求）：`examples/hello-train`（单细胞 CfC(1,1) 拟合 y=2x+1，编号注释步步讲解，loss 2.65→0.0039；实测暴露的 sigmoid 线性区限制与种子敏感性**诚实写入注释**）+ `examples/hello-use`（零训练代码纯消费：加载→前向→预测 vs 真值对照，含区间外外推漂移点明）；README examples 段双语重组为**入门→完整训练→进阶**难度梯度
+  - **D3 godoc 审计 + api.md**：**128 个顶层导出符号 + 6 字段逐一回源审计、94 处补全**（用途/形状/panic/error/契约体例统一）、**5 处行为纠偏**（Var 不拷贝别名契约、Reshape 不校验元素总数、SumToShape 标量分支语义、2D-only 清单漏列、FromRows 等 panic 契约）、3 处重复包注释去重；`doc/api.md`（及 zh）双语速查——82 符号行×2 签名列逐字符相同、122 个 pkg.go.dev 锚点全验；零代码变更以"剥离注释归一 diff"守恒证明
+  - **主控终局核验**：D3 移交缺口全补（shapes 表补 MatMulTransA/B 双语、doc/README godoc 入口补 optimizer 双语）；zh README 训练配方链接修正至 cookbook；EN README 补 cookbook 指引；**全文档链接零断链**、hello 链串联实测通过（x=0.35 预测 1.701≈真值 1.70）、五包测试绿
+- 2026-07-31：**阶段 13 关闭**。文档终态：双语指南 **22 篇**（概念 7×2 + cookbook×2 + faq×2 + api×2）+ 五包完整 godoc + **6 个难度梯度 examples**（hello×2/训练×2/进阶×2）+ README 三档导引。全部十三个阶段关闭、38 个 agent。文档纪律全程：代码示例全部实测、输出逐字嵌入、断言回源核对
 - 2026-07-31：阶段 10 启动——Q-A fuzzing 基建完成（8 目标 × 96 手工种子 + 7 条沉淀回归语料，本机 1.3–3.6M 执行/10s 全 0 panic，发现全部为 oracle 校准问题非库缺陷）+ Q-B API 设计评估备忘完成（主仓库零写入 + /tmp 原型实测四项：#12 内嵌 backing −18~−26% allocs 而墙钟 ±2% 噪声内持平 / #3 统一成本量化 / Stack 零调用 / SumToShapeTake 5 内部调用点）；**用户拍板四项全采纳推荐**（#12② 内嵌 backing / #3 冻结 + 强化文档 / Stack 删除 / SumToShapeTake 内移 autograd，组合外部破坏面 0）
 - 2026-07-31：**10b API 决策实施完成**（外部破坏面 0）：shapeBuf [4]int 内嵌 + useShape 单一收口 + 导出 Reshape（唯一 API 新增，含负维校验）；Stack 函数/测试/Q-A 三探针全删（留 tombstone）；SumToShapeTake 内移 autograd 非导出（语义+契约+panic 文案逐字保持，5 调用点重路由）。五基准 allocs −17.9%~−25.8%（本机复验终值 LTCStep 2,707 / UnrollBackward 31,994，累计 −63%/−73%），墙钟持平、字节 +3%；门禁五绿（两 example 逐字 / 五包 -race / 断言 diff 空 / fuzz-smoke 8 目标 / go doc 四符号核验）
 - 2026-07-31：**10c 双语文档同步完成**（Q-B §5 文档清单五项 + 10b 同步，14 文件双语同构）：Stack 文档四处清除（tensor/doc.go panic 列表 + pitfalls/shapes 双版）、SumToShapeTake 内移同步（architecture 所有权节 + shapes 归约节）、#12 决策留档（architecture 性能节新增「内嵌形状 backing」专节 + pitfalls 路线图表）、#3 冻结留档（shapes 诚实专节补决策依据 + SumRows/SumCols godoc 各补不对称指引）、README 双版阶段 10 语境 + 领衔改写；行号回源 44 处（autograd/ops.go 漂移修正 4 处：Div 793-810→829-846、GatherRows 855→891；nn 引用零漂移全验）。终检全绿：gofmt 空 / build / vet / test 五包 / 零断链 / .go 非注释行 diff 空自证。**v0.4.0 文档关口闭合，待打 tag**
