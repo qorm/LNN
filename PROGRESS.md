@@ -16,6 +16,7 @@
 | 6 | 双轨扩展：特性（optimizer/CfC）+ 性能（热路径向量化） | ✅ 完成 |
 | 7 | 双轨再进：序列化特性 + autograd 深改 + 发布 | ✅ 完成 |
 | 8 | v0.2 双轨：融合反向 + 序列化版本化 → 覆盖率收复 → 红队总扫 → v0.2.0 | ✅ 完成（v0.2.0→v0.2.2：CI 跨平台红灯两轮修复后双绿） |
+| 9 | v0.3 双轨：#14 稀疏收缩（根因修复）+ 优化器状态持久化 → 红队 → v0.3.0 | 🔄 进行中（9a ✅ / 9b 红队已派发） |
 
 ## 阶段 1：并行分析（已完成）
 
@@ -208,6 +209,21 @@
 **⚠️ 主控更正**：前条 P-B 摘要中"96,000 图严格 == 零失败（含 ±0）"的表述**仅在实施方生成器覆盖域内成立**——红队以异源生成器在 1D 怪癖×广播组合与 NaN 梯域发现 F1-F3。P-B 的门禁机制本身有效（负对照可侦测、确曾拦截 FMA 与升维两缺陷），短板在覆盖域；教训：差分 fuzz 的裁决力不超过生成器的想象力，异源生成器交叉是必需而非可选
 
 **红队·序列化组（已完成）**：7,500 变异体（位翻转/删除/插入/块交换，25% 叠连击）**0 panic / 0 静默错乱**（黑盒 oracle 重序列化核验掩码二值/形状/Step 健全；7 例"ok 垃圾入参"均为参数含 NaN/Inf 的忠实复现）；语义攻击全挡（张量顺序偷换/掩码注入 0.5/−1/2/NaN/跨 kind/未知 kind/version 0·2·99·255/UTF-16/大端伪流）；错误全透传（写端每个截断点、读端多偏移）；round-trip **训练动力学逐位等价**（加载后再训练 3 步的参数轨迹与同步训练锁死、种子无关）。**资源耗尽维度不安全**：F1 Medium——**无 Len() 读端**（网络/管道/gzip）绕过剩余字节守卫，~20 字节截断流逼出 64MiB～**4GiB** 分配（make 在读之前）；F2 Medium——`unfolds` 无上限，1<<20 展开 2.26s、1<<30 外推单次 Step ~38 分钟 CPU 耗尽（CfC 免疫）；F3 Low——count=maxCount−1 强分 8MiB 指针切片；F4 Low——加载不校验 erev∈{±1}（可造 NewLTC 永不能产生的细胞）；F5 Info——LoadParameters 保留陈旧 Grad 未文档化；F6 Info——限额私有且包注释"绝不无界分配"措辞掩盖 F1。**裁决：panic/语义维度安全，资源耗尽维度需补防——已派发修复（发布前置条件）**
+
+**P-D（稀疏收缩，留档 #14 头牌销账，已完成）**：以「+0 种子升序折叠 + 末端单位阵 MatMul 归一」取代稠密 [units²,units] 指示阵（ltc.go:476-494 contract + cfc.go:301-317 同构）。
+- **次序等价四约束逐条落实**：①每 j 项表 i 升序（构造期两遍掩码扫描，掩蔽块恒 +0 为加法单位元有证明 ltc.go:443-449）；②Hadamard(blocks[i], erevRows[i]) 左右次序与 MatMul av·brow 一致；③av==0 跳零由**末端真实 MatMulTransB 的跳零分支**复现（纯 Add 链反向无法归一 −0 梯度——保留真 MatMul 的根因，以 outW=0+零 wiring 可构造触发角）；④zeroV 标量 +0 播种折叠复刻新缓冲全零起始
+- **oracle 差分 1164 组全部 Float32bits 零差异**（门禁 ≥30 的 39 倍；LTC/CfC × 全连/p=0/0.3/0.7 × units{1,2,4,8} × ts{0.1,1e-5,2.5} × h0/batch 组合 + 12 组 zero(outW)+零 wiring 反向跳零对抗角；oracle = git show 1047481 发布版）
+- **内存悬崖消除**：units=1024 构造 **36.3 MiB（LTC）/ 32.3 MiB（CfC）** vs 旧 8 GiB 指示阵（< 128 MiB 门禁 3.5× 余量）；持久态 7·U²·4B 量级（doc 推导入注释）；plan 项数 == 掩码非零数、逐列升序断言
+- **maxUnits 重推 256→2048**：新模型峰值 92·U² B，U=2048 ≈ 368 MiB（与旧制 256 的 ~320 MiB **同预算级、8× 容量**）；F1"按交付字节比例分配"契约由根因兑现（最小攻击流交付 ~20U²、峰值 ~1.5× 交付量）；U=4096 jetsam PoC 仍 ~1.4 GiB 故上限保留；AtLimit 测试升至 units=2048 真实 round-trip（84 MB blob，0.53s）；旧三档拒绝门禁不弱化（<1 MiB 拒绝）；附带删除加载期 reversalIndicator 64 MiB 瞬态重建
+- **性能诚实披露（预期落空但净受益）**：allocs/op **上升**（LTCStep +43%、UnrollBackward +30%，源自折叠每级 opAdd b 分支克隆）——我工单预期"中性或略降"错了；但 **ns/op 下降 15.6%/10.5%**，因消灭了稠密 MatMul 对指示阵零行的 O(units³) 空转内层循环与反向大分配。**分配次数换走了无用算力，墙钟净受益**——如实记录而非粉饰
+- **F-RT1 ±0 保留证据**：全掩蔽列（erev 全 −1 最恶符号角）num/den 逐批 Float32bits == 0x00000000（+0）非 −0，反向掩蔽 w 梯度 +0；oracle 矩阵含 p=0 全掩蔽 ×8 组合逐位零差异；机制注释明书"av==0 跳零为 F-RT1 来源，刻意保留不得顺手修正"
+- **偏离披露**：3 个测试文件（ltc_fused/coverage_recover/save_test）因直接引用被消灭的内部表示（denReduceR 字段等）做最小编译性编辑，数值意图保持或增强（legacy oracle 稠密阵降为测试内局部构造；"指示阵重焙"断言换为"erev 行视图逐行承载流送极性"逐位断言）；既有 exact/sameBitsT 数值断言一字未动；nn 覆盖率保持 100%、两 example 逐字
+
+**F-G（优化器状态持久化，已完成）**：新建 optimizer/state.go（510 行）+ state_test.go（968 行，22 测试），覆盖率 **99.6%**（唯一未覆盖为物理不可达守卫 params>2³²，列明不强凑）。
+- **格式**：`"LNO1"` 魔数 + version + **kind 字节**（0=SGD/1=Momentum/2=Adam）+ count + 存在性记录段 + **单个 serialize 张量 blob**（刻意复用已红队审计的张量纪律——嵌套复合不可行因 ReadTensors 自定界拒尾字节，设计取舍已论证）。SGD 恒为 19 字节自洽空流；Momentum 每 present 参数一个 velocity；Adam 每 present 参数 m/v + **t/pow1/pow2 逐位保存**
+- **核心验收——续训逐位等价**：50 步→检查点→全新对象续训 50 步 vs 不间断 100 步，第 51-100 步**逐参数逐位（Float32bits）轨迹 + 逐步 loss 逐位**，三优化器全过（Adam 终损 7.10e-6/Momentum 8.52e-5/SGD 6.60e-7，位模式钉死）
+- **不可信流纪律**：validate-all-then-apply（失败加载后 velocity/m/v/t/pow 逐位零改动，parameter 0 不受 parameter 1 失败牵连）；14 类对抗流全 error 零 panic（kind 互载 6 对、未知 kind、bad magic、version 0/99 方向分流、count 双向不符、存在性=2、形状三路径、**pow 位翻转兼作 β 超参错配探测器**——一石二鸟、t 超限 blob 前拒绝、截断 ×6 ErrUnexpectedEOF、尾字节、blob 张量数、I/O 透传）；字节预算双门禁：29 字节恶意流仅分配 **352 B**、10 字节巨 count 流 276 B
+- **设计取舍**：pow 逐位保存（免跨版本舍入假设）+ 加载端 betaPow 复刻 Step 连乘逐位重算校验；陈旧键保留披露（与 LoadParameters 陈旧 Grad 契约同款诚实）；maxT=2²⁴ load-only 限额（同 maxUnfolds/maxUnits 加载面论证）；nil-map 延迟初始化、缓冲零拷贝移交
 
 **8d 双语文档同步（已完成）**：12 个 .md 文件（+292/−104），五工单全双语落地经回源+/tmp 实测双重核验：
 - **F2**：pitfalls §2 补 NaN 对 Momentum/Adam 矩估计**永久毒化**（ZeroGrad 无效——毒在优化器缓冲不在 Grad；须重建优化器，引红队 60 轮实测）；MatMul 跳零补方向性（只测左操作数：0×NaN→0 而 NaN×0→NaN，回源 tensor/ops.go:20 确认）——pitfalls 与 architecture 双处

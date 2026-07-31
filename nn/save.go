@@ -80,42 +80,71 @@ const (
 const maxUnfolds = 1024
 
 // maxUnits and maxInDim cap the units and inDim values LoadLTC and LoadCfC
-// accept from a stream. Value: 256 each. The constructors materialize the
-// synaptic reduction indicators as dense [pre*units, units] matrices
-// (sumIndicator/reversalIndicator in ltc.go): two of units^3 float32s on the
+// accept from a stream. Value: 2048 each (raised from 256 by the item-#14
+// sparse contraction; the F1 history and the original 256 derivation are
+// kept below).
+//
+// # History: the 256 cap (red team sweep F1, the v0.2.0 release blocker)
+//
+// The constructors used to materialize the synaptic reduction indicators as
+// dense [pre*units, units] matrices: two of units^3 float32s on the
 // recurrent side and two of inDim*units^2 on the sensory side, so load-time
-// memory is O(units^3) while the header that controls it is only 9-13
-// bytes. Quantified at the caps (units = inDim = 256):
+// memory was O(units^3) while the header that controls it is only 9-13
+// bytes. Quantified at the old caps (units = inDim = 256):
 //
 //	persistent  2*(units^3 + inDim*units^2)*4B = 2*(256^3 + 256*256^2)*4B
 //	            = 256 MiB of indicator matrices per loaded cell
-//	transient   plus one indicator rebuild while Load re-bakes the numerator
+//	transient   plus one indicator rebuild while Load re-baked the numerator
 //	            indicators from the streamed polarities: at most
 //	            max(units^3, inDim*units^2)*4B = 64 MiB, freed right after
 //	            the copy — a bounded worst-case peak of ~320 MiB.
 //
-// Before these caps, the v0.2.0 red team sweep (F1, the release blocker)
-// loaded a legal units=512 stream (5 MB of delivered bytes) at the cost of
-// 1,560 MB of allocations (311x amplification), and a minimal units=4096
-// attack stream made the process attempt 2*4096^3*4B ≈ 550 GB of recurrent
-// indicators until the operating system killed it outright — worse than a
-// panic, and a direct breach of this file's and the serialize package's
-// contract that a hostile stream allocates only in proportion to the bytes
-// it actually delivers. units and inDim were the twin face maxUnfolds had
-// already covered for the time axis.
+// Before these caps, F1 loaded a legal units=512 stream (5 MB of delivered
+// bytes) at the cost of 1,560 MB of allocations (311x amplification), and a
+// minimal units=4096 attack stream made the process attempt
+// 2*4096^3*4B ≈ 550 GB of recurrent indicators until the operating system
+// killed it outright — worse than a panic, and a direct breach of this
+// file's and the serialize package's contract that a hostile stream
+// allocates only in proportion to the bytes it actually delivers. units and
+// inDim were the twin face maxUnfolds had already covered for the time
+// axis.
+//
+// # Re-derivation after item #14 (sparse contraction)
+//
+// The root-cause fix (item #14) replaced the dense indicators with the
+// sparse fold of ltc.go's contract: no [units^2, units] tensor is ever
+// materialized, in the constructor OR the load path (the transient indicator
+// rebuild above is gone too — the numerator coefficients are row views of
+// the streamed erev storage). Load-time memory is now O(units^2), dominated
+// by the parameter matrices the stream itself delivers. Worst case, fully
+// wired, with U = units = inDim (the largest legitimate header):
+//
+//	stream   masks 2 + mu/sigma/w 3 + sMu/sSigma/sW 3 + erev/sErev 2
+//	         = 10*U^2 float32 resident as the parsed tensors  = 40*U^2 B
+//	cell     the same 10*U^2 parameters and masks, plus the ident
+//	         identity U^2 and the two wiring plans 2*U^2 int32
+//	         = 52*U^2 B
+//	peak     stream + cell held together during copyFields
+//	         = 92*U^2 B = 92*2048^2 B ≈ 368 MiB at the cap
+//
+// — the same ~320 MiB budget class as the old regime at units=256, with 8x
+// the capacity. A minimal attack stream (inDim = 1) delivers ~20*U^2 bytes
+// and peaks at ~1.5x that: allocation stays in proportion to delivered
+// bytes, the F1 contract now honored at the root rather than bandaged.
+// units=4096 (the old jetsam PoC) would still peak at ~1.4 GiB, so the cap
+// stays — the header check still fires before the blob is parsed — but at
+// 2048 instead of 256.
 //
 // Like maxUnfolds, the caps are deliberately load-only: NewLTC/NewCfC's
 // runtime contracts are unchanged (dims >= 1 remains the only requirement),
 // because a constructor's inputs come from the caller's own code — an
-// extreme size there is the caller's own allocation decision — while a
-// load's input is an untrusted byte stream that gets no vote on its own
-// resource budget. The root-level fix — sparse contractions that never
-// materialize the [units^2, units] indicators at all — is tracked in the
-// project's technical-debt log (item #14); these caps close the load side
-// in the meantime.
+// extreme size there is the caller's own allocation decision (and with the
+// sparse contraction a units=1024 fully-wired constructor costs ~32 MB, not
+// the old ~8 GiB cliff) — while a load's input is an untrusted byte stream
+// that gets no vote on its own resource budget.
 const (
-	maxUnits = 256
-	maxInDim = 256
+	maxUnits = 2048
+	maxInDim = 2048
 )
 
 // headerWriter writes the kind byte and the int32 header fields, capturing
@@ -305,7 +334,7 @@ func SaveLTC(w io.Writer, c *LTC) error {
 // for the same input and state, Step produces bit-identical outputs. Any
 // corruption, version skew, truncation or cross-model stream is an error, as
 // is an unfolds value above the load limit maxUnfolds (1024) or a units or
-// inDim value above maxUnits / maxInDim (256 each).
+// inDim value above maxUnits / maxInDim (2048 each).
 func LoadLTC(r io.Reader) (*LTC, error) {
 	hr := &headerReader{r: r}
 	if err := readKind(hr, kindLTC); err != nil {
@@ -324,8 +353,8 @@ func LoadLTC(r io.Reader) (*LTC, error) {
 	// All three size claims are checked before the blob is even parsed, so
 	// a hostile header cannot bill any parsing or construction work:
 	// unfolds would become a CPU-exhaustion loop (see maxUnfolds), and
-	// units/inDim would become O(units^3) indicator allocations the moment
-	// the cell is built (see maxUnits/maxInDim, red team sweep F1).
+	// units/inDim would become O(units^2) parameter allocations far above
+	// the documented load budget (see maxUnits/maxInDim, red team sweep F1).
 	if unfolds > maxUnfolds {
 		return nil, fmt.Errorf("nn: LTC header has unfolds=%d, exceeding the load limit %d", unfolds, maxUnfolds)
 	}
@@ -365,11 +394,10 @@ func LoadLTC(r io.Reader) (*LTC, error) {
 	if err := copyFields(ts[2:], dsts); err != nil {
 		return nil, err
 	}
-	// The numerator reduction indicators were built by the constructor from
-	// its own (throwaway) reversal potentials; rebuild them in place from the
-	// loaded erev/sErev so the Step contraction uses the streamed polarities.
-	copy(cell.numReduceR.Data.Data, reversalIndicator(cell.erev.Data.Data, units, units).Data)
-	copy(cell.numReduceS.Data.Data, reversalIndicator(cell.sErev.Data.Data, inDim, units).Data)
+	// The numerator coefficients are row views sharing the erev/sErev Data
+	// arrays that copyFields just overwrote with the streamed polarities, so
+	// the contraction picks them up with no rebuild (the pre-#14 design
+	// re-materialized a dense [pre*units, units] indicator here).
 	return cell, nil
 }
 
@@ -403,11 +431,9 @@ func SaveCfC(w io.Writer, c *CfC) error {
 
 // LoadCfC reads a stream written by SaveCfC and returns an equivalent cell
 // with bit-identical Step behavior; a units or inDim value above the load
-// limits maxUnits / maxInDim (256 each) is an error, exactly as in LoadLTC.
-// As in LoadLTC, the constructor bakes the reversal potentials into the
-// numerator reduction indicators, so after overwriting the parameters,
-// erev/sErev and the wiring, the indicators are rebuilt in place from the
-// streamed polarities.
+// limits maxUnits / maxInDim (2048 each) is an error, exactly as in LoadLTC.
+// As in LoadLTC, the numerator coefficients are row views of the erev/sErev
+// storage, so overwriting the streamed polarities updates them in place.
 func LoadCfC(r io.Reader) (*CfC, error) {
 	hr := &headerReader{r: r}
 	if err := readKind(hr, kindCfC); err != nil {
@@ -421,7 +447,7 @@ func LoadCfC(r io.Reader) (*CfC, error) {
 		return nil, fmt.Errorf("nn: CfC header has invalid dims in=%d units=%d", inDim, units)
 	}
 	// Checked before the blob is even parsed, the same defense as LoadLTC:
-	// the CfC constructor materializes the same O(units^3) indicators, so a
+	// the CfC constructor bills the same O(units^2) parameter matrices, so a
 	// hostile header is refused before any parsing or construction work
 	// (see maxUnits/maxInDim, red team sweep F1).
 	if units > maxUnits {
@@ -457,12 +483,9 @@ func LoadCfC(r io.Reader) (*CfC, error) {
 	if err := copyFields(ts[2:], dsts); err != nil {
 		return nil, err
 	}
-	// The numerator reduction indicators were built by the constructor from
-	// its own (throwaway) reversal potentials; rebuild them in place from the
-	// loaded erev/sErev so the Step contraction uses the streamed polarities
-	// (same step as LoadLTC).
-	copy(cell.numReduceR.Data.Data, reversalIndicator(cell.erev.Data, units, units).Data)
-	copy(cell.numReduceS.Data.Data, reversalIndicator(cell.sErev.Data, inDim, units).Data)
+	// The numerator coefficients are row views sharing the erev/sErev Data
+	// arrays that copyFields just overwrote with the streamed polarities, so
+	// the contraction picks them up with no rebuild (same as LoadLTC).
 	return cell, nil
 }
 

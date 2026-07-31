@@ -31,8 +31,9 @@ func recoveredMsg(f func()) string {
 }
 
 // TestRecoverCfCSingleSourceShortcutBitExact covers drive()'s n == 1 leg:
-// with a single presynaptic source denReduce is the identity, so the
-// contraction is the block itself (den = flat) instead of a MatMul. A
+// with a single presynaptic source the denominator indicator is the
+// identity, so the contraction is the block itself (den = block) instead of
+// the fold-plus-identity-MatMul. A
 // inDim=1 / units=1 cell drives BOTH the sensory and the recurrent
 // contraction through the shortcut; each must stay bit-identical to the
 // legacy Add-of-Hadamards chain (the same oracle the n>1 regression uses),
@@ -48,9 +49,9 @@ func TestRecoverCfCSingleSourceShortcutBitExact(t *testing.T) {
 	wPos := autograd.Softplus(cell.w)
 
 	// n = 1 on both drives: sensory (pre cols = inDim) and recurrent
-	// (pre cols = units) both take the den = flat shortcut.
-	numS, denS := cell.drive(inputs, cell.sMu, cell.sSigma, sWPos, cell.denReduceS, cell.numReduceS, cell.wiring.SensoryRow)
-	numR, denR := cell.drive(h, cell.mu, cell.sigma, wPos, cell.denReduceR, cell.numReduceR, cell.wiring.RecurrentRow)
+	// (pre cols = units) both take the den = block shortcut.
+	numS, denS := cell.drive(inputs, cell.sMu, cell.sSigma, sWPos, cell.erevRowsS, cell.wiring.SensoryRow)
+	numR, denR := cell.drive(h, cell.mu, cell.sigma, wPos, cell.erevRowsR, cell.wiring.RecurrentRow)
 	lNumS, lDenS := legacyCfCDrive(inputs, cell.sMu, cell.sSigma, sWPos, autograd.Var(cell.sErev), cell.wiring.SensoryRow)
 	lNumR, lDenR := legacyCfCDrive(h, cell.mu, cell.sigma, wPos, autograd.Var(cell.erev), cell.wiring.RecurrentRow)
 

@@ -280,10 +280,11 @@ func scalarSynapses(
 // against the old per-synapse loop element by element, on both the recurrent
 // and the sensory path and under a sparse wiring mask. The new path must
 // reproduce the old currents exactly — Go's == treats +0 and -0 as equal, so
-// only genuine rounding differences can fail the test. The vectorization
-// changes the graph structure, not the floating-point accumulation order:
-// the indicator MatMul folds left-to-right over presynaptic neurons exactly
-// like the old Add chain, and mask ∈ {0, 1} makes w·mask exactly w or +0.
+// only genuine rounding differences can fail the test. The sparse
+// contraction changes the graph structure, not the floating-point
+// accumulation order: the fold runs left-to-right over presynaptic neurons
+// exactly like the old Add chain, and mask ∈ {0, 1} makes w·mask exactly w
+// or +0.
 func TestLTCSynapsesVectorizedEquivalence(t *testing.T) {
 	rng := rand.New(rand.NewSource(41))
 	const inDim, units = 3, 5
@@ -293,10 +294,10 @@ func TestLTCSynapsesVectorizedEquivalence(t *testing.T) {
 
 	wM := autograd.Hadamard(autograd.Softplus(cell.w), cell.maskR)
 	sWm := autograd.Hadamard(autograd.Softplus(cell.sW), cell.maskS)
-	newRNum, newRDen := cell.synapses(preR, cell.mu, cell.sigma, wM, cell.denReduceR, cell.numReduceR)
+	newRNum, newRDen := cell.synapses(preR, cell.mu, cell.sigma, wM, cell.erevRowsR)
 	oldRNum, oldRDen := scalarSynapses(preR, cell.mu, cell.sigma,
 		autograd.Softplus(cell.w), cell.erev, cell.wiring.RecurrentRow)
-	newSNum, newSDen := cell.synapses(preS, cell.sMu, cell.sSigma, sWm, cell.denReduceS, cell.numReduceS)
+	newSNum, newSDen := cell.synapses(preS, cell.sMu, cell.sSigma, sWm, cell.erevRowsS)
 	oldSNum, oldSDen := scalarSynapses(preS, cell.sMu, cell.sSigma,
 		autograd.Softplus(cell.sW), cell.sErev, cell.wiring.SensoryRow)
 
@@ -323,7 +324,7 @@ func TestLTCSynapsesVectorizedEquivalence(t *testing.T) {
 	cell1 := NewLTC(1, units, RandomSparse(1, units, 0.6, 0.6, rng1), 2, rng1)
 	pre1 := autograd.Var(tensor.Uniform(rng1, -1, 1, 4, 1))
 	sWm1 := autograd.Hadamard(autograd.Softplus(cell1.sW), cell1.maskS)
-	new1Num, new1Den := cell1.synapses(pre1, cell1.sMu, cell1.sSigma, sWm1, cell1.denReduceS, cell1.numReduceS)
+	new1Num, new1Den := cell1.synapses(pre1, cell1.sMu, cell1.sSigma, sWm1, cell1.erevRowsS)
 	old1Num, old1Den := scalarSynapses(pre1, cell1.sMu, cell1.sSigma,
 		autograd.Softplus(cell1.sW), cell1.sErev, cell1.wiring.SensoryRow)
 	exact("single-source num", new1Num, old1Num)
@@ -422,5 +423,143 @@ func TestNewLTCValidation(t *testing.T) {
 			}()
 			f()
 		}()
+	}
+}
+
+// TestLTCSparseContractionLargeCellMemoryGate pins the item-#14 root-cause
+// fix: the constructor must never materialize the former [units^2, units]
+// reduction indicators. NewLTC(2, 1024, FullyConnected, 1, ...) used to
+// attempt 2*1024^3*4B = 8 GiB of dense indicators (and OOM the caller); the
+// sparse contraction's persistent state is (mu/sigma/w + erev + recurrent
+// mask + ident) = 6*units^2 float32 plus the wiring plan's units^2 int32,
+// i.e. 7*units^2*4B = 28 MiB at units=1024 (plus small sensory terms and
+// mask copies, ~32 MiB total). The gate sits at 128 MiB: 4x headroom over
+// the derivation, 64x below the old cliff.
+func TestLTCSparseContractionLargeCellMemoryGate(t *testing.T) {
+	const units = 1024
+	build := func() {
+		NewLTC(2, units, FullyConnected(2, units), 1, rand.New(rand.NewSource(7)))
+	}
+	if b := allocBytesPerRun(3, build); b >= 128<<20 {
+		t.Fatalf("NewLTC(2, %d, FullyConnected, ...) allocated %d bytes (%.0f MiB); want < 128 MiB (dense indicators would need ~8 GiB)", units, b, float64(b)/(1<<20))
+	}
+
+	cell := NewLTC(2, units, FullyConnected(2, units), 1, rand.New(rand.NewSource(7)))
+	// Fully-wired plans carry exactly pre*units terms per side.
+	if got := cell.planR.terms(); got != units*units {
+		t.Errorf("recurrent plan terms = %d, want %d (units^2)", got, units*units)
+	}
+	if got := cell.planS.terms(); got != 2*units {
+		t.Errorf("sensory plan terms = %d, want %d (inDim*units)", got, 2*units)
+	}
+	// One step must run and stay finite (functionality, not performance).
+	x := autograd.Var(tensor.Uniform(rand.New(rand.NewSource(8)), -1, 1, 1, 2))
+	out, hNew := cell.Step(x, nil, 0.1)
+	assertFinite(t, "large LTC step", out, hNew)
+}
+
+// TestLTCSparsePlanCountsMatchWiringMask proves the per-postsynaptic term
+// lists are exactly the wiring mask's nonzeros: under RandomSparse(p=0.3)
+// the total term count equals the mask nnz, and every column's list holds
+// its wired presynaptic indices in ascending order.
+func TestLTCSparsePlanCountsMatchWiringMask(t *testing.T) {
+	rng := rand.New(rand.NewSource(73))
+	const inDim, units = 3, 8
+	w := RandomSparse(inDim, units, 0.3, 0.3, rng)
+	cell := NewLTC(inDim, units, w, 2, rng)
+
+	nnz := func(m *tensor.Tensor) int {
+		n := 0
+		for _, v := range m.Data {
+			if v == 1 {
+				n++
+			}
+		}
+		return n
+	}
+	colNNZ := func(m *tensor.Tensor, j int) int {
+		n := 0
+		for i := 0; i < m.Rows(); i++ {
+			if m.Data[i*m.Cols()+j] == 1 {
+				n++
+			}
+		}
+		return n
+	}
+	maskR, maskS := w.Recurrent(), w.Sensory()
+	if got, want := cell.planR.terms(), nnz(maskR); got != want {
+		t.Fatalf("recurrent plan terms = %d, want mask nnz %d", got, want)
+	}
+	if got, want := cell.planS.terms(), nnz(maskS); got != want {
+		t.Fatalf("sensory plan terms = %d, want mask nnz %d", got, want)
+	}
+	for _, tc := range []struct {
+		name string
+		plan *synapsePlan
+		mask *tensor.Tensor
+	}{{"recurrent", cell.planR, maskR}, {"sensory", cell.planS, maskS}} {
+		for j := 0; j < units; j++ {
+			list := tc.plan.cols[j]
+			if len(list) != colNNZ(tc.mask, j) {
+				t.Fatalf("%s column %d: %d terms, want %d", tc.name, j, len(list), colNNZ(tc.mask, j))
+			}
+			for k, i := range list {
+				if tc.mask.Data[int(i)*units+j] != 1 {
+					t.Fatalf("%s column %d term %d: presynaptic %d is not wired", tc.name, j, k, i)
+				}
+				if k > 0 && i <= list[k-1] {
+					t.Fatalf("%s column %d: presynaptic indices not ascending at %d", tc.name, j, k)
+				}
+			}
+		}
+	}
+}
+
+// TestLTCSparseContractionFullyMaskedColumnZeroSign pins the F-RT1 corner
+// on the sparse contraction: a postsynaptic column whose every synapse is
+// masked, with reversal potentials -1, must contract to +0 (0x00000000) —
+// not -0 (0x80000000). This is the tensor.MatMul av==0 zero-skip behavior
+// the fold replicates (contract constraints 3 and 4): the pre-#14 dense
+// MatMul produced +0 here, the even older per-synapse Add chain produced
+// -0, and the backward leaves +0 gradients on the masked weights either
+// way.
+func TestLTCSparseContractionFullyMaskedColumnZeroSign(t *testing.T) {
+	const inDim, units = 2, 4
+	const maskedCol = 1
+	sensory := tensor.New(inDim, units).OnesLike()
+	recurrent := tensor.New(units, units).OnesLike()
+	for i := 0; i < inDim; i++ {
+		sensory.Data[i*units+maskedCol] = 0
+	}
+	for i := 0; i < units; i++ {
+		recurrent.Data[i*units+maskedCol] = 0
+	}
+	cell := NewLTC(inDim, units, &Wiring{sensoryMask: sensory, recurrentMask: recurrent}, 2, rand.New(rand.NewSource(71)))
+	// Force every reversal potential onto the masked column to -1: the
+	// maximally adversarial sign for the -0 product. The erevRows views
+	// share this storage, so the contraction sees the flip immediately.
+	for i := 0; i < units; i++ {
+		cell.erev.Data.Data[i*units+maskedCol] = -1
+	}
+
+	rng := rand.New(rand.NewSource(72))
+	pre := autograd.Var(tensor.Uniform(rng, -1, 1, 3, units))
+	wM := autograd.Hadamard(autograd.Softplus(cell.w), cell.maskR)
+	num, den := cell.synapses(pre, cell.mu, cell.sigma, wM, cell.erevRowsR)
+	for b := 0; b < 3; b++ {
+		if bits := math.Float32bits(num.Data.Data[b*units+maskedCol]); bits != 0 {
+			t.Fatalf("fully-masked num column batch %d = %#x (-0 would be 0x80000000); want +0", b, bits)
+		}
+		if bits := math.Float32bits(den.Data.Data[b*units+maskedCol]); bits != 0 {
+			t.Fatalf("fully-masked den column batch %d = %#x; want +0", b, bits)
+		}
+	}
+	// Backward: the masked weights' gradients are +0, as under the dense
+	// indicator MatMul (F-RT1: "反向零梯度同").
+	autograd.SumAll(autograd.Add(num, den)).Backward()
+	for i := 0; i < units; i++ {
+		if bits := math.Float32bits(cell.w.Grad.Data[i*units+maskedCol]); bits != 0 {
+			t.Fatalf("masked w[%d, %d] gradient = %#x; want +0", i, maskedCol, bits)
+		}
 	}
 }

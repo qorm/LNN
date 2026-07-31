@@ -503,9 +503,9 @@ func TestCfCDriveBakeMatchesLegacyBitExact(t *testing.T) {
 	sWPos := autograd.Softplus(cell.sW)
 	wPos := autograd.Softplus(cell.w)
 
-	// Baked-indicator path (the current drive).
-	numS, denS := cell.drive(inputs, cell.sMu, cell.sSigma, sWPos, cell.denReduceS, cell.numReduceS, cell.wiring.SensoryRow)
-	numR, denR := cell.drive(h, cell.mu, cell.sigma, wPos, cell.denReduceR, cell.numReduceR, cell.wiring.RecurrentRow)
+	// Sparse-contraction path (the current drive).
+	numS, denS := cell.drive(inputs, cell.sMu, cell.sSigma, sWPos, cell.erevRowsS, cell.wiring.SensoryRow)
+	numR, denR := cell.drive(h, cell.mu, cell.sigma, wPos, cell.erevRowsR, cell.wiring.RecurrentRow)
 
 	// Legacy Add-chain path, with erev re-wrapped as Var leaves (sharing the
 	// same data, which the forward pass only reads).
@@ -616,5 +616,72 @@ func TestNewCfCValidation(t *testing.T) {
 			}()
 			f()
 		}()
+	}
+}
+
+// TestCfCSparseContractionLargeCellMemoryGate is the CfC twin of the LTC
+// memory gate (finding F-RT2: the erev bake gave NewCfC the very same
+// O(units^3) indicator materialization the LTC had). NewCfC(2, 1024, ...)
+// used to attempt ~8 GiB of dense indicators; the sparse contraction's
+// persistent state is ~7*units^2*4B = 28 MiB at units=1024 (plus small
+// sensory terms and mask copies, ~32 MiB total). Gate: < 128 MiB.
+func TestCfCSparseContractionLargeCellMemoryGate(t *testing.T) {
+	const units = 1024
+	build := func() {
+		NewCfC(2, units, FullyConnected(2, units), rand.New(rand.NewSource(9)))
+	}
+	if b := allocBytesPerRun(3, build); b >= 128<<20 {
+		t.Fatalf("NewCfC(2, %d, FullyConnected, ...) allocated %d bytes (%.0f MiB); want < 128 MiB (dense indicators would need ~8 GiB)", units, b, float64(b)/(1<<20))
+	}
+
+	cell := NewCfC(2, units, FullyConnected(2, units), rand.New(rand.NewSource(9)))
+	if got := cell.planR.terms(); got != units*units {
+		t.Errorf("recurrent plan terms = %d, want %d (units^2)", got, units*units)
+	}
+	if got := cell.planS.terms(); got != 2*units {
+		t.Errorf("sensory plan terms = %d, want %d (inDim*units)", got, 2*units)
+	}
+	x := autograd.Var(tensor.Uniform(rand.New(rand.NewSource(10)), -1, 1, 1, 2))
+	out, hNew := cell.Step(x, nil, 0.1)
+	assertFinite(t, "large CfC step", out, hNew)
+}
+
+// TestCfCSparseContractionFullyMaskedColumnZeroSign is the CfC twin of the
+// F-RT1 corner: a fully-masked postsynaptic column with reversal potentials
+// -1 must contract to +0 (not -0) under drive()'s sparse fold, with +0
+// gradients on the masked weights after backward.
+func TestCfCSparseContractionFullyMaskedColumnZeroSign(t *testing.T) {
+	const inDim, units = 2, 4
+	const maskedCol = 1
+	sensory := tensor.New(inDim, units).OnesLike()
+	recurrent := tensor.New(units, units).OnesLike()
+	for i := 0; i < inDim; i++ {
+		sensory.Data[i*units+maskedCol] = 0
+	}
+	for i := 0; i < units; i++ {
+		recurrent.Data[i*units+maskedCol] = 0
+	}
+	cell := NewCfC(inDim, units, &Wiring{sensoryMask: sensory, recurrentMask: recurrent}, rand.New(rand.NewSource(91)))
+	for i := 0; i < units; i++ {
+		cell.erev.Data[i*units+maskedCol] = -1
+	}
+
+	rng := rand.New(rand.NewSource(92))
+	h := autograd.Var(tensor.Uniform(rng, -1, 1, 3, units))
+	wPos := autograd.Softplus(cell.w)
+	num, den := cell.drive(h, cell.mu, cell.sigma, wPos, cell.erevRowsR, cell.wiring.RecurrentRow)
+	for b := 0; b < 3; b++ {
+		if bits := math.Float32bits(num.Data.Data[b*units+maskedCol]); bits != 0 {
+			t.Fatalf("fully-masked num column batch %d = %#x (-0 would be 0x80000000); want +0", b, bits)
+		}
+		if bits := math.Float32bits(den.Data.Data[b*units+maskedCol]); bits != 0 {
+			t.Fatalf("fully-masked den column batch %d = %#x; want +0", b, bits)
+		}
+	}
+	autograd.SumAll(autograd.Add(num, den)).Backward()
+	for i := 0; i < units; i++ {
+		if bits := math.Float32bits(cell.w.Grad.Data[i*units+maskedCol]); bits != 0 {
+			t.Fatalf("masked w[%d, %d] gradient = %#x; want +0", i, maskedCol, bits)
+		}
 	}
 }

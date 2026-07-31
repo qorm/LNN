@@ -61,22 +61,28 @@ type CfC struct {
 
 	// Reversal potentials are fixed random +/-1 constants, exactly as in the
 	// LTC: NOT trainable and deliberately absent from Parameters(). They are
-	// plain data, never graph nodes: their signs are baked into the
-	// numReduce* indicators below at construction time, so backward produces
-	// no gradient on them at all (the old design let them enter the graph as
-	// Var leaves and accumulated dead gradients no one ever read; archived
-	// finding #10, fixed by mirroring ltc.go's reversalIndicator scheme).
+	// plain data; their signs enter the graph only through the erevRows*
+	// row-view constants below, so backward produces no gradient on them at
+	// all (the old design let them enter the graph as Var leaves and
+	// accumulated dead gradients no one ever read; archived finding #10).
 	erev  *tensor.Tensor // [units, units]
 	sErev *tensor.Tensor // [inDim, units]
 
 	// Construction-time graph constants shared by every Step, mirroring the
-	// LTC's reduction indicators: denReduce*/numReduce* are sparse
-	// [pre*units, units] matrices whose MatMul contraction sums the
-	// per-presynaptic activation blocks drive() concatenates; numReduce*
-	// additionally scales each synapse by its (constant) reversal potential,
-	// so the fixed +/-1 signs enter the graph only as baked constants.
-	denReduceS, denReduceR *autograd.Variable
-	numReduceS, numReduceR *autograd.Variable
+	// LTC's sparse contraction state (see ltc.go's contract for the full
+	// bit-equivalence proof): the presynaptic-axis reduction used to run as
+	// MatMuls against dense [pre*units, units] indicators — the O(units^3)
+	// memory cliff of red team F1 / technical-debt item #14, mirrored here
+	// by finding F-RT2. drive() now folds the activation blocks and ends in
+	// a normalizing MatMul against ident; erevRowsR/S carry the per-
+	// presynaptic numerator coefficients as row views sharing the
+	// erev/sErev storage (Load overwrites that storage in place; the rows
+	// track it with no rebuild), and planR/planS record the per-
+	// postsynaptic term lists as O(nnz) metadata.
+	ident                *autograd.Variable
+	zeroV                *autograd.Variable
+	erevRowsR, erevRowsS []*autograd.Variable
+	planR, planS         *synapsePlan
 
 	wiring *Wiring
 }
@@ -152,17 +158,20 @@ func NewCfC(inDim, units int, wiring *Wiring, rng *rand.Rand) *CfC {
 		// The reversal potentials must keep drawing the rng at exactly this
 		// point: the draw order fixes same-seed initialization, so the
 		// rng-free graph constants below come after.
-		erev:       erevInit(units, units),
-		sErev:      erevInit(inDim, units),
-		denReduceS: autograd.Const(sumIndicator(inDim, units)),
-		denReduceR: autograd.Const(sumIndicator(units, units)),
-		wiring:     wiring,
+		erev:   erevInit(units, units),
+		sErev:  erevInit(inDim, units),
+		ident:  autograd.Const(identityMat(units)),
+		zeroV:  autograd.Const(tensor.FromData([]float32{0}, 1)),
+		wiring: wiring,
+		planR:  newSynapsePlan(wiring.recurrentMask),
+		planS:  newSynapsePlan(wiring.sensoryMask),
 	}
-	// Numerator reductions bake in the (already drawn) reversal potentials:
-	// the same indicators the LTC builds in its constructor (ltc.go), so the
-	// fixed +/-1 signs never appear as graph leaves.
-	c.numReduceR = autograd.Const(reversalIndicator(c.erev.Data, units, units))
-	c.numReduceS = autograd.Const(reversalIndicator(c.sErev.Data, inDim, units))
+	// Numerator coefficients are row views of the (already drawn) reversal
+	// potentials, exactly as in the LTC's constructor (ltc.go): O(pre*units)
+	// constants sharing the erev storage, so the fixed +/-1 signs never
+	// appear as graph leaves.
+	c.erevRowsR = erevRowViews(c.erev)
+	c.erevRowsS = erevRowViews(c.sErev)
 	return c
 }
 
@@ -219,9 +228,9 @@ func (c *CfC) Step(x, h *autograd.Variable, ts float64) (out, hNew *autograd.Var
 	sWPos := autograd.Softplus(c.sW)
 
 	// Synaptic drives: num = sum_j act_j*erev_j, den = sum_j act_j, with the
-	// erev signs baked into the numReduce indicators (see drive).
-	numS, denS := c.drive(inputs, c.sMu, c.sSigma, sWPos, c.denReduceS, c.numReduceS, c.wiring.SensoryRow)
-	numR, denR := c.drive(h, c.mu, c.sigma, wPos, c.denReduceR, c.numReduceR, c.wiring.RecurrentRow)
+	// erev signs carried by the erevRows constants (see drive and contract).
+	numS, denS := c.drive(inputs, c.sMu, c.sSigma, sWPos, c.erevRowsS, c.wiring.SensoryRow)
+	numR, denR := c.drive(h, c.mu, c.sigma, wPos, c.erevRowsR, c.wiring.RecurrentRow)
 
 	epsV := autograd.Const(tensor.FromData([]float32{c.eps}, 1))
 	// G = gleak + den, the total conductance [batch, units].
@@ -246,27 +255,25 @@ func (c *CfC) Step(x, h *autograd.Variable, ts float64) (out, hNew *autograd.Var
 // drive accumulates numerator and denominator synaptic currents from a
 // presynaptic source (inputs or previous state), self-contained in cfc.go
 // (it does not share the LTC's synapse routine, but it does share the LTC's
-// sparse-indicator contraction). Row i of the parameter matrices
+// sparse contraction machinery and its bit-equivalence contract — see
+// ltc.go's contract for the full proof). Row i of the parameter matrices
 // parameterizes the synapses of presynaptic neuron i, whose wiring mask row
 // comes from maskRow(i); the sensory and recurrent paths share this single
 // calling convention. Each iteration produces a [batch, units] outer product
-// (column [batch, 1] x row [1, units]); the blocks then concatenate into
-// [batch, n·units] and two MatMuls against the construction-time indicators
-// contract the presynaptic axis:
+// (column [batch, 1] x row [1, units]); contract then reduces the
+// presynaptic axis:
 //
 //	den[:, j] = Σ_i block_i[:, j]
 //	num[:, j] = Σ_i block_i[:, j] · erev[i, j]
 //
-// with the fixed +/-1 reversal potentials baked into numReduce — exactly the
-// ltc.go reversalIndicator scheme. Because every indicator row carries a
-// single nonzero (a plain +/-1 or 0), MatMul's zero-skipping, left-to-right
-// accumulation leaves each output element as one exact float32 product, so
-// this contraction is bit-identical to the former per-presynaptic
-// Add-of-Hadamards chain in both forward and backward — while the reversal
-// potentials no longer enter the graph at all (no dead gradient, archived
-// finding #10).
+// with the fixed +/-1 reversal potentials carried by the erevRows row-view
+// constants — exactly the ltc.go scheme. The masked block entries are
+// exactly +0, so the fold sums precisely the wired terms bit for bit, and
+// the reversal potentials never enter the graph as leaves (no dead
+// gradient, archived finding #10).
 func (c *CfC) drive(
-	pre, mu, sigma, w, denReduce, numReduce *autograd.Variable,
+	pre, mu, sigma, w *autograd.Variable,
+	erevRows []*autograd.Variable,
 	maskRow func(i int) *tensor.Tensor,
 ) (num, den *autograd.Variable) {
 	n := pre.Data.Cols()
@@ -280,16 +287,32 @@ func (c *CfC) drive(
 		act = autograd.Hadamard(act, wR)
 		blocks[i] = autograd.Hadamard(act, autograd.Const(maskRow(i)))
 	}
-	flat := blocks[0]
-	if n > 1 {
-		flat = autograd.ConcatCol(blocks...)
-		den = autograd.MatMul(flat, denReduce)
+	return c.contract(blocks, erevRows)
+}
+
+// contract is the CfC's copy of the LTC's sparse presynaptic reduction
+// (ltc.go's contract, whose doc comment carries the bit-equivalence proof):
+// a +0-seeded ascending fold of the blocks (the denominator) and of the
+// blocks scaled by their reversal rows (the numerator), each ended by a
+// MatMul against the units×units identity that replicates the former
+// indicator MatMul's zero-skip in the backward pass. The single-source
+// denominator shortcut is preserved: with one presynaptic row the indicator
+// was the identity, so den is the raw block.
+func (c *CfC) contract(blocks, erevRows []*autograd.Variable) (num, den *autograd.Variable) {
+	if len(blocks) == 1 {
+		den = blocks[0]
 	} else {
-		// A single presynaptic source: denReduce is the units×units identity,
-		// so the contraction is the block itself.
-		den = flat
+		den = autograd.Add(c.zeroV, blocks[0])
+		for i := 1; i < len(blocks); i++ {
+			den = autograd.Add(den, blocks[i])
+		}
+		den = autograd.MatMul(den, c.ident)
 	}
-	num = autograd.MatMul(flat, numReduce)
+	num = autograd.Add(c.zeroV, autograd.Hadamard(blocks[0], erevRows[0]))
+	for i := 1; i < len(blocks); i++ {
+		num = autograd.Add(num, autograd.Hadamard(blocks[i], erevRows[i]))
+	}
+	num = autograd.MatMul(num, c.ident)
 	return num, den
 }
 

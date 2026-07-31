@@ -642,13 +642,15 @@ func allocBytesPerRun(n int, f func()) uint64 {
 }
 
 // TestLoadLTCRejectsExcessiveUnits pins red team sweep F1 (the v0.2.0
-// blocker): NewLTC materializes the reduction indicators as dense
-// [pre*units, units] matrices, so a load is O(units^3) in memory — the PoC
-// loaded a legal units=512 stream (5 MB delivered) at the cost of 1,560 MB
-// of allocations (311x amplification), and a minimal units=4096 attack
-// stream made the process attempt 2*4096^3*4B ≈ 550 GB of indicators until
-// the OS killed it. The cap must therefore fire in the header check, before
-// the blob is parsed and before any indicator matrix is allocated.
+// blocker): loads used to be O(units^3) in memory because NewLTC
+// materialized the reduction indicators as dense [pre*units, units]
+// matrices — the PoC loaded a legal units=512 stream (5 MB delivered) at
+// the cost of 1,560 MB of allocations (311x amplification), and a minimal
+// units=4096 attack stream made the process attempt 2*4096^3*4B ≈ 550 GB
+// of indicators until the OS killed it. Item #14's sparse contraction
+// removed the indicators (loads are O(units^2) now) and raised the cap
+// from 256 to 2048, but the cap itself must still fire in the header
+// check, before the blob is parsed and before any cell is allocated.
 func TestLoadLTCRejectsExcessiveUnits(t *testing.T) {
 	header := func(units int) []byte {
 		var b [13]byte
@@ -684,9 +686,10 @@ func TestLoadLTCRejectsExcessiveUnits(t *testing.T) {
 	}
 }
 
-// TestLoadCfCRejectsExcessiveUnits is the CfC twin: NewCfC bakes the same
-// [pre*units, units] indicators (cfc.go mirrors ltc.go's scheme), so the
-// identical cap must guard LoadCfC's header before its blob is parsed.
+// TestLoadCfCRejectsExcessiveUnits is the CfC twin: NewCfC builds the same
+// O(units^2) cell (cfc.go mirrors ltc.go's sparse contraction since item
+// #14, and baked the same dense indicators before it), so the identical
+// cap must guard LoadCfC's header before its blob is parsed.
 func TestLoadCfCRejectsExcessiveUnits(t *testing.T) {
 	header := func(units int) []byte {
 		var b [9]byte
@@ -751,13 +754,14 @@ func TestLoadRejectsExcessiveInDim(t *testing.T) {
 }
 
 // TestLoadLTCAcceptsUnitsAtLimit proves the cap is not over-tight: a
-// legitimate stream at exactly maxUnits — the largest legal value, near the
-// red team's legal PoC size of 512, which used to cost 1,560 MB —
-// round-trips, and the loaded cell steps bit-identically.
+// legitimate stream at exactly maxUnits — the largest legal value (2048
+// since item #14's sparse contraction re-derived the budget; the red
+// team's legal PoC size of 512 used to cost 1,560 MB under the dense
+// indicators) — round-trips, and the loaded cell steps bit-identically.
 func TestLoadLTCAcceptsUnitsAtLimit(t *testing.T) {
-	// Sensory side kept small on purpose: the recurrent indicators alone
-	// (2*units^3 float32s) cost 128 MiB per cell at units=256, and the
-	// round trip holds two cells plus one transient 64 MiB rebuild.
+	// Sensory side kept small on purpose: at units=2048 the recurrent side
+	// alone (mu/sigma/w + erev + mask + ident + plan) costs ~115 MB per
+	// cell, and the round trip holds two cells plus the stream blob.
 	cell := NewLTC(4, maxUnits, nil, 1, rand.New(rand.NewSource(113)))
 	var buf bytes.Buffer
 	if err := SaveLTC(&buf, cell); err != nil {
@@ -887,11 +891,22 @@ func TestLoadCfCAcceptsFlippedReversalPattern(t *testing.T) {
 	if !saveSameBits(ts[cfcTensorCount-2], loaded.erev) || !saveSameBits(ts[cfcTensorCount-1], loaded.sErev) {
 		t.Error("loaded reversal potentials do not match the flipped stream")
 	}
-	// The baked indicators must have been rebuilt from the flipped stream.
-	wantR := reversalIndicator(loaded.erev.Data, 6, 6)
-	wantS := reversalIndicator(loaded.sErev.Data, 4, 6)
-	if !saveSameBits(wantR, loaded.numReduceR.Data) || !saveSameBits(wantS, loaded.numReduceS.Data) {
-		t.Error("loaded numerator indicators do not match the streamed polarities")
+	// The numerator coefficients must track the flipped stream: the erev
+	// row views the contraction reads share the erev/sErev storage
+	// copyFields just overwrote, so every row must carry the streamed
+	// polarities (item #14 replaced the rebuilt dense indicators with these
+	// shared row views).
+	for i := 0; i < 6; i++ {
+		row := tensor.FromData(loaded.erev.Data[i*6:(i+1)*6], 1, 6)
+		if !saveSameBits(row, loaded.erevRowsR[i].Data) {
+			t.Fatalf("loaded recurrent numerator coefficients row %d do not match the streamed polarities", i)
+		}
+	}
+	for i := 0; i < 4; i++ {
+		row := tensor.FromData(loaded.sErev.Data[i*6:(i+1)*6], 1, 6)
+		if !saveSameBits(row, loaded.erevRowsS[i].Data) {
+			t.Fatalf("loaded sensory numerator coefficients row %d do not match the streamed polarities", i)
+		}
 	}
 	x := saveInput(2, 4)
 	out, h := loaded.Step(x, nil, 0.1)

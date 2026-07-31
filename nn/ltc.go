@@ -43,23 +43,47 @@ type LTC struct {
 	// trainable and are deliberately absent from Parameters(): learning them
 	// would flip synapses between excitatory and inhibitory polarity and
 	// degrade the LTC into an ordinary plastic network. They enter the graph
-	// only through the numReduce* constants below.
+	// only through the erevRows* row-view constants below.
 	erev  *autograd.Variable // [units, units]
 	sErev *autograd.Variable // [inDim, units]
 
 	// Construction-time graph constants shared by every Step. maskS/maskR
 	// fold the wiring into the positivity-constrained weights with one
 	// matrix Hadamard per Step instead of one masked multiply per synapse.
-	// denReduce*/numReduce* are sparse [pre*units, units] indicator matrices
-	// whose MatMul contraction sums the per-presynaptic activation blocks;
-	// numReduce* additionally scales each synapse by its (constant) reversal
-	// potential. Backward accumulates gradients into these leaves that
-	// are never read — exactly as the old per-synapse mask constants did,
-	// but at a handful of nodes per Step instead of one per synapse per
-	// unfold.
-	maskS, maskR           *autograd.Variable
-	denReduceS, denReduceR *autograd.Variable
-	numReduceS, numReduceR *autograd.Variable
+	//
+	// The presynaptic-axis contraction (summing the per-presynaptic
+	// activation blocks, scaling by reversal potentials for the numerator)
+	// used to run as MatMuls against dense [pre*units, units] indicator
+	// matrices — an O(units^3) float32 materialization that put a memory
+	// cliff in both the constructor and the load path (red team sweep F1;
+	// the load side was bandaged by maxUnits until this root-cause fix,
+	// technical-debt item #14). The contraction is now the sparse fold of
+	// contract(): its persistent state is ident (one units×units identity),
+	// zeroV (one scalar), the erevRows* row views (sharing erev/sErev
+	// storage, no extra floats) and the plan* term lists (O(wiring nnz)
+	// int32s) — O(units^2) in all, and no Step ever materializes a
+	// [units^2, units] tensor.
+	maskS, maskR *autograd.Variable
+
+	// ident is the units×units identity matrix. Each contraction ends in a
+	// MatMul against it: the forward is a value-preserving copy, and the
+	// backward runs the genuine tensor.MatMulTransB, whose av==0 skip
+	// normalizes zero incoming gradients to +0 bit-for-bit as the former
+	// indicator MatMul's backward did (see contract).
+	ident *autograd.Variable
+	// zeroV is the scalar +0 seeding every contraction fold — the analogue
+	// of MatMul's fresh zero-filled accumulator buffer (see contract).
+	zeroV *autograd.Variable
+	// erevRowsR/S expose row i of the reversal potentials as a [1, units]
+	// graph constant: the per-presynaptic numerator coefficients. The row
+	// tensors share the erev/sErev Data arrays, so Load's in-place copy of
+	// the streamed polarities is picked up automatically, with no rebuild
+	// (the old design re-materialized a dense indicator here per load).
+	erevRowsR, erevRowsS []*autograd.Variable
+	// planR/planS record, per postsynaptic neuron j, the ascending list of
+	// wired presynaptic indices (mask[i, j] == 1): the terms the contraction
+	// sums, as O(nnz) metadata (see synapsePlan and contract).
+	planR, planS *synapsePlan
 
 	// epsV is the membrane epsilon as a graph constant, built once.
 	epsV *autograd.Variable
@@ -123,18 +147,22 @@ func NewLTC(inDim, units int, wiring *Wiring, unfolds int, rng *rand.Rand) *LTC 
 		// The reversal potentials must keep drawing the rng at exactly this
 		// point: the draw order fixes same-seed initialization, so the
 		// rng-free graph constants below come after.
-		erev:       autograd.Var(erevInit(units, units)),
-		sErev:      autograd.Var(erevInit(inDim, units)),
-		maskS:      autograd.Const(wiring.Sensory()),
-		maskR:      autograd.Const(wiring.Recurrent()),
-		denReduceS: autograd.Const(sumIndicator(inDim, units)),
-		denReduceR: autograd.Const(sumIndicator(units, units)),
-		epsV:       autograd.Const(tensor.FromData([]float32{ltcEps}, 1)),
-		wiring:     wiring,
+		erev:   autograd.Var(erevInit(units, units)),
+		sErev:  autograd.Var(erevInit(inDim, units)),
+		maskS:  autograd.Const(wiring.Sensory()),
+		maskR:  autograd.Const(wiring.Recurrent()),
+		ident:  autograd.Const(identityMat(units)),
+		zeroV:  autograd.Const(tensor.FromData([]float32{0}, 1)),
+		epsV:   autograd.Const(tensor.FromData([]float32{ltcEps}, 1)),
+		wiring: wiring,
+		planR:  newSynapsePlan(wiring.recurrentMask),
+		planS:  newSynapsePlan(wiring.sensoryMask),
 	}
-	// Numerator reductions bake in the (already drawn) reversal potentials.
-	c.numReduceR = autograd.Const(reversalIndicator(c.erev.Data.Data, units, units))
-	c.numReduceS = autograd.Const(reversalIndicator(c.sErev.Data.Data, inDim, units))
+	// Numerator coefficients are row views of the (already drawn) reversal
+	// potentials: O(pre*units) constants sharing the erev storage, replacing
+	// the dense [pre*units, units] reversal indicators.
+	c.erevRowsR = erevRowViews(c.erev.Data)
+	c.erevRowsS = erevRowViews(c.sErev.Data)
 	return c
 }
 
@@ -151,34 +179,88 @@ func shapeIs(sh []int, want ...int) bool {
 	return true
 }
 
-// sumIndicator builds the sparse [n*m, m] reduction matrix R with
-// R[i*m+j, j] = 1. A MatMul against the n per-presynaptic [batch, m]
-// activation blocks laid out side by side (shape [batch, n*m]) then
-// contracts the presynaptic axis: out[:, j] = Σ_i blocks[:, i*m+j]. MatMul
-// skips zero entries, so the contraction costs O(batch·n·m) despite R's
-// [n*m, m] extent.
-func sumIndicator(n, m int) *tensor.Tensor {
-	r := tensor.New(n*m, m)
+// identityMat builds the n×n identity matrix: the terminal operand of the
+// sparse contraction's normalizing MatMul (see contract).
+func identityMat(n int) *tensor.Tensor {
+	t := tensor.New(n, n)
 	for i := 0; i < n; i++ {
-		for j := 0; j < m; j++ {
-			r.Data[(i*m+j)*m+j] = 1
-		}
+		t.Data[i*n+i] = 1
 	}
-	return r
+	return t
 }
 
-// reversalIndicator is sumIndicator scaled per synapse by the (constant)
-// reversal potential: R[i*m+j, j] = erev[i*m+j]. The same MatMul
-// contraction then yields the numerator current Σ_i act_i · erev_i, so the
-// fixed +/-1 potentials never appear as per-synapse graph nodes.
-func reversalIndicator(erev []float32, n, m int) *tensor.Tensor {
-	r := tensor.New(n*m, m)
-	for i := 0; i < n; i++ {
-		for j := 0; j < m; j++ {
-			r.Data[(i*m+j)*m+j] = erev[i*m+j]
+// erevRowViews exposes each row of a [pre, units] reversal-potential matrix
+// as a [1, units] graph constant, for the per-presynaptic numerator
+// coefficients of contract. The row tensors deliberately SHARE rows' Data
+// arrays (read-only: forwards only read constant values, and backwards write
+// gradients into separate buffers), so Save/Load's in-place overwrite of the
+// cell's erev storage is reflected in the constants without any rebuild —
+// the old design re-materialized a dense [pre*units, units] indicator here.
+func erevRowViews(rows *tensor.Tensor) []*autograd.Variable {
+	pre, units := rows.Rows(), rows.Cols()
+	vs := make([]*autograd.Variable, pre)
+	for i := range vs {
+		vs[i] = autograd.Const(&tensor.Tensor{Shape: []int{1, units}, Data: rows.Data[i*units : (i+1)*units]})
+	}
+	return vs
+}
+
+// synapsePlan records the wired synapse topology per postsynaptic neuron:
+// cols[j] holds the presynaptic indices i with mask[i, j] == 1, ascending —
+// exactly the per-column (i, coefficient) term list the contraction sums
+// (the numerator's coefficient of term (i, j) is erev[i, j]; the
+// denominator's is 1). Storage is O(nnz(mask)) int32s plus one slice header
+// per postsynaptic neuron — against the O(pre*units^2) float32 extent of the
+// dense indicator matrices this replaced (red team F1's memory cliff,
+// technical-debt item #14): at units=1024 fully wired, 4 MiB of term lists
+// versus 8 GiB of indicators.
+//
+// The plan documents and counts the contraction's terms; contract itself
+// folds whole presynaptic rows rather than walking the lists, because
+// unwired synapses are arithmetically neutral: a masked block entry is
+// exactly +0 (sigmoid >= 0 times a zero-masked weight), and +0 is an
+// additive identity, so the all-rows fold sums precisely the wired terms,
+// bit for bit (see contract's ordering-equivalence proof).
+type synapsePlan struct {
+	cols [][]int32
+}
+
+// newSynapsePlan builds the per-postsynaptic term lists from a binary
+// [pre, post] wiring mask, in ascending presynaptic order.
+func newSynapsePlan(mask *tensor.Tensor) *synapsePlan {
+	pre, post := mask.Rows(), mask.Cols()
+	counts := make([]int, post)
+	for i := 0; i < pre; i++ {
+		row := mask.Data[i*post : (i+1)*post]
+		for j, v := range row {
+			if v == 1 {
+				counts[j]++
+			}
 		}
 	}
-	return r
+	cols := make([][]int32, post)
+	for j := range cols {
+		cols[j] = make([]int32, 0, counts[j])
+	}
+	for i := 0; i < pre; i++ {
+		row := mask.Data[i*post : (i+1)*post]
+		for j, v := range row {
+			if v == 1 {
+				cols[j] = append(cols[j], int32(i))
+			}
+		}
+	}
+	return &synapsePlan{cols: cols}
+}
+
+// terms returns the total number of wired synapses: the sum of the per-column
+// list lengths, i.e. the number of nonzeros in the wiring mask.
+func (p *synapsePlan) terms() int {
+	n := 0
+	for _, c := range p.cols {
+		n += len(c)
+	}
+	return n
 }
 
 // StateSize returns the hidden state dimension.
@@ -224,7 +306,7 @@ func (c *LTC) Step(x, h *autograd.Variable, ts float64) (out, hNew *autograd.Var
 	wM := autograd.Hadamard(autograd.Softplus(c.w), c.maskR)   // [units, units]
 
 	// Sensory (input) synapses are loop-invariant over the ODE unfolds.
-	numS, denS := c.synapses(inputs, c.sMu, c.sSigma, sWm, c.denReduceS, c.numReduceS)
+	numS, denS := c.synapses(inputs, c.sMu, c.sSigma, sWm, c.erevRowsS)
 
 	// Recurrent parameter rows are Step-invariant: slice them once and reuse
 	// the rows across every ODE unfold below.
@@ -240,7 +322,7 @@ func (c *LTC) Step(x, h *autograd.Variable, ts float64) (out, hNew *autograd.Var
 
 	v := h
 	for t := 0; t < c.unfolds; t++ {
-		numR, denR := c.synapsesRows(v, muRs, sigRs, wmRs, c.denReduceR, c.numReduceR)
+		numR, denR := c.synapsesRows(v, muRs, sigRs, wmRs, c.erevRowsR)
 		// num = cm_t .* v + gleak .* vleak + synapses
 		num := autograd.Add(autograd.Add(autograd.Hadamard(cmT, v), numConst), numR)
 		v = autograd.Div(num, autograd.Add(denBase, denR))
@@ -300,23 +382,17 @@ func (c *LTC) rows(m *autograd.Variable) []*autograd.Variable {
 //	block_i = sigmoid(sigma_i ⊙ (pre[:, i] − mu_i)) ⊙ wm_i,
 //
 // where wm carries the positivity-constrained weight already folded with
-// the wiring mask (see Step). The blocks concatenate into [batch, n·units]
-// and two MatMuls against the sparse construction-time indicators contract
-// the presynaptic axis:
+// the wiring mask (see Step). contract then reduces the presynaptic axis:
 //
 //	den[:, j] = Σ_i block_i[:, j]
 //	num[:, j] = Σ_i block_i[:, j] · erev[i, j]
 //
-// (the fixed reversal potentials are baked into numReduce). MatMul skips
-// zero entries, and its fresh-buffer left-to-right accumulation over i
-// reproduces the old per-synapse Add chain bit-for-bit — mask being {0, 1}
-// makes w·mask exactly w or +0, so no rounding order changes either. Graph
-// size drops from O(pre²·unfolds) nodes to O(pre·unfolds). The sensory and
+// with erevRows carrying the (fixed) reversal rows. The sensory and
 // recurrent paths share this single calling convention; the recurrent path
 // additionally reuses one set of pre-sliced rows across all unfolds via
 // synapsesRows.
 func (c *LTC) synapses(
-	pre, mu, sigma, wm, denReduce, numReduce *autograd.Variable,
+	pre, mu, sigma, wm *autograd.Variable, erevRows []*autograd.Variable,
 ) (num, den *autograd.Variable) {
 	n := pre.Data.Cols()
 	muRs := make([]*autograd.Variable, n)
@@ -327,16 +403,16 @@ func (c *LTC) synapses(
 		sigRs[i] = autograd.SliceRow(sigma, i)
 		wmRs[i] = autograd.SliceRow(wm, i)
 	}
-	return c.synapsesRows(pre, muRs, sigRs, wmRs, denReduce, numReduce)
+	return c.synapsesRows(pre, muRs, sigRs, wmRs, erevRows)
 }
 
 // synapsesRows is the per-unfold inner loop: one activation block per
-// presynaptic neuron from the pre-sliced parameter rows, then the two
-// indicator MatMul reductions.
+// presynaptic neuron from the pre-sliced parameter rows, then the sparse
+// contraction of contract.
 func (c *LTC) synapsesRows(
 	pre *autograd.Variable,
 	muRs, sigRs, wmRs []*autograd.Variable,
-	denReduce, numReduce *autograd.Variable,
+	erevRows []*autograd.Variable,
 ) (num, den *autograd.Variable) {
 	blocks := make([]*autograd.Variable, len(muRs))
 	for i := range blocks {
@@ -346,15 +422,74 @@ func (c *LTC) synapsesRows(
 		// Sigmoid+Hadamard pair: identical forward bits, one backward pass.
 		blocks[i] = autograd.SigmoidHadamard(z, wmRs[i])
 	}
-	flat := blocks[0]
-	if len(blocks) > 1 {
-		flat = autograd.ConcatCol(blocks...)
-		den = autograd.MatMul(flat, denReduce)
+	return c.contract(blocks, erevRows)
+}
+
+// contract reduces the per-presynaptic activation blocks into the numerator
+// and denominator synaptic currents — the sparse replacement for the former
+// MatMul(flat, indicator) reductions, which materialized dense
+// [pre*units, units] indicator matrices: an O(units^3) float32 cliff that
+// made NewLTC(4, 1024, …) allocate ~8 GiB of indicators (red team sweep F1,
+// technical-debt item #14). Persistent contraction state is now ident (one
+// units×units matrix), zeroV (one scalar), the erevRows views (sharing erev
+// storage) and the per-cell synapsePlans — O(units^2) — and the per-step
+// graph grows by O(pre) nodes, never by a [units^2, units] tensor.
+//
+// The reduction is bit-identical to the indicator MatMul it replaces — in
+// forward AND backward — because it replicates that MatMul's four defining
+// behaviors exactly:
+//
+//  1. Ascending presynaptic order. MatMul column j accumulates its nonzeros
+//     in ascending flat index k = i*units+j, i.e. ascending i — the same
+//     term sequence planR/planS record per postsynaptic neuron. The fold
+//     below visits the blocks in index order, so each column j accumulates
+//     the very same (i, coefficient) pairs in the very same order. Unwired
+//     synapses are absent from the lists yet present in the fold — and
+//     arithmetically neutral: a masked block entry is exactly +0 (sigmoid
+//     >= 0 times a zero-masked weight), and adding +0 is the identity, so
+//     the all-rows fold sums precisely the wired terms.
+//  2. Operand order. The numerator's per-term product is block·erev — the
+//     activation block element on the left, the coefficient on the right —
+//     exactly as MatMul evaluated av·brow[j]. IEEE multiplication agrees
+//     bitwise here (erev is +/-1), but the order is preserved regardless.
+//  3. Zero-skip. MatMul skips left operands that are zero, -0 included
+//     (tensor.MatMul's av==0 branch — the source of the F-RT1 +0 behavior,
+//     deliberately kept, not "fixed"). Forward, the fold reproduces the
+//     skip by arithmetic: a zero block makes the term +/-0, and acc + (+0)
+//     = acc and acc + (-0) = acc for every accumulator value the fold can
+//     hold (it starts at +0 and round-to-nearest never produces -0 from a
+//     +0-seeded sum), so skipped and added zeros land on identical bits.
+//     Backward, the terminal MatMul against ident runs the genuine
+//     tensor.MatMulTransB, whose av==0 branch normalizes a zero incoming
+//     gradient to a +0 contribution — bit for bit what the indicator
+//     MatMul's backward computed for flat's gradient.
+//  4. +0 accumulator. The fold seeds from zeroV (scalar +0), mirroring
+//     MatMul's fresh zero-filled output buffer. This is what keeps a fully
+//     masked postsynaptic column at +0 (0x00000000) instead of -0 (red
+//     team F-RT1): an empty term list sums to the seed, exactly as the
+//     all-skipped MatMul column did.
+//
+// den keeps the historical single-source shortcut: with one presynaptic row
+// the denominator indicator is the identity, so den is the raw block — no
+// fold, no normalizing MatMul — while num still folds and normalizes, both
+// exactly as before.
+func (c *LTC) contract(blocks, erevRows []*autograd.Variable) (num, den *autograd.Variable) {
+	if len(blocks) == 1 {
+		den = blocks[0]
 	} else {
-		// A single presynaptic source: denReduce is the m×m identity, so the
-		// contraction is a copy the MatMul would pay for bit-identically.
-		den = flat
+		den = autograd.Add(c.zeroV, blocks[0])
+		for i := 1; i < len(blocks); i++ {
+			den = autograd.Add(den, blocks[i])
+		}
+		// The identity MatMul: a value-preserving copy forward (x·1 is exact
+		// for nonzero x; zero x is skipped and stays +0), and backward the
+		// av==0 gradient skip the indicator MatMul ran (constraint 3).
+		den = autograd.MatMul(den, c.ident)
 	}
-	num = autograd.MatMul(flat, numReduce)
+	num = autograd.Add(c.zeroV, autograd.Hadamard(blocks[0], erevRows[0]))
+	for i := 1; i < len(blocks); i++ {
+		num = autograd.Add(num, autograd.Hadamard(blocks[i], erevRows[i]))
+	}
+	num = autograd.MatMul(num, c.ident)
 	return num, den
 }
