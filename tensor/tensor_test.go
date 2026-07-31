@@ -227,14 +227,6 @@ func TestSoftmaxRows(t *testing.T) {
 	}
 }
 
-func TestStack(t *testing.T) {
-	a := FromRows([]float32{1, 2}, []float32{3, 4})
-	b := FromRows([]float32{5, 6}, []float32{7, 8})
-	s := Stack(a, b)
-	checkShape(t, s, 2, 2, 2)
-	checkData(t, s, []float32{1, 2, 3, 4, 5, 6, 7, 8}, 0)
-}
-
 func TestRandom(t *testing.T) {
 	rng := rand.New(rand.NewSource(42))
 	u := Uniform(rng, -2, 3, 4, 5)

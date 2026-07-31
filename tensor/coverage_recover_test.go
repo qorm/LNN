@@ -235,9 +235,11 @@ func TestRecoverStringRendering(t *testing.T) {
 }
 
 // TestRecoverTensorPanicContracts pins the defensive panic messages so a
-// refactor cannot silently reword them. The SumToShapeTake case drives the
-// irreducible default arm; the must2D/offset cases drive the rank and arity
-// guards.
+// refactor cannot silently reword them. The SumToShape case drives the
+// irreducible default arm (the owning SumToShapeTake variant moved into the
+// autograd package in v0.4.0 as the unexported sumToShapeTake, whose identical
+// panic contract is pinned by an autograd internal test); the must2D/offset
+// cases drive the rank and arity guards.
 func TestRecoverTensorPanicContracts(t *testing.T) {
 	cases := []struct {
 		name string
@@ -256,7 +258,7 @@ func TestRecoverTensorPanicContracts(t *testing.T) {
 			"tensor.SliceRow: invalid row -1 for shape [2 2]"},
 		{"SliceRow rank", func() { SliceRow(New(3), 0) },
 			"tensor.SliceRow: invalid row 0 for shape [3]"},
-		{"SumToShapeTake irreducible", func() { SumToShapeTake(New(2, 2), []int{3}) },
+		{"SumToShape irreducible", func() { SumToShape(New(2, 2), []int{3}) },
 			"tensor.SumToShape: cannot reduce shape [2 2] to [3]"},
 		{"must2D on 1D", func() { New(3).Rows() },
 			"tensor: expected 2D tensor, got shape [3]"},
@@ -268,10 +270,6 @@ func TestRecoverTensorPanicContracts(t *testing.T) {
 			"tensor: 3 indices for shape [2 2]"},
 		{"Scalar non-scalar", func() { New(2).Scalar() },
 			"tensor.Scalar: shape [2] is not scalar"},
-		{"Stack empty", func() { Stack() },
-			"tensor.Stack: no tensors"},
-		{"Stack mismatch", func() { Stack(New(2), New(3)) },
-			"tensor.Stack: shape [3] does not match [2]"},
 	}
 	for _, c := range cases {
 		if msg := panicMsg(c.f); msg != c.want {

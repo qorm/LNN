@@ -92,7 +92,7 @@ For input `[m, n]`:
 | `ConcatCol(...)` | cols | `[m, Σn]` | all inputs share `m` |
 | `Transpose` | — | `[n, m]` | |
 | `MatMul(a, b)` | — | `[m, n]` | from `[m, k] × [k, n]` |
-| `Stack(k tensors of shape S)` | new lead | `[k, S...]` | **experimental:** produces 3D for 2D inputs, which no other op consumes (they panic on rank ≠ 2) |
+| ~~`Stack`~~ | — | — | **removed in v0.4.0** (API hygiene): for 2D inputs it produced 3D tensors that no other op consumes (they panic on rank ≠ 2), with zero callers inside the library |
 
 ### The honest part: SumRows and SumCols are asymmetric
 
@@ -102,11 +102,21 @@ historical: the conventions grew with the code, and both `autograd`
 backward passes and `nn` internals are built on them (e.g. the
 `LogSoftmaxRows` gradient reshapes a `SumCols` result to `[m, 1]`, while
 bias gradients rely on `SumRows` staying row-broadcastable). Changing
-either shape now would be an API-breaking change across the module, so it
-is tracked as a separate evaluation item rather than fixed in place
-(roadmap — see [pitfalls.md](pitfalls.md)). Until then: check the table
-above, and prefer `autograd` ops (which handle the reductions internally)
-over manual `tensor` reductions in new code.
+either shape now would be an API-breaking change across the module — and
+in the v0.4.0 API-stability window the conventions were **frozen
+deliberately**, with the decision measured rather than assumed: the true
+cost of unification is not the two reductions themselves (four internal
+call sites combined) but the 1D→`[1, n]` lift they anchor — 11 direct
+`elemwiseGradShape` call sites plus 23 lift guards in the fused backward
+paths, all carrying bitwise-equivalence contracts whose evidence base
+(the 96k + 52k + 522-graph differential-fuzz oracles) would be
+invalidated outright, on top of re-proving the phase-7
+magnitude-equivalence story and rewriting at least 17 tests. The only
+gain in return is symmetry, with zero measured performance benefit;
+evaluated in a zero-user window, v0.4.0 chose to freeze rather than pay.
+Accordingly: check the table above, and prefer `autograd` ops (which
+handle the reductions internally) over manual `tensor` reductions in new
+code.
 
 The same lineage explains the 1D⊕1D → `[1, n]` promotion: leaf gradients
 of 1D parameters still come back in the leaf's own shape (`SumToShape`
@@ -129,4 +139,10 @@ Broadcasting ops reduce output gradients back to operand shapes with
 
 This is what makes leaf gradients always match leaf shapes even when the
 forward pass broadcast them (including 1D leaves whose forward output was
-promoted to `[1, n]`).
+promoted to `[1, n]`). Internally the backward pass uses an owning twin
+that skips the defensive clone on a shape match — it moved into
+`autograd` as the unexported `sumToShapeTake` in v0.4.0 (formerly the
+exported `tensor.SumToShapeTake`), since its ownership contract was a
+footgun on the public surface and its only callers were the five
+backward sites; the cloning `SumToShape` above is the sole public
+reducer now.

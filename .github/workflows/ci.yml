@@ -32,3 +32,10 @@ jobs:
 
       - name: Run ltc-sequence example (integration smoke test)
         run: go run ./examples/ltc-sequence
+
+      # Native fuzzing smoke: each FuzzXxx target fuzzed for a short window.
+      # The seed corpus already ran under the plain test step above; this adds
+      # guided mutation coverage over the untrusted-stream and constructor
+      # surfaces. Any crash fails the build (and uploads the minimized input).
+      - name: Fuzz smoke (30s per target)
+        run: make fuzz-smoke SMOKETIME=30s

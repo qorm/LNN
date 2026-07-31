@@ -127,7 +127,7 @@ func TestRecoverLogSoftmaxRowsIrregularSeed(t *testing.T) {
 	seedT := tensor.FromData([]float32{2}, 1, 1)
 	softmax := tensor.Exp(out.Data)
 	rowsum := tensor.SumCols(seedT)
-	rowsum.Shape = []int{rowsum.Size(), 1}
+	rowsum.Reshape(rowsum.Size(), 1)
 	want := tensor.Sub(seedT, tensor.Hadamard(softmax, rowsum))
 	if x.Grad == nil || !bitsEqual(x.Grad, want) {
 		t.Fatalf("fallback grad = %v (shape %v), want %v (shape %v)",
@@ -244,7 +244,7 @@ func TestRecoverBroadcastLiftNormalization(t *testing.T) {
 }
 
 // TestRecoverNegReduceLegacyFallback proves the opSub b-branch falls through
-// to negReduce's default arm — the unfused SumToShapeTake(Neg(g), shape)
+// to negReduce's default arm — the unfused sumToShapeTake(Neg(g), shape)
 // composition — and therefore reproduces that composition's panic contract
 // when the seeded shape can be neither reduced nor broadcast.
 func TestRecoverNegReduceLegacyFallback(t *testing.T) {

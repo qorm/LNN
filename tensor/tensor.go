@@ -10,10 +10,61 @@ import (
 	"math/bits"
 )
 
+// maxInlineRank is the rank up to which a tensor's shape is stored inline in
+// the struct (shapeBuf) rather than in a separate heap allocation.
+//
+// Coverage: every operator in this library is 1D/2D-focused — MatMul is
+// matrices only and the broadcasting binary ops, reductions and softmax
+// families all reject Dims() != 2. Stack was the sole rank-3 producer and it
+// is deleted in v0.4.0 (API hygiene, zero in-library callers), so live library
+// tensors top out at rank 2; maxInlineRank=4 leaves two ranks of headroom for
+// direct external construction. The serialize package carries its own
+// rank+dims wire stream (up to rank 8) and constructs tensors directly without
+// going through useShape, so any tensor whose rank exceeds maxInlineRank falls
+// back to a copied heap slice (still correct — Shape remains the single source
+// of truth — just without the allocation saving).
+const maxInlineRank = 4
+
 // Tensor is a dense, row-major float32 tensor.
+//
+// Shape stays the single source of truth as a []int, but for rank <=
+// maxInlineRank it points into the embedded shapeBuf instead of a separately
+// heap-allocated slice, removing one allocation per tensor construction (API
+// hardening #12, option ②). The exported field type and all read paths are
+// unchanged; shapeBuf is an implementation detail callers never touch.
 type Tensor struct {
-	Shape []int
-	Data  []float32
+	Shape    []int
+	Data     []float32
+	shapeBuf [maxInlineRank]int
+}
+
+// useShape points t.Shape at the embedded shapeBuf (zero heap allocation) when
+// the rank fits, otherwise falls back to a copied heap slice. It is the single
+// internal choke point for (re)assigning a tensor's shape; New, Clone and
+// Reshape all route through it so no code hand-writes the Shape slice.
+func (t *Tensor) useShape(dims []int) {
+	if len(dims) <= maxInlineRank {
+		copy(t.shapeBuf[:], dims)
+		t.Shape = t.shapeBuf[:len(dims)]
+		return
+	}
+	// rank > maxInlineRank: heap fallback (e.g. serialize's rank-8 tensors).
+	t.Shape = append([]int(nil), dims...)
+}
+
+// Reshape sets the tensor's shape to dims, storing ranks up to maxInlineRank
+// inline in the struct and falling back to a heap copy beyond that. It is the
+// exported replacement for the former direct `t.Shape = []int{...}` writes:
+// it re-points Shape without reallocating Data, so the caller must pass a
+// shape whose element count matches the existing buffer. Every dimension must
+// be non-negative; a negative dimension panics.
+func (t *Tensor) Reshape(dims ...int) {
+	for _, d := range dims {
+		if d < 0 {
+			panic(fmt.Sprintf("tensor.Reshape: negative dimension %d in shape %v", d, dims))
+		}
+	}
+	t.useShape(dims)
 }
 
 // New returns a zero-filled tensor with the given shape. Every dimension must
@@ -24,7 +75,8 @@ func New(shape ...int) *Tensor {
 			panic(fmt.Sprintf("tensor.New: negative dimension %d in shape %v", d, shape))
 		}
 	}
-	t := &Tensor{Shape: append([]int(nil), shape...)}
+	t := &Tensor{}
+	t.useShape(shape)
 	t.Data = make([]float32, t.Size())
 	return t
 }
@@ -111,7 +163,10 @@ func (t *Tensor) offset(idx []int) int {
 
 // Clone returns a deep copy.
 func (t *Tensor) Clone() *Tensor {
-	return &Tensor{Shape: append([]int(nil), t.Shape...), Data: append([]float32(nil), t.Data...)}
+	out := &Tensor{}
+	out.useShape(t.Shape)
+	out.Data = append([]float32(nil), t.Data...)
+	return out
 }
 
 // ZerosLike returns a zero-filled tensor with the same shape.
@@ -157,30 +212,6 @@ func (t *Tensor) IsRowVec() bool {
 		return true
 	}
 	return t.Dims() == 2 && t.Shape[0] == 1
-}
-
-// Stack stacks tensors along a new leading dimension. All inputs must share
-// one shape; the result has shape [len(ts), shape...].
-//
-// Experimental: stacking 2D inputs yields a 3D tensor, and no other operator
-// in this library (MatMul, the broadcasting binary ops, reductions, softmax
-// families) supports 3D tensors — they panic on Dims() != 2. Consume the
-// result manually (Data/Shape access) rather than feeding it back into ops.
-// Kept for API compatibility; know this before relying on it in new code.
-func Stack(ts ...*Tensor) *Tensor {
-	if len(ts) == 0 {
-		panic("tensor.Stack: no tensors")
-	}
-	shape := append([]int{len(ts)}, ts[0].Shape...)
-	out := New(shape...)
-	n := ts[0].Size()
-	for i, t := range ts {
-		if !SameShape(t, ts[0]) {
-			panic(fmt.Sprintf("tensor.Stack: shape %v does not match %v", t.Shape, ts[0].Shape))
-		}
-		copy(out.Data[i*n:(i+1)*n], t.Data)
-	}
-	return out
 }
 
 // String renders small tensors for debugging.

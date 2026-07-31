@@ -164,11 +164,14 @@ func broadcastShapeFresh(a, b *Tensor) (shape []int, fresh bool) {
 	}
 }
 
-// newAdopting builds a zero-filled tensor that adopts shape as its Shape
-// field without copying. Only for freshly allocated shape slices that no
-// other tensor references (see broadcastShapeFresh).
+// newAdopting builds a zero-filled tensor from a freshly allocated shape slice
+// that no other tensor references (see broadcastShapeFresh). The shape is
+// copied inline into the struct via useShape: since #12's inline backing this
+// is cheaper than the former heap adoption, which needed a separate shape
+// slice allocation that the inline path now avoids entirely.
 func newAdopting(shape []int) *Tensor {
-	t := &Tensor{Shape: shape}
+	t := &Tensor{}
+	t.useShape(shape)
 	t.Data = make([]float32, t.Size())
 	return t
 }
@@ -404,6 +407,9 @@ func MeanAll(a *Tensor) *Tensor {
 }
 
 // SumRows sums over axis 0 of a 2D tensor, returning shape [1, n].
+// The reduction output shapes are asymmetric (SumRows keeps a [1, n]
+// matrix while SumCols drops to 1D [m]); the convention was frozen as of
+// v0.4.0 — see doc/shapes-and-broadcasting.md for the rationale.
 func SumRows(a *Tensor) *Tensor {
 	m, n := a.Rows(), a.Cols()
 	out := New(1, n)
@@ -416,6 +422,9 @@ func SumRows(a *Tensor) *Tensor {
 }
 
 // SumCols sums over axis 1 of a 2D tensor, returning 1D shape [m].
+// The reduction output shapes are asymmetric (SumCols drops to 1D [m]
+// while SumRows keeps a [1, n] matrix); the convention was frozen as of
+// v0.4.0 — see doc/shapes-and-broadcasting.md for the rationale.
 func SumCols(a *Tensor) *Tensor {
 	m, n := a.Rows(), a.Cols()
 	out := New(m)
@@ -430,40 +439,31 @@ func SumCols(a *Tensor) *Tensor {
 }
 
 // SumToShape reduces a broadcast-produced gradient back to a target shape:
-// identical shape passes through, scalars get the total sum, row vectors get
-// column sums, column vectors get row sums. It panics on any other
-// combination. The result never aliases grad.
+// identical shape passes through (cloned), scalars get the total sum, row
+// vectors get column sums, column vectors get row sums. It panics on any
+// other combination. The result never aliases grad: the matching-shape arm
+// returns a Clone and every reduction arm (SumAll/SumRows/SumCols) allocates
+// a fresh buffer. The owning variant that once lived here (SumToShapeTake,
+// which returned grad itself on a shape match) moved into the autograd
+// package in v0.4.0 as the unexported sumToShapeTake — its only callers were
+// the backward path, and keeping an ownership footgun on the public surface
+// bought nothing external.
 func SumToShape(grad *Tensor, shape []int) *Tensor {
-	r := SumToShapeTake(grad, shape)
-	if r == grad {
-		return grad.Clone()
-	}
-	return r
-}
-
-// SumToShapeTake reduces grad to shape exactly like SumToShape, but takes
-// ownership of grad: when the shapes already match, grad itself is returned
-// without a defensive clone, and the caller must not use grad afterwards.
-// The autograd backward path uses this to hand fresh, exclusively-owned
-// gradient temporaries straight to leaves; every reduction branch still
-// allocates a new tensor. SumToShape keeps the alias-free contract for all
-// other callers.
-func SumToShapeTake(grad *Tensor, shape []int) *Tensor {
 	target := &Tensor{Shape: shape}
 	switch {
 	case SameShape(grad, target):
-		return grad
+		return grad.Clone()
 	case target.IsScalar():
 		return SumAll(grad)
 	case grad.Dims() == 2 && target.IsRowVec() && grad.Cols() == target.Size():
 		s := SumRows(grad)
 		if len(shape) == 1 {
-			s.Shape = []int{shape[0]}
+			s.Reshape(shape[0])
 		}
 		return s
 	case grad.Dims() == 2 && target.Dims() == 2 && target.Shape[1] == 1 && grad.Shape[0] == target.Shape[0]:
 		s := SumCols(grad)
-		s.Shape = []int{shape[0], 1}
+		s.Reshape(shape[0], 1)
 		return s
 	default:
 		panic(fmt.Sprintf("tensor.SumToShape: cannot reduce shape %v to %v", grad.Shape, shape))

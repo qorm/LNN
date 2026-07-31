@@ -53,7 +53,7 @@
 //   - indexing: wrong index count or out-of-bounds indices (At, Set),
 //     Scalar on a non-scalar, Rows/Cols on a non-2D tensor;
 //   - operations: MatMul shape mismatch, non-broadcastable operands,
-//     invalid slice ranges (SliceCol, SliceRow), Stack shape mismatch;
+//     invalid slice ranges (SliceCol, SliceRow);
 //   - reductions: MeanAll of an empty tensor panics because the mean of
 //     zero elements is undefined (SumAll of an empty tensor is 0).
 //

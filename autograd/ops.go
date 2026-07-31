@@ -54,7 +54,7 @@ func (v *Variable) runBackward() {
 		a.addGrad(tensor.MatMulTransB(v.Grad, b.Data))
 		b.addGrad(tensor.MatMulTransA(a.Data, v.Grad))
 	case opAdd:
-		// Ownership: the a-branch hands v.Grad to a via SumToShapeTake,
+		// Ownership: the a-branch hands v.Grad to a via sumToShapeTake,
 		// which returns v.Grad itself when a's shape matches (no
 		// reduction). That is safe because reverse-topological order
 		// guarantees every consumer of v has finished contributing before
@@ -66,13 +66,13 @@ func (v *Variable) runBackward() {
 		// would corrupt the other (e.g. Add(x, y) with both leaves reused
 		// downstream).
 		a, b := v.parents[0], v.parents[1]
-		a.addGrad(tensor.SumToShapeTake(v.Grad, a.Data.Shape))
+		a.addGrad(sumToShapeTake(v.Grad, a.Data.Shape))
 		b.addGrad(tensor.SumToShape(v.Grad, b.Data.Shape))
 	case opSub:
 		// The a-branch may take v.Grad directly (see opAdd). The b-branch
 		// goes through negReduce, whose result is always a fresh buffer.
 		a, b := v.parents[0], v.parents[1]
-		a.addGrad(tensor.SumToShapeTake(v.Grad, a.Data.Shape))
+		a.addGrad(sumToShapeTake(v.Grad, a.Data.Shape))
 		b.addGrad(negReduce(v.Grad, b.Data.Shape))
 	case opHadamard:
 		// Each branch produces a fresh buffer through hadamardReduce — the
@@ -295,13 +295,13 @@ func (v *Variable) runBackward() {
 			// replicate it exactly (see gradMatchesElemwise).
 			softmax := tensor.Exp(v.Data)
 			rowsum := tensor.SumCols(v.Grad)
-			rowsum.Shape = []int{rowsum.Size(), 1}
+			rowsum.Reshape(rowsum.Size(), 1)
 			a.addGrad(tensor.Sub(v.Grad, tensor.Hadamard(softmax, rowsum)))
 			return
 		}
 		softmax := tensor.Exp(v.Data)
 		rowsum := tensor.SumCols(v.Grad)
-		rowsum.Shape = []int{rowsum.Size(), 1}
+		rowsum.Reshape(rowsum.Size(), 1)
 		gd, sm, rs := v.Grad.Data, softmax.Data, rowsum.Data
 		n := v.Data.Cols()
 		r := tensor.New(v.Data.Shape...)
@@ -366,7 +366,43 @@ func (v *Variable) runBackward() {
 	}
 }
 
-// hadamardReduce evaluates SumToShapeTake(Hadamard(g, x), shape) — the
+// sumToShapeTake reduces grad to shape for the backward path, taking
+// ownership of grad: when the shapes already match, grad itself is returned
+// without a defensive clone, and the caller must not use grad afterwards
+// (reverse-topological order guarantees no later consumer reads it). Every
+// reduction arm still allocates a fresh buffer.
+//
+// Originally tensor.SumToShapeTake; moved into autograd in v0.4.0 and made
+// unexported to narrow the public API surface — its only callers were the
+// five backward sites in this file, and an ownership footgun on the exported
+// tensor surface bought nothing external. The cloning alias-free variant
+// (tensor.SumToShape) stays public for everyone else. Implemented purely on
+// exported tensor primitives (SameShape/IsScalar/Dims/IsRowVec/Cols/Size/
+// SumRows/SumCols/SumAll); the semantics and ownership contract, including
+// the irreducible panic text, are preserved verbatim.
+func sumToShapeTake(grad *tensor.Tensor, shape []int) *tensor.Tensor {
+	target := &tensor.Tensor{Shape: shape}
+	switch {
+	case tensor.SameShape(grad, target):
+		return grad
+	case target.IsScalar():
+		return tensor.SumAll(grad)
+	case grad.Dims() == 2 && target.IsRowVec() && grad.Cols() == target.Size():
+		s := tensor.SumRows(grad)
+		if len(shape) == 1 {
+			s.Reshape(shape[0])
+		}
+		return s
+	case grad.Dims() == 2 && target.Dims() == 2 && target.Shape[1] == 1 && grad.Shape[0] == target.Shape[0]:
+		s := tensor.SumCols(grad)
+		s.Reshape(shape[0], 1)
+		return s
+	default:
+		panic(fmt.Sprintf("tensor.SumToShape: cannot reduce shape %v to %v", grad.Shape, shape))
+	}
+}
+
+// hadamardReduce evaluates sumToShapeTake(Hadamard(g, x), shape) — the
 // gradient contribution of one operand of an elementwise product — without
 // materializing the full-size product when a reduction is due. When the
 // target shape matches g's AND the product's own broadcast shape, the
@@ -397,9 +433,9 @@ func hadamardReduce(g, x *tensor.Tensor, shape []int) *tensor.Tensor {
 		}
 		// The product's broadcast shape is wider than the target (the
 		// 1D-lift quirk above): reduce it exactly as the legacy chain did.
-		// SumToShapeTake returns a fresh buffer for every reduction branch,
+		// sumToShapeTake returns a fresh buffer for every reduction branch,
 		// and cannot alias p back to this caller.
-		return tensor.SumToShapeTake(p, shape)
+		return sumToShapeTake(p, shape)
 	}
 	// The fused branches below index the pairwise products in g's flat/row
 	// layout; that is exact only when the product would carry g's very
@@ -440,7 +476,7 @@ func hadamardReduce(g, x *tensor.Tensor, shape []int) *tensor.Tensor {
 			}
 		}
 		if len(shape) == 1 {
-			r.Shape = []int{shape[0]}
+			r.Reshape(shape[0])
 		}
 		return r
 	case len(g.Shape) == 2 && len(shape) == 2 && shape[1] == 1 && g.Shape[0] == shape[0] && productCarriesGShape(g, x):
@@ -457,7 +493,7 @@ func hadamardReduce(g, x *tensor.Tensor, shape []int) *tensor.Tensor {
 		}
 		return r
 	default:
-		return tensor.SumToShapeTake(tensor.Hadamard(g, x), shape)
+		return sumToShapeTake(tensor.Hadamard(g, x), shape)
 	}
 }
 
@@ -516,7 +552,7 @@ func flatSameLayout(g, x *tensor.Tensor) bool {
 	return sameShape(x.Shape, g.Shape) || sameShape(elemwiseGradShape(x.Shape), g.Shape)
 }
 
-// negReduce evaluates SumToShapeTake(Neg(g), shape) for the subtracted
+// negReduce evaluates sumToShapeTake(Neg(g), shape) for the subtracted
 // operand's gradient, fusing the sign flip into the reduction. Each addend
 // goes through mul32(v, -1), which reproduces tensor.Neg's v*(-1) multiply
 // exactly: bit-identical to a unary minus for finite values (the exact
@@ -546,7 +582,7 @@ func negReduce(g *tensor.Tensor, shape []int) *tensor.Tensor {
 			}
 		}
 		if len(shape) == 1 {
-			r.Shape = []int{shape[0]}
+			r.Reshape(shape[0])
 		}
 		return r
 	case len(g.Shape) == 2 && len(shape) == 2 && shape[1] == 1 && g.Shape[0] == shape[0]:
@@ -562,7 +598,7 @@ func negReduce(g *tensor.Tensor, shape []int) *tensor.Tensor {
 		}
 		return r
 	default:
-		return tensor.SumToShapeTake(tensor.Neg(g), shape)
+		return sumToShapeTake(tensor.Neg(g), shape)
 	}
 }
 

@@ -17,6 +17,7 @@
 | 7 | 双轨再进：序列化特性 + autograd 深改 + 发布 | ✅ 完成 |
 | 8 | v0.2 双轨：融合反向 + 序列化版本化 → 覆盖率收复 → 红队总扫 → v0.2.0 | ✅ 完成（v0.2.0→v0.2.2：CI 跨平台红灯两轮修复后双绿） |
 | 9 | v0.3 双轨：#14 稀疏收缩（根因修复）+ 优化器状态持久化 → 红队 → v0.3.0 | ✅ 完成（v0.3.0 已发布） |
+| 10 | API 稳定窗口：fuzzing 基建 + API 决策实施 → v0.4.0 | 🔄 进行中（Q-A ✅ / Q-B ✅ 用户拍板全采纳推荐 / 10b ✅ 实施完成 / 10c ✅ 双语文档同步完成，v0.4.0 待打 tag） |
 
 ## 阶段 1：并行分析（已完成）
 
@@ -210,6 +211,24 @@
 
 **红队·序列化组（已完成）**：7,500 变异体（位翻转/删除/插入/块交换，25% 叠连击）**0 panic / 0 静默错乱**（黑盒 oracle 重序列化核验掩码二值/形状/Step 健全；7 例"ok 垃圾入参"均为参数含 NaN/Inf 的忠实复现）；语义攻击全挡（张量顺序偷换/掩码注入 0.5/−1/2/NaN/跨 kind/未知 kind/version 0·2·99·255/UTF-16/大端伪流）；错误全透传（写端每个截断点、读端多偏移）；round-trip **训练动力学逐位等价**（加载后再训练 3 步的参数轨迹与同步训练锁死、种子无关）。**资源耗尽维度不安全**：F1 Medium——**无 Len() 读端**（网络/管道/gzip）绕过剩余字节守卫，~20 字节截断流逼出 64MiB～**4GiB** 分配（make 在读之前）；F2 Medium——`unfolds` 无上限，1<<20 展开 2.26s、1<<30 外推单次 Step ~38 分钟 CPU 耗尽（CfC 免疫）；F3 Low——count=maxCount−1 强分 8MiB 指针切片；F4 Low——加载不校验 erev∈{±1}（可造 NewLTC 永不能产生的细胞）；F5 Info——LoadParameters 保留陈旧 Grad 未文档化；F6 Info——限额私有且包注释"绝不无界分配"措辞掩盖 F1。**裁决：panic/语义维度安全，资源耗尽维度需补防——已派发修复（发布前置条件）**
 
+**Q-A（Go 原生 fuzzing 基建，已完成，零库改动）**：8 个 `func FuzzXxx` 目标 × 96 条手工种子（每条 f.Add 注释攻击意图）+ **7 条 fuzzer 沉淀回归语料**。Oracle 判据：永不 panic、失败零副作用（参考细胞/目标优化器重存字节恒等对照）、读端一致性（已知/未知长度 outcome 同）、重存幂等（Read→Write→Read 逐位）、上限不可绕过（重存解析头部断言 inDim/units∈[1,2048]、unfolds∈[1,1024]）、构造器禁裸崩（makeslice/index 裸崩即失败）、算子图叶梯度形状一致+种子线性性。**本机实测**：serialize/optimizer/tensor/autograd 达 **1.3–3.6M 执行/10s、0 panic**；180s autograd 长时专跑 clean。Makefile `fuzz`/`fuzz-smoke`（FUZZTIME/SMOKETIME 可调）+ CI 30s×8 冒烟 step（~4 分钟，YAML 校验通过）。**发现全部为 oracle 校准问题非库缺陷**（诚实留痕）：D1 autograd 线性性的浮点物理边界（二倍 Backward 累加重结合非逐位→改根种子×2 公式；±MaxFloat32/Exp→非有限图跳过；**灾难性抵消残差**——1e38 项相消残差偏 29 ULP、ULP 度量在 0 附近失效→仿射容差，真实公式 bug 为 O(1) 相对误差远超此窗）；D2 tensor 负维优先级（库行为正确，分类器修正）；7 条触发输入转为常驻回归语料。**互补既有测试**：读端一致性全量化、成功路径可逆幂等、失败零副作用可执行对照、构造器禁裸崩系统化、autograd 随机算子图（既有 autograd 测试无 fuzz）
+
+**10b API 决策实施（已完成，外部破坏面 0）**：
+- **#12②**：`shapeBuf [4]int` 非导出内嵌 + `useShape`（rank≤4 零堆分配、>4 堆回退保 serialize rank-8 兼容）+ **导出 `Reshape`（唯一 API 新增，含负维校验）**；New/Clone/newAdopting 经 useShape；Q-B 枚举 7 处 `.Shape=` 直写全数重路由；serialize/nn/optimizer 直构字面量择「保留+论证」（命名字段字面量在 useShape 语义下与堆回退分支逐位等价，全包测试绿确认解耦）
+- **Stack 删除**：函数 + TestStack + 2 个 panic 契约子测试 + **Q-A 的 FuzzTensorConstructors 3 处探针**（留 tombstone 注释"Stack deleted in v0.4.0 API hygiene"，其余探针保留）；全仓 .go 符号零残留（doc.go 文字提及留 10c）
+- **SumToShapeTake 内移**：autograd 新增非导出 `sumToShapeTake`（~20 行纯用 tensor 已导出原语重实现，语义+所有权契约+panic 文案逐字保持）；tensor 删除导出 Take、`SumToShape` 自包含重写（Clone 保 alias-free）；5 调用点重路由；测试迁 `autograd/sum_to_shape_take_test.go` + tensor 侧 panic 契约再锚定到仍公共的 SumToShape default 分支
+- **allocs 复现（当前树自洽 A/B）**：五基准 **−17.9%~−25.8%**（ChainForwardBackward −25.6%、DivDenLoop −25.8%、GatherRowsBackward −23.1%、LTCStep −17.9%、UnrollBackward −23.1%），与 Q-B −18~−26% 边界偏差 ≤0.2pp；tensor 8 基准每算子恰少 1 次 shape 分配（4→3 即 −25%、3→2 即 −33% 分母效应）。**诚实校准**：Q-B 留存 bench 基线（2442/33963）低于当前树（3296/41588）因其对测自 9a 稀疏收缩之前（2442×1.43≈3492 算术吻合 P-D 披露的 +43%），非同树不可直比——headline 以当前树 A/B 为准；墙钟 ±数% 噪声内持平（收益在 GC 卫生）
+- **门禁五绿**：两 example 逐字（0.690761→0.041996 / 0.620651→0.029091）、五包 -race 全绿、既有 want 值/数据断言 diff 自证零变更、**fuzz-smoke 8 目标全绿（Stack 探针清理后 tensor 目标仍运行）**、`go doc ./tensor` 四符号核验（Stack ABSENT / SumToShapeTake ABSENT / Reshape PRESENT / SumToShape PRESENT）
+
+**用户决策（Q-B 备忘拍板，四项全采纳推荐）**：①**#12 选②内嵌 backing**（−24% 分配、零 API 破坏）；②**#3 冻结 + 强化文档**（保住差分 oracle 资产）；③**Stack 删除**（库内 0 调用）；④**SumToShapeTake 移入 autograd 内部**（移除公共面脚枪）。决策组合外部破坏面 0，10b 实施 → 10c 文档 → v0.4.0
+
+**Q-B（API 设计评估备忘，已完成，主仓库零写入 + /tmp 原型已清理 + 146 行 patch 留存）**：零用户窗口前提下的四项实测评估：
+- **#12 定秩 Shape**：pprof 复测 tensor.New 占 60.42%（留档 64.9% 吻合）。原型（内嵌 [4]int backing、Shape []int 仍为真相源、零 API 变更）实测五基准 allocs **−18~−26%（确定性）**，但**墙钟交替 A/B 落在 ±2% 噪声内（早期 −6.1% 经交替法证伪为会话漂移）、B/op +3%**；数值逐位等价（两 example loss 逐位复现）。影响面：选①值类型破坏 **233 处 .Shape 访问 + 7 处直写**；选②内嵌 backing 仅 ~10 内部点、**零破坏且收益与①等同**（消除同一次堆分配）；选③并行字段严格劣于②。序列化/黄金向量解耦已核对。**推荐：若做选②，整体降级低优先（墙钟无实测收益）；反方论据：墙钟不动即不值得动最热数据结构→冻结**
+- **#3 形状约定**：真正昂贵的不是 SumRows/SumCols（合计 4 内部调用点）而是 **1D→[1,n] 升维**（11 处 elemwiseGradShape 直调 + 23 处升维守卫，融合反向逐位等价契约的核心），统一 = **差分 oracle（96k+52k+522 图）全失效 + 重做 P-B 量级等价证明 + ≥17 测试重写**，换来的只有对称性零性能收益。**推荐②冻结 + 文档（诚实专节已 90% 就位）；反方论据：零用户窗口是消除认知税的唯一时机**
+- **Stack**：库内调用 **0** / 文档示例 **0** / 仅 6 测试引用 → **推荐删除**（外部破坏 0）
+- **SumToShapeTake**：5 内部调用点、tensor 无需新增导出（原语全已导出、~20 行内部重实现）→ **推荐移入 autograd 内部**移除公共面脚枪
+- **打包推荐**：#12② + #3 冻结 + Stack 删除 + SumToShapeTake 内移；外部破坏面 **0**；诚实校准：唯一有数字的收益是 #12 的 −24% 分配次数（墙钟持平），价值在 GC 卫生（未量化）与 API 整洁度（窗口一次性红利）。**五项决策问题已呈库主拍板**
+
 **9c 双语文档同步（已完成，v0.3.0 文档关口闭合）**：12 个 .md 文件双语清偿 F9-2 全部欠账——persistence.md 新增「Optimizer state streams（LNO1）」整节（格式规格表/三优化器布局/续训逐位契约/不可信流纪律/索引同序契约/陈旧键语义，含 /tmp 实测示例转录逐行核对）；maxUnits 256→2048 四处 + 92·U² 重推双段结构；ltc.md 机制表 24 行行号全量刷新、向量化节整节改写为**稀疏收缩**（折叠+末端 MatMul 归一+项表+四约束+1164/522 组证据）、±0 节扩为三层（前向 +0/多源归一/**单源 −0 例外引 F9-1**）；cfc.md drive 机制按 contract 同构刷新；architecture 内存模型数字与 allocs↑/ns↓ 权衡诚实表述；pitfalls 路线图 #14 删除线标销账 + 状态持久化已完成行；README 双版 optimizer 描述补状态持久化、Status 三行刷新（optimizer 覆盖率实测 99.6% 不掩饰）、路线图领衔改 #12。**F9-1/F9-4 代码注释修正（仅注释，`git diff` 非注释行空自证）**：contract 约束③归一宣称限定多源路径 + 单源角明书（红队四组实测、值 0、轨迹零分歧、刻意接受）；betaPow 注释精确化（亚正规不动点 0x00000004@t965 / 0x000001f4@t96,902 实测吻合、早退仅对真归零 β 成立）。**行号终检**：44 处内联 .go 引用 + 58 处表格行号逐条回源（含自改注释致 ltc.go 495→509、cfc.go 392→398 的二次漂移修正）；**反查额外偏差 6 处并修**（persistence [1,256] 第二处、自改注释致 8 处行号失效、示例记录值逐字运行更正、gofmt 规范化、pitfalls SigmoidHadamard 采纳点 347→423、optimizer 覆盖率 100%→99.6% 实测更正）。终检全绿：gofmt 空/build/vet/test 五包/零断链/中英 8 对同构
 
 **红队·阶段 9（独立复核，已完成）**：**裁决 v0.3.0 无阻断项放行**。
@@ -349,16 +368,16 @@ Git 历史：`87ccf77` 基线 → `08aba45` 阶段3a → `102af40` 阶段3b → 
 |---|---|---|---|---|
 | 1 | 并发 Backward 数据竞争 | V-04 | 接受风险 | 单线程契约文档化（README + module.go），用户遵守契约即无风险 |
 | 2 | ~~`Div` 借 `Pow(-1)`~~ | 核心B/V-11 | — | ✅ **阶段 5 已销账**（闭式单节点，−11% 时延 / −6.7% allocs）；den≈eps 的 1/b² 梯度放大为数学本性，已文档化 |
-| 3 | `SumRows→[1,n]` vs `SumCols→[m]`、1D⊕1D→[1,n] 约定不对称 | 核心A/V-12 | Low | API 破坏性，另立评估（README 已披露） |
+| 3 | `SumRows→[1,n]` vs `SumCols→[m]`、1D⊕1D→[1,n] 约定不对称 | 核心A/V-12 | Low | **阶段 10 用户拍板冻结，依据见 Q-B 备忘实测**：统一的真实代价 = 使 96k+52k+522 图差分 oracle 全失效 + 重做 P-B 量级等价证明 + 重写 11 处 lift/23 处守卫/≥17 测试，换对称性零性能收益；零用户窗口评估后择冻结。已留档 doc/shapes-and-broadcasting.md 诚实专节 + SumRows/SumCols godoc |
 | 4 | Randn Box-Muller 尾部硬截断 ~7.43σ | V-13/F4 | Low | 对初始化可忽略，采样器用途需留意 |
 | 5 | tiny-ts 域（<1e-38）仅保有限性、物理保真退化 | F1 | Info | 正常训练域不受影响，留档 |
-| 6 | `Stack` 产出 3D 无消费方、ops.go 五职责 | 核心A/健康度 | 🟢 | Stack 已标注 Experimental；~~无 CI/Benchmark~~ ✅ 阶段 5 已补（GitHub Actions + 13 基准） |
+| 6 | `Stack` 产出 3D 无消费方、ops.go 五职责 | 核心A/健康度 | 🟢 | **Stack 于 v0.4.0 删除**（库内 0 调用 / 文档示例 0，公共面收窄）；~~无 CI/Benchmark~~ ✅ 阶段 5 已补（GitHub Actions + 13 基准）；ops.go 拆分仍 🟢 低优先 |
 | 7 | nn 热路径分配量（LTCStep 7372 allocs/op、Unroll 12 万 allocs/op） | D2 基准量化 | 🟢 | 已有基准尺子，图算子融合/掩码预施加为后续优化方向 |
 | 8 | 三份源码内旧包注释与 doc.go 并存 | D3 发现 | 🟢 | go 1.26 下 doc.go 胜出、用户无感，未来可清理 |
 | 9 | Backward 阶段逐节点固定开销（tensor.New 46%/Clone 20%/broadcast 闭包 14%） | P-A pprof | 🟢 | UnrollBackward 再压缩需 autograd 层改动（Sigmoid-Hadamard 融合反向、addGrad 原地写入、去闭包），独立工单候选 |
 | 10 | CfC 的 erev/sErev 以 Var 叶入图产生死梯度 | CfC 红队 | Info | LTC 已焙入 Const 指示阵；CfC 可同法优化，正确性无碍（Parameters 排除⇒优化器不可达），微量浪费 |
 | 11 | `NewSGD(+Inf)` 被字面校验放行；构造后字段可改非法值 | optimizer 红队 | Info | 信任模型自洽且已文档化，sgd.go 注释已补（6c） |
-| 12 | tensor.New 每节点前向输出 + Shape/Data 双分配（终态 pprof 64.9%） | P-B | 🟢 | 进一步压缩需 parents 定长槽化（受阻既有结构断言测试）与 Tensor 定秩 Shape（公共 API 禁区），独立工单候选 |
+| 12 | tensor.New 每节点前向输出 + Shape/Data 双分配（终态 pprof 64.9%） | P-B | 🟢 | **阶段 10 用户拍板选②内嵌 backing 已实施，−18~−26% allocs**（五基准本机复验：LTCStep 2,707 / UnrollBackward 31,994，墙钟持平 ±数%、字节 +3%）；内嵌 [4]int shapeBuf 消除 Shape 堆分配，新增导出 Reshape 取代 7 处直写，rank>4 堆回退保 serialize rank-8；选①值类型（破坏 233 处 .Shape 访问）因收益相同被否。余项：parents 定长槽化降级低优先（受阻既有结构断言测试） |
 | 13 | ~~Sigmoid-Hadamard 融合反向~~ | P-B | — | ✅ **阶段 8 已销账**（SigmoidHadamard 算子，−5.6%/−5.8%，结构上限实测终答） |
 | 14 | 指示矩阵 O(units³) 实体化（构造器与加载双悬崖） | 总扫红队 F1 | 🟡 | 加载侧已由 maxUnits 上限封堵；根因需稀疏收缩（不实体化 [units²,units]），独立工单候选 |
 
@@ -383,4 +402,7 @@ Git 历史：`87ccf77` 基线 → `08aba45` 阶段3a → `102af40` 阶段3b → 
 - 2026-07-30：**v0.2.2 再修（容差 4→16）**：按实测最大漂移 6 ULP 的 ~2.7 倍定窗，鉴别力守门同步收紧（32 ULP 必败、tolerance+1 必败、±0 折叠正确）；包注释与双语 persistence 全部精确化（1 ULP 单输出 / 6 ULP 构造链 / 16 窗口依据）。**CI 双绿**（v0.2.2 tag + main 均 success）、代理解析 v0.2.2 通过。诚实留痕：两轮才修好——第一轮对缩合链深度的估计错了，容忍值追逐了观测而非推导
 - 2026-07-30：**方法论教训（双重）**：①本地绿 ≠ 跨平台绿，CI 是验证链不可或缺的一环——此前所有逐位门禁都在同机成立；②容差型断言的容忍值必须覆盖**最坏构造链**而非首次观测值，且永远配鉴别力守门防止容差变纵容。另：go.mod 钉住 go 1.26.5（CI go-version-file）⇒ 严格 arm64 路径的稳定性锚定工具链版本，未来升 Go 须重评估黄金向量（-write-golden 门禁即为此设）
 - 2026-07-31：阶段 9 v0.3 双轨——9a 稀疏收缩（#14 根因销账：units³ 指示阵消灭、1164 组 oracle 逐位、units=1024 8GiB→36MiB、maxUnits 256→2048 同预算 8× 容量、ns −10~−16% 而 allocs 诚实披露 +30~43%）+ 优化器状态持久化（LNO1、续训逐位等价）（528b87a）；9b 红队放行无阻断——522 组差分逮住 F9-1 单源 ±0 角（值 0 无轨迹影响，裁决文档化而非代码修补，沿用 F-RT1 判例）、F9-2 文档欠账清单、betaPow 亚正规不动点；9c 双语清偿 + 注释精确化 + 102 处行号回源。
-- 2026-07-31：**发布 v0.3.0**（tag + 推送 + CI）；**全部九个阶段关闭**。覆盖率终值 tensor 99.7 / autograd 100 / nn 100 / optimizer 99.6 / serialize 97.8
+- 2026-07-31：**发布 v0.3.0**（tag + 推送；CI 双绿：v0.3.0 tag 流水线 + main 流水线均 success；tag 解析经 GOPROXY=direct 与 goproxy.cn 镜像实测通过，proxy.golang.org 当时对本环境网络抖动、同日 v0.2.x 经其正常）；**全部九个阶段关闭**。覆盖率终值 tensor 99.7 / autograd 100 / nn 100 / optimizer 99.6 / serialize 97.8。Git 终态 17 提交、5 个版本标签（v0.1.0/v0.2.0/v0.2.1/v0.2.2/v0.3.0）、27 个 agent
+- 2026-07-31：阶段 10 启动——Q-A fuzzing 基建完成（8 目标 × 96 手工种子 + 7 条沉淀回归语料，本机 1.3–3.6M 执行/10s 全 0 panic，发现全部为 oracle 校准问题非库缺陷）+ Q-B API 设计评估备忘完成（主仓库零写入 + /tmp 原型实测四项：#12 内嵌 backing −18~−26% allocs 而墙钟 ±2% 噪声内持平 / #3 统一成本量化 / Stack 零调用 / SumToShapeTake 5 内部调用点）；**用户拍板四项全采纳推荐**（#12② 内嵌 backing / #3 冻结 + 强化文档 / Stack 删除 / SumToShapeTake 内移 autograd，组合外部破坏面 0）
+- 2026-07-31：**10b API 决策实施完成**（外部破坏面 0）：shapeBuf [4]int 内嵌 + useShape 单一收口 + 导出 Reshape（唯一 API 新增，含负维校验）；Stack 函数/测试/Q-A 三探针全删（留 tombstone）；SumToShapeTake 内移 autograd 非导出（语义+契约+panic 文案逐字保持，5 调用点重路由）。五基准 allocs −17.9%~−25.8%（本机复验终值 LTCStep 2,707 / UnrollBackward 31,994，累计 −63%/−73%），墙钟持平、字节 +3%；门禁五绿（两 example 逐字 / 五包 -race / 断言 diff 空 / fuzz-smoke 8 目标 / go doc 四符号核验）
+- 2026-07-31：**10c 双语文档同步完成**（Q-B §5 文档清单五项 + 10b 同步，14 文件双语同构）：Stack 文档四处清除（tensor/doc.go panic 列表 + pitfalls/shapes 双版）、SumToShapeTake 内移同步（architecture 所有权节 + shapes 归约节）、#12 决策留档（architecture 性能节新增「内嵌形状 backing」专节 + pitfalls 路线图表）、#3 冻结留档（shapes 诚实专节补决策依据 + SumRows/SumCols godoc 各补不对称指引）、README 双版阶段 10 语境 + 领衔改写；行号回源 44 处（autograd/ops.go 漂移修正 4 处：Div 793-810→829-846、GatherRows 855→891；nn 引用零漂移全验）。终检全绿：gofmt 空 / build / vet / test 五包 / 零断链 / .go 非注释行 diff 空自证。**v0.4.0 文档关口闭合，待打 tag**

@@ -20,7 +20,7 @@ no code generation, no GPU backend, no operator overloading tricks — just Go.
 
 | Package | Purpose |
 |---|---|
-| `github.com/qorm/LNN/tensor` | Dense row-major `float32` tensors with a 1D/2D-focused op set: matmul, elementwise math with limited broadcasting, activations, reductions, slicing, random initialization. |
+| `github.com/qorm/LNN/tensor` | Dense row-major `float32` tensors with a 1D/2D-focused op set: matmul, elementwise math with limited broadcasting, activations, reductions, slicing, random initialization. Since v0.4.0, shapes up to rank 4 are stored inline in the tensor (one fewer heap allocation per construction), and `Tensor.Reshape` re-points a shape without reallocating. |
 | `github.com/qorm/LNN/autograd` | A dynamic computation-graph engine. Each op tags its output `Variable` with an op kind; `Backward` walks the graph in reverse topological order, dispatches each node's gradient propagation, and accumulates gradients into leaves. |
 | `github.com/qorm/LNN/nn` | Neural-network building blocks: `Linear` layers, `Wiring` synapse topologies, the `LTC` liquid cell and its closed-form sibling `CfC`, and the `Cell`/`Unroll` abstractions for driving recurrent cells over sequences. |
 | `github.com/qorm/LNN/optimizer` | Explicit parameter-update rules over `autograd`: SGD, heavy-ball Momentum, and Adam (Kingma & Ba, bias-corrected). One `Step(params)` call replaces the hand-rolled update loop. State persistence (`SaveState`/`LoadState`, `"LNO1"` streams) makes resumed training bit-identical to uninterrupted training. |
@@ -218,13 +218,17 @@ recommended production form — caller-owned gradient-norm clipping plus
   contraction eliminated the dense `[units², units]` indicator matrices
   entirely (construction of a fully-wired `units = 1024` cell costs
   ~32 MB, not the old ~8 GiB). The phase-7 backward overhaul halved the
-  per-node allocations, and the phase-8 Sigmoid–Hadamard fusion trimmed
-  them further (measured: `LTCStep` 3,296 allocs/op, `UnrollBackward`
-  41,588 — cumulative −55%/−65% from the original loop; the phase-9 step
-  raised allocs ~43%/~30% but cut wall-clock ~21%/~13% — allocation
-  counts were traded away for useless compute). Keep `units`, `unfolds`
-  and sequence length modest on this engine; the `CfC` cell
-  ([doc/cfc.md](doc/cfc.md)) has no `unfolds` factor at all.
+  per-node allocations, the phase-8 Sigmoid–Hadamard fusion trimmed
+  them further, and the phase-10 embedded shape backing (inline `[4]int`
+  shape storage) cut one more allocation per tensor construction
+  (measured now: `LTCStep` 2,707 allocs/op, `UnrollBackward` 31,994 —
+  cumulative −63%/−73% from the original loop; the phase-9 step raised
+  allocs ~43%/~30% but cut wall-clock ~21%/~13%, and phase 10 took
+  allocs down a further −18%/−23% with wall-clock flat — allocation
+  counts were traded away for useless compute first, then for GC
+  hygiene). Keep `units`, `unfolds` and sequence length modest on this
+  engine; the `CfC` cell ([doc/cfc.md](doc/cfc.md)) has no `unfolds`
+  factor at all.
 
 ## Concurrency contract
 
@@ -248,7 +252,7 @@ Honest maturity assessment as of this commit (coverage measured with
 
 | Package | Status |
 |---|---|
-| `tensor` | Core is stable and well tested (~99.7% line coverage). The single residual uncovered statement is a double-constant fill-loop body in `broadcastBinary` that is argued unreachable (its column count is always `1` on that path, so the loop never executes, and the `[1,1]×[1,1]` case is intercepted by the same-shape fast path first); it is documented rather than padded with a contrived test. The transpose-aware MatMul kernels added in phase 7 are exercised through the `autograd` package's tests. |
+| `tensor` | Core is stable and well tested (~99.7% line coverage). The single residual uncovered statement is a double-constant fill-loop body in `broadcastBinary` that is argued unreachable (its column count is always `1` on that path, so the loop never executes, and the `[1,1]×[1,1]` case is intercepted by the same-shape fast path first); it is documented rather than padded with a contrived test. The transpose-aware MatMul kernels added in phase 7 are exercised through the `autograd` package's tests. The v0.4.0 embedded shape backing removed one heap allocation per tensor construction (benchmark allocations −18~−26%, wall-clock neutral within noise). |
 | `autograd` | Stable and well tested (100% line coverage); gradients pass finite-difference and bitwise-differential checks across the covered paths, including the phase-7 legacy-composition fallback branches for irregular manually seeded gradients and the phase-8 Sigmoid–Hadamard fusion's regular and fallback paths. |
 | `nn` | Functional and well tested (100% line coverage): the LTC and CfC forward/backward paths are regression-tested, including closed-form degenerate-case checks, tiny/NaN `ts` guards, wiring validation, and Save/Load round-trips (a legitimate `units = 2048` stream round-trips at the load limit). Reversal potentials are fixed ±1 constants in both cells, carried by row-view constants over the sparse contraction — not trainable, and with no dead gradient (structurally impossible). The phase-9 sparse contraction is regression-tested bitwise against the former indicator-matrix implementation, with a large-cell memory gate. CfC is a phase-6 feature and its API may still evolve. |
 | `optimizer` | Stable, ~99.6% line coverage (the sole uncovered statement is a physically unreachable parameter-count guard): the three update rules are verified against independent reference implementations (SGD bit-for-bit, Adam ~1.6e-6 vs a float64 reference), the pointer-keyed state semantics are regression-tested, and state persistence (`SaveState`/`LoadState`, `"LNO1"` streams) is pinned by bit-exact resume tests (50+50 vs 100 steps, all three optimizers) and hostile-stream tests (validate-all-then-apply with zero side effects, byte-budget gates). |
@@ -273,10 +277,23 @@ O(units³) indicator matrices (construction ~32 MB at `units = 1024`,
 not ~8 GiB; the load caps were re-derived `256 → 2048` on the new
 O(units²) model, honoring the proportional-allocation contract at the
 root) — and added optimizer state persistence (`SaveState`/`LoadState`,
-`"LNO1"` streams, bit-exact resume for all three optimizers). The
+`"LNO1"` streams, bit-exact resume for all three optimizers). Phase 10
+(v0.4.0) was an API-hygiene pass with zero breakage for documented
+usage: #12 closed with the embedded `[4]int` shape backing (allocations
+−18~−26%, wall-clock neutral, the new exported `Tensor.Reshape`
+replacing direct `Shape` writes); `tensor.Stack` deleted (zero
+in-library callers — its 3D output was consumed by no op); the
+ownership-contract `SumToShapeTake` moved inside `autograd`, leaving
+only the alias-free `SumToShape` on the public surface; and the
+asymmetric reduction conventions (#3) frozen after evaluation —
+unifying them would void the ~148k-graph differential-fuzz evidence
+base for symmetry alone (decision trail in
+[doc/shapes-and-broadcasting.md](doc/shapes-and-broadcasting.md)). The
 remaining roadmap is the technical-debt table in
-[doc/pitfalls.md](doc/pitfalls.md) — headlined by `tensor.New`'s fixed
-per-node overhead (#12).
+[doc/pitfalls.md](doc/pitfalls.md); with #12 closed, every remaining
+entry is accepted-risk or informational grade — the sole
+performance-flavored candidate left (fixed-capacity parent slots in the
+graph node) is low priority.
 
 Track the remediation plan and progress in `PLAN.md` and `PROGRESS.md`.
 

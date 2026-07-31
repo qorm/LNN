@@ -154,7 +154,7 @@ it (所有权移交, ownership transfer). Every backward case passes either a
 freshly allocated tensor or a buffer it dedicates to that call, so no
 other reference can observe later accumulation into it. The `Add` case
 shows the design at its sharpest: the a-branch hands `v.Grad` itself to
-`a` via the taking `tensor.SumToShapeTake` (safe because reverse
+`a` via the taking reducer `sumToShapeTake` (safe because reverse
 topological order guarantees every consumer of `v` has finished before
 this step runs), while the b-branch deliberately goes through the
 *cloning* `SumToShape` — when both operands share `v`'s shape it must
@@ -169,6 +169,14 @@ audit lives in the comments of `autograd/ops.go`, and the alias design is
 pinned by dedicated probes (`autograd/alias_probe_test.go`, plus the
 shape-contract regressions in `autograd/f1_regress_test.go`) — the
 Clone share of backward allocations fell from ~20% to ~1%.
+
+`sumToShapeTake` itself is autograd-internal since v0.4.0: it used to be
+the exported `tensor.SumToShapeTake`, but its only callers were the five
+backward sites in `autograd/ops.go`, and an ownership footgun on the
+public tensor surface bought nothing external — so it moved in and was
+unexported (semantics, ownership contract and panic text preserved
+verbatim). The cloning, alias-free `SumToShape` remains the sole public
+reducer.
 
 ### Fused backward passes — and the FMA barrier
 
@@ -270,9 +278,42 @@ single-digit number it is: each fused site saves exactly one graph node
 plus one backward intermediate tensor, and the structure accounts close
 exactly (`LTCStep` 68 sites × 2 allocations = 136 = the difference;
 `UnrollBackward` 396 sites × 5 = 1,980). What remains is `tensor.New`'s
-fixed per-node overhead (the roadmap item above) — this is the measured
-structural ceiling for fusion on this engine, the answer the earlier
-"cost/fragility" question was waiting for.
+fixed per-node overhead (addressed in the next section) — this is the
+measured structural ceiling for fusion on this engine, the answer the
+earlier "cost/fragility" question was waiting for.
+
+### Embedded shape backing — the phase-10 allocation cut
+
+The fixed per-node overhead tracked since phase 6 as roadmap item #12:
+every graph node pays for its forward output tensor, and every tensor
+construction paid twice — once for the `Tensor` with its `Data` buffer,
+once more for the `Shape` `[]int` slice on the heap. Profiling put the
+share at 64.9% of the remaining allocations (re-measured 60.4% just
+before the fix). v0.4.0 removed the `Shape` half by embedding a `[4]int`
+shape buffer (embedded backing — an inline `shapeBuf` in the struct):
+`Shape` stays the `[]int` single source of truth, but for rank ≤ 4 it
+points into the struct itself, at zero heap allocation; ranks beyond 4 —
+only `serialize`'s wire stream carries tensors up to rank 8 — fall back
+to a copied heap slice, so compatibility is preserved.
+
+The decision trail is worth keeping, because the honest numbers argue
+against *and* for the change at once. Prototyping measured the five
+benchmarks at **−18~−26% allocs/op** (deterministic; the eight
+tensor-operator benchmarks each lost exactly one shape allocation, −25%
+where the count went 4→3), but wall-clock landed inside **±a few % of
+noise** in interleaved A/B runs and `B/op` rose ~3% (the embedded buffer
+enlarges every `Tensor`): the benefit is allocation count and GC
+hygiene, not throughput. Two implementations were on the table: option
+①, a value-type shape field, would remove the same allocation but break
+all **233** `.Shape` accesses plus **7** direct writes — an API rupture
+for the same gain; option ②, the embedded backing, touches ~10 internal
+sites and breaks nothing (read paths untouched, exported field type
+unchanged). The library owner chose ②; the sole API addition is the
+exported `Tensor.Reshape`, the sanctioned replacement for direct
+`t.Shape = …` writes (negative dimensions panic). The same v0.4.0
+API-hygiene pass deleted `tensor.Stack` (3D output no op consumes, zero
+in-library callers) and moved the ownership-contract `SumToShapeTake`
+into autograd internals (above).
 
 ### Non-leaf gradients are set to nil after each traversal — and why
 
@@ -300,10 +341,11 @@ down from O(units²) per-synapse nodes, and from the dense
 materialized O(units³) float32s, at construction *and* at load time;
 see [persistence.md](persistence.md)). The phase-7 backward overhaul
 (above) halved the per-node allocation count, and the phase-8
-Sigmoid–Hadamard fusion took it further still. Measured now: `LTCStep`
-**3,296 allocs/op** and `UnrollBackward` **41,588** — cumulative
-**−55% and −65%** from the original per-synapse loop
-(7,360 / 120,163). The phase-9 step is an honest trade: allocs went
+Sigmoid–Hadamard fusion took it further still, and the phase-10
+embedded shape backing (above) removed one more allocation per tensor
+construction. Measured now: `LTCStep` **2,707 allocs/op** and
+`UnrollBackward` **31,994** — cumulative **−63% and −73%** from the
+original per-synapse loop (7,360 / 120,163). The phase-9 step is an honest trade: allocs went
 *up* ~43%/~30% over the phase-8 values (2,306 / 31,983; the fold's
 per-stage cloning) but ns/op went *down* ~21%/~13% (independent
 red-team rerun), because the dense indicator MatMuls' O(units³) idle
