@@ -17,7 +17,7 @@ for every "what shape comes out?" question.
 
 | 2D only (panic on other ranks) | any rank |
 |---|---|
-| `MatMul`, `Transpose`, `Rows`, `Cols`, `ConcatCol`, `SliceCol`, `SliceRow`, `SoftmaxRows`, `LogSoftmaxRows`, `SumRows`, `SumCols` | `Add`, `Sub`, `Hadamard`, `Scale`, `Neg`, `Apply`, `Tanh`, `Sigmoid`, `Exp`, `Log`, `Pow`, `Softplus`, `Clip`, `SumAll`, `MeanAll` |
+| `MatMul`, `MatMulTransA`, `MatMulTransB`, `Transpose`, `Rows`, `Cols`, `ConcatCol`, `SliceCol`, `SliceRow`, `SoftmaxRows`, `LogSoftmaxRows`, `SumRows`, `SumCols` | `Add`, `Sub`, `Hadamard`, `Scale`, `Neg`, `Apply`, `Tanh`, `Sigmoid`, `Exp`, `Log`, `Pow`, `Softplus`, `Clip`, `SumAll`, `MeanAll` |
 
 `MatMul` is matrix multiplication only: `[m, k] × [k, n] → [m, n]`, with a
 panic on rank or inner-dimension mismatch.

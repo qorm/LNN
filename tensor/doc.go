@@ -21,13 +21,14 @@
 //
 // # Shape conventions
 //
-// The library is intentionally 1D/2D-focused. MatMul, Transpose, Rows, Cols,
-// ConcatCol, SliceCol, SliceRow, SoftmaxRows and LogSoftmaxRows are defined
-// for matrices only and panic on other ranks. Elementwise operations (Add,
-// Sub, Hadamard, the unary math family, Apply) work on any shape, but the
-// binary ops promote a 1D-vs-1D result to shape [1, n], and the axis
-// reductions are asymmetric: SumRows returns [1, n] while SumCols returns
-// [m]. See doc/shapes-and-broadcasting.md for the full table and rationale.
+// The library is intentionally 1D/2D-focused. MatMul, MatMulTransA,
+// MatMulTransB, Transpose, Rows, Cols, ConcatCol, SliceCol, SliceRow,
+// SumRows, SumCols, SoftmaxRows and LogSoftmaxRows are defined for matrices
+// only and panic on other ranks. Elementwise operations (Add, Sub, Hadamard,
+// the unary math family, Apply) work on any shape, but the binary ops
+// promote a 1D-vs-1D result to shape [1, n], and the axis reductions are
+// asymmetric: SumRows returns [1, n] while SumCols returns [m]. See
+// doc/shapes-and-broadcasting.md for the full table and rationale.
 //
 // # Broadcasting
 //

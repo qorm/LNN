@@ -5,7 +5,10 @@ import (
 	"math"
 )
 
-// MatMul multiplies two 2D tensors: [m, k] x [k, n] -> [m, n].
+// MatMul multiplies two 2D tensors: a of shape [m, k] times b of shape
+// [k, n] yields a fresh [m, n] tensor. It is matrix multiplication only —
+// no batched or vector products. Panics if either operand is not 2D, or
+// if the inner dimensions disagree (a.Cols() != b.Rows()).
 func MatMul(a, b *Tensor) *Tensor {
 	if a.Dims() != 2 || b.Dims() != 2 || a.Cols() != b.Rows() {
 		panic(fmt.Sprintf("tensor.MatMul: shapes %v and %v are incompatible", a.Shape, b.Shape))
@@ -29,7 +32,8 @@ func MatMul(a, b *Tensor) *Tensor {
 	return out
 }
 
-// Transpose returns the transpose of a 2D tensor.
+// Transpose returns the transpose of a 2D tensor: [m, n] -> [n, m], in a
+// fresh buffer. Panics if a is not 2D.
 func Transpose(a *Tensor) *Tensor {
 	m, n := a.Rows(), a.Cols()
 	out := New(n, m)
@@ -46,7 +50,8 @@ func Transpose(a *Tensor) *Tensor {
 // evaluates exactly the same products and accumulation order as
 // MatMul(Transpose(a), b) — the transposed entries are read in place in the
 // same zero-skipping loop — without allocating the transpose. Used by the
-// autograd backward of MatMul.
+// autograd backward of MatMul. Panics if either operand is not 2D, or if
+// the row counts disagree (a.Rows() != b.Rows()).
 func MatMulTransA(a, b *Tensor) *Tensor {
 	if a.Dims() != 2 || b.Dims() != 2 || a.Rows() != b.Rows() {
 		panic(fmt.Sprintf("tensor.MatMulTransA: shapes %v and %v are incompatible", a.Shape, b.Shape))
@@ -74,7 +79,8 @@ func MatMulTransA(a, b *Tensor) *Tensor {
 // evaluates exactly the same products and accumulation order as
 // MatMul(a, Transpose(b)) — the transposed entries are read in place in the
 // same zero-skipping loop — without allocating the transpose. Used by the
-// autograd backward of MatMul.
+// autograd backward of MatMul. Panics if either operand is not 2D, or if
+// the column counts disagree (a.Cols() != b.Cols()).
 func MatMulTransB(a, b *Tensor) *Tensor {
 	if a.Dims() != 2 || b.Dims() != 2 || a.Cols() != b.Cols() {
 		panic(fmt.Sprintf("tensor.MatMulTransB: shapes %v and %v are incompatible", a.Shape, b.Shape))
@@ -254,22 +260,39 @@ func bcastRowAccess(mode, i, cols int) (base, stride int) {
 	}
 }
 
-// Add computes a + b with broadcasting.
+// Add computes a + b with broadcasting, returning a fresh tensor. The
+// operand shapes must match one of the enumerated broadcasting rules in
+// the package doc (and doc/shapes-and-broadcasting.md): identical shapes,
+// scalar against anything, row/column vector against a matrix, or the
+// [m, 1] x row-vector outer product. Panics on any other combination
+// ("not broadcastable"). Two 1D operands yield a [1, n] result (the 1D
+// output promotion); in particular [1] + [1] yields [1, 1], and only
+// rank-0 ([], from tensor.New()) operands produce a [1] result.
 func Add(a, b *Tensor) *Tensor {
 	return broadcastBinary(a, b, func(x, y float32) float32 { return x + y })
 }
 
-// Sub computes a - b with broadcasting.
+// Sub computes a - b with broadcasting, returning a fresh tensor. The
+// operands follow the same enumerated broadcasting rules as Add (package
+// doc, doc/shapes-and-broadcasting.md) and panic on any other combination
+// ("not broadcastable"), with the same [1, n] promotion for two 1D
+// operands.
 func Sub(a, b *Tensor) *Tensor {
 	return broadcastBinary(a, b, func(x, y float32) float32 { return x - y })
 }
 
-// Hadamard computes elementwise a * b with broadcasting.
+// Hadamard computes elementwise a * b with broadcasting, returning a
+// fresh tensor. The operands follow the same enumerated broadcasting
+// rules as Add (package doc, doc/shapes-and-broadcasting.md) and panic on
+// any other combination ("not broadcastable"); in particular [m, 1]
+// against a row vector produces the outer product [m, n], and two 1D
+// operands yield a [1, n] result.
 func Hadamard(a, b *Tensor) *Tensor {
 	return broadcastBinary(a, b, func(x, y float32) float32 { return x * y })
 }
 
-// Scale multiplies every element by s.
+// Scale multiplies every element of a by the constant s, returning a
+// fresh tensor of the same shape (any rank). It does not modify a.
 func Scale(a *Tensor, s float32) *Tensor {
 	out := a.ZerosLike()
 	for i, v := range a.Data {
@@ -278,10 +301,13 @@ func Scale(a *Tensor, s float32) *Tensor {
 	return out
 }
 
-// Neg negates every element.
+// Neg negates every element, returning a fresh tensor of the same shape.
+// It is Scale(a, -1).
 func Neg(a *Tensor) *Tensor { return Scale(a, -1) }
 
-// Apply maps f over every element.
+// Apply maps f over every element of a in flat row-major order,
+// returning a fresh tensor of the same shape (any rank). It does not
+// modify a; f must not retain or mutate the tensor.
 func Apply(a *Tensor, f func(float32) float32) *Tensor {
 	out := a.ZerosLike()
 	for i, v := range a.Data {
@@ -299,30 +325,44 @@ func sigmoid(x float32) float32 {
 	return e / (1 + e)
 }
 
-// Tanh applies tanh elementwise.
+// Tanh applies tanh elementwise, returning a fresh tensor of the same
+// shape (any rank).
 func Tanh(a *Tensor) *Tensor {
 	return Apply(a, func(x float32) float32 { return float32(math.Tanh(float64(x))) })
 }
 
-// Sigmoid applies the logistic sigmoid elementwise.
+// Sigmoid applies the logistic sigmoid 1/(1+e^-x) elementwise, in a
+// numerically stable form, returning a fresh tensor of the same shape
+// (any rank).
 func Sigmoid(a *Tensor) *Tensor { return Apply(a, sigmoid) }
 
-// Exp applies exp elementwise.
+// Exp applies exp elementwise, returning a fresh tensor of the same
+// shape (any rank). Large inputs overflow to +Inf like plain float32
+// arithmetic (no domain checking, per the package doc).
 func Exp(a *Tensor) *Tensor {
 	return Apply(a, func(x float32) float32 { return float32(math.Exp(float64(x))) })
 }
 
-// Log applies natural log elementwise.
+// Log applies natural log elementwise, returning a fresh tensor of the
+// same shape (any rank). The domain is not checked: log of a negative
+// element is NaN and log of zero is -Inf, exactly as float32 arithmetic
+// dictates (per the package doc).
 func Log(a *Tensor) *Tensor {
 	return Apply(a, func(x float32) float32 { return float32(math.Log(float64(x))) })
 }
 
-// Pow raises every element to p.
+// Pow raises every element of a to the constant power p, returning a
+// fresh tensor of the same shape (any rank). The domain is not checked:
+// a negative element with a non-integer p yields NaN, as float32
+// arithmetic dictates (per the package doc).
 func Pow(a *Tensor, p float32) *Tensor {
 	return Apply(a, func(x float32) float32 { return float32(math.Pow(float64(x), float64(p))) })
 }
 
-// Softplus applies log(1 + e^x) elementwise, stably.
+// Softplus applies log(1 + e^x) elementwise, returning a fresh tensor of
+// the same shape (any rank). It is numerically stable: elements above 20
+// return x itself, where log(1 + e^x) rounds to x in float32 anyway, so
+// large inputs never overflow through exp.
 func Softplus(a *Tensor) *Tensor {
 	return Apply(a, func(x float32) float32 {
 		if x > 20 {
@@ -332,7 +372,10 @@ func Softplus(a *Tensor) *Tensor {
 	})
 }
 
-// Clip clamps every element to [lo, hi].
+// Clip clamps every element of a to [lo, hi], returning a fresh tensor
+// of the same shape (any rank). It expects lo <= hi; with lo > hi every
+// element maps to one of the two bounds (elements below lo to lo, all
+// others to hi), which is almost never what a caller wants.
 func Clip(a *Tensor, lo, hi float32) *Tensor {
 	return Apply(a, func(x float32) float32 {
 		if x < lo {
@@ -345,7 +388,11 @@ func Clip(a *Tensor, lo, hi float32) *Tensor {
 	})
 }
 
-// ConcatCol concatenates 2D tensors along the column axis.
+// ConcatCol concatenates 2D tensors along the column axis: inputs of
+// shapes [m, n1], [m, n2], ... yield a fresh [m, n1+n2+...] tensor,
+// copies of the inputs laid side by side. Panics if called with no
+// tensors, if any input is not 2D, or if the inputs have differing row
+// counts.
 func ConcatCol(ts ...*Tensor) *Tensor {
 	if len(ts) == 0 {
 		panic("tensor.ConcatCol: no tensors")
@@ -369,7 +416,10 @@ func ConcatCol(ts ...*Tensor) *Tensor {
 	return out
 }
 
-// SliceCol returns columns [from, to) of a 2D tensor.
+// SliceCol returns columns [from, to) of a 2D tensor as a fresh [m,
+// to-from] copy (no storage is shared with a). Panics if a is not 2D,
+// or if the range is invalid or empty: from < 0, to > a.Cols(), or
+// from >= to.
 func SliceCol(a *Tensor, from, to int) *Tensor {
 	if a.Dims() != 2 || from < 0 || to > a.Cols() || from >= to {
 		panic(fmt.Sprintf("tensor.SliceCol: invalid range [%d, %d) for shape %v", from, to, a.Shape))
@@ -382,7 +432,9 @@ func SliceCol(a *Tensor, from, to int) *Tensor {
 	return out
 }
 
-// SliceRow returns row i of a 2D tensor with shape [1, n].
+// SliceRow returns row i of a 2D tensor as a fresh [1, n] copy (no
+// storage is shared with a). Panics if a is not 2D, or if i is outside
+// [0, a.Rows()).
 func SliceRow(a *Tensor, i int) *Tensor {
 	if a.Dims() != 2 || i < 0 || i >= a.Rows() {
 		panic(fmt.Sprintf("tensor.SliceRow: invalid row %d for shape %v", i, a.Shape))
@@ -393,7 +445,8 @@ func SliceRow(a *Tensor, i int) *Tensor {
 	return out
 }
 
-// SumAll returns the sum of all elements as a scalar tensor.
+// SumAll returns the sum of all elements of a (any rank) as a scalar
+// tensor of shape [1]. The sum of an empty tensor is 0.
 func SumAll(a *Tensor) *Tensor {
 	var s float32
 	for _, v := range a.Data {
@@ -402,9 +455,10 @@ func SumAll(a *Tensor) *Tensor {
 	return FromData([]float32{s}, 1)
 }
 
-// MeanAll returns the mean of all elements as a scalar tensor. It panics on
-// an empty tensor: the mean of zero elements is undefined, and dividing by
-// Size()==0 would silently produce NaN.
+// MeanAll returns the mean of all elements of a (any rank) as a scalar
+// tensor of shape [1]. Panics on an empty tensor: the mean of zero
+// elements is undefined, and dividing by Size()==0 would silently
+// produce NaN.
 func MeanAll(a *Tensor) *Tensor {
 	if a.Size() == 0 {
 		panic(fmt.Sprintf("tensor.MeanAll: mean of empty tensor (shape %v) is undefined", a.Shape))
@@ -412,10 +466,13 @@ func MeanAll(a *Tensor) *Tensor {
 	return FromData([]float32{SumAll(a).Data[0] / float32(a.Size())}, 1)
 }
 
-// SumRows sums over axis 0 of a 2D tensor, returning shape [1, n].
-// The reduction output shapes are asymmetric (SumRows keeps a [1, n]
-// matrix while SumCols drops to 1D [m]); the convention was frozen as of
-// v0.4.0 — see doc/shapes-and-broadcasting.md for the rationale.
+// SumRows sums over axis 0 of a 2D tensor [m, n], returning the column
+// sums as a [1, n] matrix (deliberately kept 2D so the result
+// re-broadcasts against [m, n]). Panics if a is not 2D. The reduction
+// output shapes are asymmetric (SumRows keeps a [1, n] matrix while
+// SumCols drops to 1D [m]); the convention was frozen as of v0.4.0 —
+// see doc/shapes-and-broadcasting.md for the rationale and the full
+// reduction table.
 func SumRows(a *Tensor) *Tensor {
 	m, n := a.Rows(), a.Cols()
 	out := New(1, n)
@@ -427,10 +484,12 @@ func SumRows(a *Tensor) *Tensor {
 	return out
 }
 
-// SumCols sums over axis 1 of a 2D tensor, returning 1D shape [m].
-// The reduction output shapes are asymmetric (SumCols drops to 1D [m]
-// while SumRows keeps a [1, n] matrix); the convention was frozen as of
-// v0.4.0 — see doc/shapes-and-broadcasting.md for the rationale.
+// SumCols sums over axis 1 of a 2D tensor [m, n], returning the row
+// sums as a 1D [m] vector. Panics if a is not 2D. The reduction output
+// shapes are asymmetric (SumCols drops to 1D [m] while SumRows keeps a
+// [1, n] matrix); the convention was frozen as of v0.4.0 — see
+// doc/shapes-and-broadcasting.md for the rationale and the full
+// reduction table.
 func SumCols(a *Tensor) *Tensor {
 	m, n := a.Rows(), a.Cols()
 	out := New(m)
@@ -444,16 +503,27 @@ func SumCols(a *Tensor) *Tensor {
 	return out
 }
 
-// SumToShape reduces a broadcast-produced gradient back to a target shape:
-// identical shape passes through (cloned), scalars get the total sum, row
-// vectors get column sums, column vectors get row sums. It panics on any
-// other combination. The result never aliases grad: the matching-shape arm
-// returns a Clone and every reduction arm (SumAll/SumRows/SumCols) allocates
-// a fresh buffer. The owning variant that once lived here (SumToShapeTake,
-// which returned grad itself on a shape match) moved into the autograd
-// package in v0.4.0 as the unexported sumToShapeTake — its only callers were
-// the backward path, and keeping an ownership footgun on the public surface
-// bought nothing external.
+// SumToShape reduces a broadcast-produced gradient back to a target
+// shape, following the table in doc/shapes-and-broadcasting.md
+// ("Backward reductions"). For a gradient of shape [m, n]:
+//
+//   - target [m, n]: identity (a clone of grad);
+//   - a scalar target (any single-element shape — [1], [1, 1], []): the
+//     total sum, returned with shape [1];
+//   - target [n] or [1, n]: column sums, returned with the target's own
+//     layout ([n] or [1, n]);
+//   - target [m, 1]: row sums, returned with shape [m, 1];
+//   - anything else: panic ("cannot reduce").
+//
+// The result never aliases grad: the matching-shape arm returns a Clone
+// and every reduction arm (SumAll/SumRows/SumCols) allocates a fresh
+// buffer. This is what makes autograd leaf gradients always match leaf
+// shapes even when the forward pass broadcast them. The owning variant
+// that once lived here (SumToShapeTake, which returned grad itself on a
+// shape match) moved into the autograd package in v0.4.0 as the
+// unexported sumToShapeTake — its only callers were the backward path,
+// and keeping an ownership footgun on the public surface bought nothing
+// external.
 func SumToShape(grad *Tensor, shape []int) *Tensor {
 	target := &Tensor{Shape: shape}
 	switch {
@@ -476,9 +546,11 @@ func SumToShape(grad *Tensor, shape []int) *Tensor {
 	}
 }
 
-// LogSoftmaxRows applies log-softmax to each row of a 2D tensor, computed in
-// the numerically stable max-subtracted form. A tensor with zero columns has
-// no elements per row and yields an empty result of the same shape.
+// LogSoftmaxRows applies log-softmax to each row of a 2D tensor [m, n],
+// returning a fresh [m, n] tensor, computed in the numerically stable
+// max-subtracted form. A tensor with zero columns has no elements per
+// row and yields an empty result of the same shape. Panics if a is not
+// 2D.
 func LogSoftmaxRows(a *Tensor) *Tensor {
 	m, n := a.Rows(), a.Cols()
 	out := New(m, n)
@@ -506,9 +578,11 @@ func LogSoftmaxRows(a *Tensor) *Tensor {
 	return out
 }
 
-// SoftmaxRows applies softmax to each row of a 2D tensor. A tensor with zero
-// columns has no elements per row and yields an empty result of the same
-// shape.
+// SoftmaxRows applies softmax to each row of a 2D tensor [m, n],
+// returning a fresh [m, n] tensor in the numerically stable
+// max-subtracted form. A tensor with zero columns has no elements per
+// row and yields an empty result of the same shape. Panics if a is not
+// 2D.
 func SoftmaxRows(a *Tensor) *Tensor {
 	m, n := a.Rows(), a.Cols()
 	out := New(m, n)

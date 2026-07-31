@@ -316,8 +316,16 @@ func ltcTensors(c *LTC) []*tensor.Tensor {
 
 // SaveLTC writes c to w. The stream captures every field fixed at
 // construction time — hyperparameters, wiring masks, the 13 trainable
-// parameters and the fixed +/-1 reversal potentials — so LoadLTC reproduces
-// the cell bit-for-bit.
+// parameters and the fixed +/-1 reversal potentials — so LoadLTC
+// reproduces the cell bit for bit.
+//
+// Errors: any I/O failure writing the header or the tensor blob is
+// returned (wrapped with its location), along with the serialize
+// writer's validation errors (see serialize.WriteTensors); for a cell
+// produced by NewLTC the latter cannot fire. It never panics on I/O or
+// stream concerns; c must be a live cell (a nil c panics as any nil
+// dereference would — programmer error, per the library's
+// panic-on-misuse convention).
 func SaveLTC(w io.Writer, c *LTC) error {
 	hw := &headerWriter{w: w}
 	hw.u8(kindLTC)
@@ -330,11 +338,22 @@ func SaveLTC(w io.Writer, c *LTC) error {
 	return serialize.WriteTensors(w, ltcTensors(c))
 }
 
-// LoadLTC reads a stream written by SaveLTC and returns an equivalent cell:
-// for the same input and state, Step produces bit-identical outputs. Any
-// corruption, version skew, truncation or cross-model stream is an error, as
-// is an unfolds value above the load limit maxUnfolds (1024) or a units or
-// inDim value above maxUnits / maxInDim (2048 each).
+// LoadLTC reads a stream written by SaveLTC and returns an equivalent
+// cell: for the same input and state, Step produces bit-identical
+// outputs, independently of the RNG used to construct the destination.
+//
+// Errors (never panics — the stream is untrusted input, the documented
+// exception to the library's panic-on-misuse convention): a cross-model
+// stream (wrong kind byte), a truncated or corrupt header, dims below 1,
+// an unfolds value outside [1, maxUnfolds] (1024, a load-only limit),
+// units or inDim above maxUnits / maxInDim (2048 each, load-only
+// limits), every serialize.ReadTensors failure (bad magic, unknown
+// version, truncation — surfaced as io.ErrUnexpectedEOF — hostile size
+// claims), a wrong tensor count, mask shapes or non-binary mask entries,
+// and reversal potentials that are not exactly +1 or -1. All header
+// limits are checked before the blob is parsed, so a hostile header
+// bills no parsing work; see doc/persistence.md for the byte-level
+// contract.
 func LoadLTC(r io.Reader) (*LTC, error) {
 	hr := &headerReader{r: r}
 	if err := readKind(hr, kindLTC); err != nil {
@@ -415,9 +434,15 @@ func cfcTensors(c *CfC) []*tensor.Tensor {
 	return ts
 }
 
-// SaveCfC writes c to w. As with the LTC, the stream captures the wiring
-// masks, all 13 trainable parameters and the reversal potentials; the CfC
-// has no unfolds, so the header is just inDim and units.
+// SaveCfC writes c to w. As with the LTC, the stream captures the
+// wiring masks, all 13 trainable parameters and the reversal
+// potentials; the CfC has no unfolds, so the header is just inDim and
+// units.
+//
+// Errors: exactly as SaveLTC — I/O failures (wrapped with their
+// location) plus the serialize writer's validation errors, which cannot
+// fire for a cell produced by NewCfC. It never panics on I/O or stream
+// concerns; c must be a live cell.
 func SaveCfC(w io.Writer, c *CfC) error {
 	hw := &headerWriter{w: w}
 	hw.u8(kindCfC)
@@ -429,11 +454,20 @@ func SaveCfC(w io.Writer, c *CfC) error {
 	return serialize.WriteTensors(w, cfcTensors(c))
 }
 
-// LoadCfC reads a stream written by SaveCfC and returns an equivalent cell
-// with bit-identical Step behavior; a units or inDim value above the load
-// limits maxUnits / maxInDim (2048 each) is an error, exactly as in LoadLTC.
-// As in LoadLTC, the numerator coefficients are row views of the erev/sErev
-// storage, so overwriting the streamed polarities updates them in place.
+// LoadCfC reads a stream written by SaveCfC and returns an equivalent
+// cell with bit-identical Step behavior, independently of the RNG used
+// to construct the destination.
+//
+// Errors (never panics — the stream is untrusted input): the same
+// classes as LoadLTC minus unfolds (the CfC has none) — wrong kind
+// byte, truncated or corrupt header, dims below 1, units or inDim above
+// maxUnits / maxInDim (2048 each, load-only limits), every
+// serialize.ReadTensors failure (bad magic, unknown version,
+// truncation as io.ErrUnexpectedEOF, hostile size claims), a wrong
+// tensor count, bad wiring masks, and reversal potentials that are not
+// exactly +1 or -1. As in LoadLTC, the numerator coefficients are row
+// views of the erev/sErev storage, so overwriting the streamed
+// polarities updates them in place. See doc/persistence.md.
 func LoadCfC(r io.Reader) (*CfC, error) {
 	hr := &headerReader{r: r}
 	if err := readKind(hr, kindCfC); err != nil {
@@ -489,8 +523,13 @@ func LoadCfC(r io.Reader) (*CfC, error) {
 	return cell, nil
 }
 
-// SaveLinear writes l to w. The header carries only the kind byte; the layer
-// dimensions live in W's shape.
+// SaveLinear writes l to w. The header carries only the kind byte; the
+// layer dimensions live in W's shape.
+//
+// Errors: any I/O failure writing the kind byte or the tensor blob is
+// returned, along with the serialize writer's validation errors (see
+// serialize.WriteTensors). It never panics on I/O or stream concerns;
+// l must be a live layer.
 func SaveLinear(w io.Writer, l *Linear) error {
 	hw := &headerWriter{w: w}
 	hw.u8(kindLinear)
@@ -500,7 +539,16 @@ func SaveLinear(w io.Writer, l *Linear) error {
 	return serialize.WriteTensors(w, []*tensor.Tensor{l.W.Data, l.B.Data})
 }
 
-// LoadLinear reads a stream written by SaveLinear.
+// LoadLinear reads a stream written by SaveLinear and returns a layer
+// owning fresh tensors (nothing aliases the reader's bytes).
+//
+// Errors (never panics — the stream is untrusted input): a wrong kind
+// byte, every serialize.ReadTensors failure (bad magic, unknown
+// version, truncation as io.ErrUnexpectedEOF, hostile size claims), a
+// tensor count other than 2, a weight that is not 2D, and a bias shape
+// that does not match the weight's column count. Unlike the cell
+// loaders it has no header dims to bound: the layer's size is whatever
+// W's streamed shape says, subject to serialize's per-tensor limits.
 func LoadLinear(r io.Reader) (*Linear, error) {
 	hr := &headerReader{r: r}
 	if err := readKind(hr, kindLinear); err != nil {

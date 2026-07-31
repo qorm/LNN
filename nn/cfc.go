@@ -108,10 +108,16 @@ const (
 )
 
 // NewCfC creates a CfC cell. wiring may be nil, meaning FullyConnected;
-// otherwise its sensory mask must have shape [inDim, units] and its recurrent
-// mask [units, units]. Unlike the LTC there is no unfolds parameter: the
-// closed-form solution advances the full time span in a single step.
-// Parameter init ranges follow the LTC reference implementation.
+// otherwise its sensory mask must have shape [inDim, units] and its
+// recurrent mask [units, units]. Unlike the LTC there is no unfolds
+// parameter: the closed-form solution advances the full time span in a
+// single step. Parameter init ranges follow the LTC reference
+// implementation. rng must be non-nil and supplies every initialization
+// draw, so a fixed seed reproduces a cell bit for bit. Panics if
+// inDim < 1 or units < 1, or if a non-nil wiring's mask shapes do not
+// match [inDim, units] / [units, units]. (LoadCfC additionally caps
+// units and inDim on the load path only; the constructor accepts any
+// values >= 1 — see doc/persistence.md.)
 func NewCfC(inDim, units int, wiring *Wiring, rng *rand.Rand) *CfC {
 	if inDim < 1 || units < 1 {
 		panic(fmt.Sprintf("nn.NewCfC: invalid dims in=%d units=%d", inDim, units))
@@ -192,8 +198,13 @@ func cfcShapeEq(sh []int, want ...int) bool {
 // StateSize returns the hidden state dimension.
 func (c *CfC) StateSize() int { return c.units }
 
-// Parameters returns the trainable variables of the cell. The reversal
-// potentials erev/sErev are fixed constants and intentionally excluded.
+// Parameters returns the cell's 13 trainable variables in a fixed
+// order: gleak, vleak, cm, mu, sigma, w, sMu, sSigma, sW, inW, inB,
+// outW, outB — the same frozen order as the LTC, which is the cell's
+// stream order inside SaveCfC and the positional key for
+// serialize.WriteParameters / optimizer.SaveState. The reversal
+// potentials erev/sErev are fixed constants and intentionally excluded;
+// SaveCfC persists them anyway, so LoadCfC reproduces the cell exactly.
 func (c *CfC) Parameters() []*autograd.Variable {
 	return []*autograd.Variable{
 		c.gleak, c.vleak, c.cm,
@@ -203,10 +214,14 @@ func (c *CfC) Parameters() []*autograd.Variable {
 	}
 }
 
-// Step advances the cell by one RNN step over the time span ts (which must be
-// positive and finite; NaN and +/-Inf are rejected). x is [batch, inDim], h
-// is [batch, units] or nil for a zero initial state. It returns the (affinely
-// mapped) output and the new raw state.
+// Step advances the cell by one RNN step over the time span ts, using
+// the closed-form membrane solution (Lemma 1) instead of ODE unfolding.
+// x is [batch, inDim], h is [batch, units] or nil for a zero initial
+// state. It returns the affinely mapped output vNew⊙outW+outB with
+// shape [batch, units] and the new raw state vNew with shape
+// [batch, units]. Panics if ts is not positive and finite (NaN, +/-Inf,
+// zero and negative values are all rejected), or if x/h do not have the
+// expected rank and widths (the tensor-layer contract).
 func (c *CfC) Step(x, h *autograd.Variable, ts float64) (out, hNew *autograd.Variable) {
 	// NaN-aware positivity check: NaN > 0 is false, so NaN panics here too;
 	// both infinities are rejected explicitly, as in the LTC.

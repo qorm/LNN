@@ -353,8 +353,18 @@ func SaveState(w io.Writer, o Optimizer, params []*autograd.Variable) error {
 // The destination optimizer supplies the hyperparameters; for Adam the
 // streamed pow1/pow2 must equal this optimizer's Beta1^t/Beta2^t bit for
 // bit, so a stream saved under different betas fails as corruption rather
-// than resuming with inconsistent bias correction. SGD carries no state;
-// loading an SGD stream validates the stream and changes nothing.
+// than resuming with inconsistent bias correction. An Adam update count
+// above maxT (2^24) is rejected before the blob is even parsed — a
+// load-only limit bounding the pow recomputation cost, with Adam.Step's
+// runtime contract unchanged. SGD carries no state; loading an SGD
+// stream validates the stream and changes nothing.
+//
+// It never panics on stream contents (the stream is untrusted input,
+// the documented exception domain): truncation surfaces as
+// io.ErrUnexpectedEOF (transparently from the blob reader when it sits
+// inside the blob), and every other failure is a descriptive error.
+// o must be a supported optimizer and params must carry Data, as for
+// SaveState.
 func LoadState(r io.Reader, o Optimizer, params []*autograd.Variable) error {
 	kind, ok := stateKindOf(o)
 	if !ok {

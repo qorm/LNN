@@ -5,10 +5,12 @@ import (
 	"math/rand"
 )
 
-// Uniform returns a tensor with elements drawn from U(lo, hi). If lo > hi the
-// interval is mirrored rather than rejected: values fall in [hi, lo]. This is
-// deliberate legacy behavior kept for backward compatibility; callers that
-// rely on interval bounds should pass lo <= hi.
+// Uniform returns a tensor of the given shape with elements drawn from
+// U(lo, hi) using rng. If lo > hi the interval is mirrored rather than
+// rejected: values fall in [hi, lo]. This is deliberate legacy behavior
+// kept for backward compatibility; callers that rely on interval bounds
+// should pass lo <= hi. Panics if rng is nil, if any dimension is
+// negative (via New), or if the element count overflows int64.
 func Uniform(rng *rand.Rand, lo, hi float32, shape ...int) *Tensor {
 	t := New(shape...)
 	for i := range t.Data {
@@ -17,7 +19,9 @@ func Uniform(rng *rand.Rand, lo, hi float32, shape ...int) *Tensor {
 	return t
 }
 
-// Randn returns a tensor with elements drawn from N(0, 1) using Box-Muller.
+// Randn returns a tensor of the given shape with elements drawn from
+// N(0, 1) using Box-Muller. Panics if rng is nil, if any dimension is
+// negative (via New), or if the element count overflows int64.
 //
 // The u1 uniform is clamped away from zero at 1e-12 (keeping log(u1) finite
 // for deterministic same-seed runs), which hard-truncates the distribution's

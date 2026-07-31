@@ -278,10 +278,17 @@ func (rd *reader) floats(n uint64) ([]float32, error) {
 	return data, nil
 }
 
-// WriteTensors writes ts to w in the package's wire format. It fails with a
-// descriptive error on I/O failure, on a nil tensor, or on an in-memory
-// tensor whose Shape and Data disagree (checked with the same overflow-safe
-// multiplication as tensor.Size, but returning an error instead of panicking).
+// WriteTensors writes ts to w in the package's wire format: magic
+// "LNNS", version, count, then each tensor's rank, shape and
+// little-endian float32 payload (see the package doc for the byte
+// layout).
+//
+// Errors (never panics): more than maxCount (2^20) tensors, a nil
+// tensor, a rank above maxRank (8), a negative dimension, an element
+// count that overflows int64 (checked with the same overflow-safe
+// multiplication as tensor.Size, but returning an error instead of
+// panicking), a tensor whose Shape and Data disagree, and any I/O
+// failure (reported once, wrapped).
 func WriteTensors(w io.Writer, ts []*tensor.Tensor) error {
 	if uint64(len(ts)) > maxCount {
 		return fmt.Errorf("serialize: %d tensors exceed the stream count limit %d", len(ts), maxCount)
@@ -345,12 +352,21 @@ func (bw *writer) tensor(t *tensor.Tensor, idx int) error {
 	return bw.err
 }
 
-// ReadTensors reads a stream written by WriteTensors and returns its tensors.
-// Corrupt, truncated, unknown-version or hostile streams fail with a
-// descriptive error; memory use is bounded as described in the package doc:
-// fixed limits validated first, a remaining-bytes check on known-length
-// readers, and growth proportional to the bytes actually delivered on
-// unknown-length readers.
+// ReadTensors reads a stream written by WriteTensors and returns its
+// tensors, each in a freshly allocated buffer that aliases nothing of
+// the reader's bytes.
+//
+// Errors (never panics — the stream is untrusted input): a bad magic,
+// an unknown version byte (directional: "newer version… update this
+// build" above Version, "corrupt or forged" below), a tensor count
+// above maxCount (2^20), a rank above maxRank (8), negative dimensions,
+// a payload above maxElems (2^30 float32s) or overflowing int64, any
+// truncation (surfaced as io.ErrUnexpectedEOF), trailing bytes after
+// the last counted tensor, and underlying I/O errors. Memory use is
+// bounded as described in the package doc: fixed limits validated
+// first, a remaining-bytes check on known-length readers, and growth
+// proportional to the bytes actually delivered on unknown-length
+// readers.
 func ReadTensors(r io.Reader) ([]*tensor.Tensor, error) {
 	rd := newReader(r)
 	var m [4]byte
@@ -454,8 +470,15 @@ func readTensor(rd *reader, idx int) (*tensor.Tensor, error) {
 	return &tensor.Tensor{Shape: shape, Data: data}, nil
 }
 
-// WriteParameters writes the Data tensors of params (in order) to w. It is
-// WriteTensors over p.Data with nil guards, named for the checkpoint use case.
+// WriteParameters writes the Data tensors of params (in order) to w. It
+// is WriteTensors over p.Data with nil guards, named for the checkpoint
+// use case: the order of params fixes the order of the tensors in the
+// stream, and LoadParameters restores by position.
+//
+// Errors (never panics): a nil parameter or one without Data, plus
+// every WriteTensors error (I/O failure, shape/Data disagreement). It
+// writes nothing but values: gradients and graph structure are not part
+// of the stream.
 func WriteParameters(w io.Writer, params []*autograd.Variable) error {
 	ts := make([]*tensor.Tensor, len(params))
 	for i, p := range params {
@@ -467,17 +490,24 @@ func WriteParameters(w io.Writer, params []*autograd.Variable) error {
 	return WriteTensors(w, ts)
 }
 
-// LoadParameters reads a stream written by WriteParameters and copies the
-// values back into params IN PLACE: the *autograd.Variable pointers keep
-// their identity, so every graph edge that references them stays valid and
-// graph ownership is preserved. A count mismatch or any shape mismatch is an
-// error; all shapes are validated before anything is copied, so a failing
-// load leaves every parameter exactly as it was.
+// LoadParameters reads a stream written by WriteParameters and copies
+// the values back into params IN PLACE, by position: the i-th streamed
+// tensor overwrites params[i].Data. The *autograd.Variable pointers
+// keep their identity, so every graph edge that references them stays
+// valid and graph ownership is preserved.
 //
-// The load overwrites each parameter's Data and deliberately leaves its Grad
-// field untouched: gradients accumulated on an earlier graph survive the load
-// as stale values. A caller that reuses the variables in a new graph should
-// call ZeroGrad first, exactly as before any training step.
+// Errors (never panics — the stream is untrusted input): a nil
+// parameter or one without Data, a count mismatch, any shape mismatch,
+// and every ReadTensors failure (bad magic, unknown version,
+// truncation as io.ErrUnexpectedEOF, hostile size claims). All shapes
+// are validated before anything is copied, so a failing load leaves
+// every parameter exactly as it was.
+//
+// The load overwrites each parameter's Data and deliberately leaves its
+// Grad field untouched: gradients accumulated on an earlier graph
+// survive the load as stale values. A caller that reuses the variables
+// in a new graph should call ZeroGrad first, exactly as before any
+// training step (see doc/persistence.md, "stale Grad").
 func LoadParameters(r io.Reader, params []*autograd.Variable) error {
 	for i, p := range params {
 		if p == nil || p.Data == nil {

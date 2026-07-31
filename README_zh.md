@@ -170,7 +170,22 @@ out2, h2 := cfc.Step(x, nil, 0.1)
 
 `ts` 的选取以任务的采样间隔为锚：若序列每一步对应底层过程的一个时间单位，则 `ts = 1.0`。完整的 `ts` 契约——须为正的有限值，`ts ≈ 1e-38` 以下仅为有限性域——见 [doc/zh/ltc.md](doc/zh/ltc.md)。
 
-`examples/ltc-sequence` 把这些拼成了一个完整的训练循环（对 `nn.ParametersOf(cell, readout)` 做手写 SGD），任务是一个玩具序列任务——运行方式：`go run ./examples/ltc-sequence`。`examples/cfc-sequence` 在同一任务上换用 CfC 细胞与推荐的生产形态——调用方负责的全局梯度范数裁剪加 `optimizer.NewSGD` + `Step`——损失从 `0.620651` 降到 `0.029091`。示例都在仓库内——克隆仓库（`git clone https://github.com/qorm/LNN.git`）后在仓库根目录运行；`go get` 安装的用户可直接在 GitHub 上浏览。
+示例按难度梯度编排——先从 hello-train 与 hello-use 入手（各几十行），再看完整训练循环，最后进入续训与诊断等进阶主题。示例都在仓库内——克隆仓库（`git clone https://github.com/qorm/LNN.git`）后在仓库根目录运行；`go get` 安装的用户可直接在 GitHub 上浏览。任务式中文训练配方（梯度累积、断点续训、自定义损失、事件驱动变 ts 等）详见 [doc/zh/cookbook.md](doc/zh/cookbook.md)。
+
+**入门**
+
+- `examples/hello-train`——最简训练程序：用单个 CfC 神经元拟合 `y = 2x + 1`，更新步是朴素手写梯度下降（约 60 行编号注释：模型、数据、前向 → 反向 → 更新），并把模型保存下来。
+- `examples/hello-use`——最简推理程序：加载上面保存的模型，只做一次前向步，把预测与真值直线并排打印（约 30 行，没有任何训练代码）。
+
+**完整训练循环**
+
+- `examples/ltc-sequence`——玩具「带界累加器」序列任务上的完整训练循环（对 `nn.ParametersOf(cell, readout)` 做手写 SGD，含全局梯度范数裁剪）：`go run ./examples/ltc-sequence`。
+- `examples/cfc-sequence`——在同一任务上换用 CfC 细胞与推荐的生产形态——调用方负责的裁剪加 `optimizer.NewSGD` + `Step`——损失从 `0.620651` 降到 `0.029091`。
+
+**进阶**
+
+- `examples/ltc-resume`——把训练到一半的 LTC 检查点（模型、读出层参数，以及经 `optimizer.SaveState` 保存的 Adam 状态）写入临时目录，再用另一组种子构建的全新一套对象加载续训，并断言续训轨迹与不间断训练逐位（bit-identical）一致。
+- `examples/gradient-inspect`——训练一个小 LTC，每隔 K 轮打印各参数的梯度 L2 范数、全局梯度最大绝对值、NaN/Inf 计数与参数更新量——含同轮「裁剪前 vs 裁剪后」的范数对比——作为定位 loss 停滞或发散的诊断模板。
 
 ## 数值与规模
 

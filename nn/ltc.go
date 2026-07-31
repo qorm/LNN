@@ -93,9 +93,14 @@ type LTC struct {
 
 // NewLTC creates an LTC cell. wiring may be nil, meaning FullyConnected;
 // otherwise its sensory mask must have shape [inDim, units] and its
-// recurrent mask [units, units]. unfolds is the number of ODE solver steps
-// per RNN step (6 in the reference). Parameter init ranges follow the
-// reference implementation.
+// recurrent mask [units, units]. unfolds is the number of ODE solver
+// steps per RNN step (6 in the reference). Parameter init ranges follow
+// the reference implementation. rng must be non-nil and supplies every
+// initialization draw, so a fixed seed reproduces a cell bit for bit.
+// Panics if inDim < 1 or units < 1, if unfolds < 1, or if a non-nil
+// wiring's mask shapes do not match [inDim, units] / [units, units].
+// (LoadLTC additionally caps unfolds, units and inDim on the load path
+// only; the constructor accepts any values >= 1 — see doc/persistence.md.)
 func NewLTC(inDim, units int, wiring *Wiring, unfolds int, rng *rand.Rand) *LTC {
 	if inDim < 1 || units < 1 {
 		panic(fmt.Sprintf("nn.NewLTC: invalid dims in=%d units=%d", inDim, units))
@@ -266,8 +271,14 @@ func (p *synapsePlan) terms() int {
 // StateSize returns the hidden state dimension.
 func (c *LTC) StateSize() int { return c.units }
 
-// Parameters returns the trainable variables of the cell. The reversal
-// potentials erev/sErev are fixed constants and intentionally excluded.
+// Parameters returns the cell's 13 trainable variables in a fixed
+// order: gleak, vleak, cm, mu, sigma, w, sMu, sSigma, sW, inW, inB,
+// outW, outB. The order is frozen: it is the cell's stream order inside
+// SaveLTC and the positional key for serialize.WriteParameters /
+// optimizer.SaveState. The reversal potentials erev/sErev are fixed
+// constants and intentionally excluded (training them would flip
+// synapse polarity); SaveLTC persists them anyway, so LoadLTC
+// reproduces the cell exactly.
 func (c *LTC) Parameters() []*autograd.Variable {
 	return []*autograd.Variable{
 		c.gleak, c.vleak, c.cm,
@@ -277,10 +288,14 @@ func (c *LTC) Parameters() []*autograd.Variable {
 	}
 }
 
-// Step advances the cell by one RNN step, integrating the ODE over the time
-// span ts (which must be positive and finite; NaN and +/-Inf are rejected).
-// x is [batch, inDim], h is [batch, units] or nil for a zero initial state.
-// It returns the (affinely mapped) output and the new raw state.
+// Step advances the cell by one RNN step, integrating the membrane ODE
+// over the time span ts in c.unfolds semi-implicit Euler substeps. x is
+// [batch, inDim], h is [batch, units] or nil for a zero initial state.
+// It returns the affinely mapped output v⊙outW+outB with shape
+// [batch, units] and the new raw membrane state v with shape
+// [batch, units]. Panics if ts is not positive and finite (NaN, +/-Inf,
+// zero and negative values are all rejected), or if x/h do not have the
+// expected rank and widths (the tensor-layer contract).
 func (c *LTC) Step(x, h *autograd.Variable, ts float64) (out, hNew *autograd.Variable) {
 	// NaN-aware positivity check: NaN > 0 is false, so NaN panics here too.
 	// +Inf passes `ts > 0` but would silently integrate over an infinite time

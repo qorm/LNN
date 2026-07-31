@@ -1,7 +1,3 @@
-// Package tensor provides a minimal dense float32 n-dimensional tensor type
-// with row-major layout, plus the small set of numeric operations the LNN
-// library needs. It is intentionally 1D/2D-focused: MatMul is defined for
-// matrices only, while elementwise operations work on any shape.
 package tensor
 
 import (
@@ -33,8 +29,8 @@ const maxInlineRank = 4
 // hardening #12, option ②). The exported field type and all read paths are
 // unchanged; shapeBuf is an implementation detail callers never touch.
 type Tensor struct {
-	Shape    []int
-	Data     []float32
+	Shape    []int     // row-major dimension list: (i, j) of [m, n] is Data[i*n+j]; change only via Reshape (never append in place — see the type doc)
+	Data     []float32 // flat row-major element buffer; its length must equal the shape product (Size)
 	shapeBuf [maxInlineRank]int
 }
 
@@ -53,11 +49,16 @@ func (t *Tensor) useShape(dims []int) {
 }
 
 // Reshape sets the tensor's shape to dims, storing ranks up to maxInlineRank
-// inline in the struct and falling back to a heap copy beyond that. It is the
-// exported replacement for the former direct `t.Shape = []int{...}` writes:
-// it re-points Shape without reallocating Data, so the caller must pass a
-// shape whose element count matches the existing buffer. Every dimension must
-// be non-negative; a negative dimension panics.
+// inline in the struct and falling back to a heap copy beyond that (the
+// rank>4 fallback: a tensor constructed over a longer shape, e.g. a rank-8
+// tensor read by serialize, keeps working — Shape remains the single source
+// of truth, only the allocation saving is lost). It is the exported
+// replacement for the former direct `t.Shape = []int{...}` writes: it
+// re-points Shape without reallocating Data, so the caller must pass a shape
+// whose element count matches the existing buffer — Reshape does NOT check
+// the count, and a mismatching shape leaves Data and Shape inconsistent
+// (later operations will misbehave or panic). Panics if any dimension is
+// negative.
 func (t *Tensor) Reshape(dims ...int) {
 	for _, d := range dims {
 		if d < 0 {
@@ -67,8 +68,10 @@ func (t *Tensor) Reshape(dims ...int) {
 	t.useShape(dims)
 }
 
-// New returns a zero-filled tensor with the given shape. Every dimension must
-// be non-negative; a negative dimension panics.
+// New returns a zero-filled tensor with the given shape. New() with no
+// arguments is a rank-0 tensor holding a single zero (Size 1, IsScalar
+// true). Panics if any dimension is negative, or if the element count
+// overflows int64 (see Size).
 func New(shape ...int) *Tensor {
 	for _, d := range shape {
 		if d < 0 {
@@ -81,9 +84,10 @@ func New(shape ...int) *Tensor {
 	return t
 }
 
-// FromData returns a tensor wrapping a copy of data with the given shape.
-// It panics if the shape does not match len(data), if any dimension is
-// negative, or if the shape's element count overflows int64.
+// FromData returns a tensor holding a copy of data with the given shape:
+// the returned tensor never aliases the caller's slice. Panics if the
+// shape's element count does not match len(data), if any dimension is
+// negative, or if the element count overflows int64 (see Size).
 func FromData(data []float32, shape ...int) *Tensor {
 	t := New(shape...)
 	if t.Size() != len(data) {
@@ -93,7 +97,10 @@ func FromData(data []float32, shape ...int) *Tensor {
 	return t
 }
 
-// FromRows builds a 2D tensor from per-row slices.
+// FromRows builds a 2D tensor of shape [len(rows), len(rows[0])] from
+// per-row slices, copying every row. FromRows() with no rows returns an
+// empty tensor of shape [0, 0]. Panics if the rows have differing lengths
+// (ragged input), or if the element count overflows int64 (see Size).
 func FromRows(rows ...[]float32) *Tensor {
 	if len(rows) == 0 {
 		return New(0, 0)
@@ -128,10 +135,12 @@ func (t *Tensor) Size() int {
 // Dims returns the number of dimensions.
 func (t *Tensor) Dims() int { return len(t.Shape) }
 
-// Rows returns the first dimension of a 2D tensor.
+// Rows returns the first dimension of a 2D tensor. Panics if the tensor
+// is not 2D.
 func (t *Tensor) Rows() int { return t.must2D()[0] }
 
-// Cols returns the second dimension of a 2D tensor.
+// Cols returns the second dimension of a 2D tensor. Panics if the tensor
+// is not 2D.
 func (t *Tensor) Cols() int { return t.must2D()[1] }
 
 func (t *Tensor) must2D() []int {
@@ -141,10 +150,14 @@ func (t *Tensor) must2D() []int {
 	return t.Shape
 }
 
-// At returns the element at the given indices.
+// At returns the element at the given indices, one per dimension. Panics
+// if the number of indices differs from the tensor's rank, or if any
+// index is out of bounds for its dimension.
 func (t *Tensor) At(idx ...int) float32 { return t.Data[t.offset(idx)] }
 
-// Set sets the element at the given indices.
+// Set sets the element at the given indices, one per dimension. Panics if
+// the number of indices differs from the tensor's rank, or if any index
+// is out of bounds for its dimension.
 func (t *Tensor) Set(v float32, idx ...int) { t.Data[t.offset(idx)] = v }
 
 func (t *Tensor) offset(idx []int) int {
@@ -161,7 +174,8 @@ func (t *Tensor) offset(idx []int) int {
 	return off
 }
 
-// Clone returns a deep copy.
+// Clone returns a deep copy: a fresh Data buffer and an independent Shape,
+// sharing no storage with t.
 func (t *Tensor) Clone() *Tensor {
 	out := &Tensor{}
 	out.useShape(t.Shape)
@@ -194,10 +208,13 @@ func SameShape(a, b *Tensor) bool {
 	return true
 }
 
-// IsScalar reports whether the tensor holds exactly one element.
+// IsScalar reports whether the tensor holds exactly one element: any
+// shape whose dimensions multiply to 1 qualifies ([1], [1, 1], the empty
+// shape of a rank-0 tensor — but not [0], which holds zero elements).
 func (t *Tensor) IsScalar() bool { return t.Size() == 1 }
 
-// Scalar returns the single element of a size-1 tensor.
+// Scalar returns the single element of a size-1 tensor. Panics if the
+// tensor does not hold exactly one element (see IsScalar).
 func (t *Tensor) Scalar() float32 {
 	if !t.IsScalar() {
 		panic(fmt.Sprintf("tensor.Scalar: shape %v is not scalar", t.Shape))
@@ -214,7 +231,9 @@ func (t *Tensor) IsRowVec() bool {
 	return t.Dims() == 2 && t.Shape[0] == 1
 }
 
-// String renders small tensors for debugging.
+// String renders small tensors for debugging: tensors of more than 64
+// elements print only their shape plus the first and last value. It never
+// panics on a well-formed tensor (Size must not overflow).
 func (t *Tensor) String() string {
 	if t.Size() > 64 {
 		return fmt.Sprintf("Tensor(shape=%v, data=[%v ... %v])", t.Shape, t.Data[0], t.Data[len(t.Data)-1])

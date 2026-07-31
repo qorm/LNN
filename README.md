@@ -188,15 +188,47 @@ corresponds to one time unit of the underlying process, use `ts = 1.0`.
 The full `ts` contract — positive and finite, with a finiteness-only
 domain below `ts ≈ 1e-38` — is in [doc/ltc.md](doc/ltc.md).
 
-`examples/ltc-sequence` puts this together into a complete training loop
-(hand-rolled SGD over `nn.ParametersOf(cell, readout)`) on a toy sequence
-task — run it with `go run ./examples/ltc-sequence`.
-`examples/cfc-sequence` runs the same task with the CfC cell and the
-recommended production form — caller-owned gradient-norm clipping plus
-`optimizer.NewSGD` + `Step` — with the loss falling from `0.620651` to
-`0.029091`. The examples live in the repository — clone it
-(`git clone https://github.com/qorm/LNN.git`) and run from the repository
-root; `go get` installations can browse them on GitHub.
+The examples form a graded path — start with hello-train and hello-use
+(a few dozen lines each), then read the full training loops, then go
+further with checkpointing and diagnostics. They live in the repository
+— clone it (`git clone https://github.com/qorm/LNN.git`) and run from
+the repository root; `go get` installations can browse them on GitHub.
+Task-oriented recipes (gradient accumulation, checkpointing, custom
+losses, event-driven time steps, and more) are in
+[doc/cookbook.md](doc/cookbook.md) (中文版：[doc/zh/cookbook.md](doc/zh/cookbook.md)).
+
+**Start here**
+
+- `examples/hello-train` — the smallest possible training program: fit
+  `y = 2x + 1` with one CfC neuron and hand-written gradient descent
+  (~60 numbered lines: model, data, forward → backward → update), then
+  save the model.
+- `examples/hello-use` — the smallest possible inference program: load
+  that saved model and run one forward step, printing predictions next
+  to the true line (~30 lines, no training code).
+
+**Full training loops**
+
+- `examples/ltc-sequence` — a complete training loop (hand-rolled SGD
+  over `nn.ParametersOf(cell, readout)`, with global gradient-norm
+  clipping) on a toy bounded-accumulator sequence task:
+  `go run ./examples/ltc-sequence`.
+- `examples/cfc-sequence` — the same task with the CfC cell and the
+  recommended production form — caller-owned clipping plus
+  `optimizer.NewSGD` + `Step` — with the loss falling from `0.620651`
+  to `0.029091`.
+
+**Going further**
+
+- `examples/ltc-resume` — checkpoints a trained LTC (model, readout
+  parameters and Adam state via `optimizer.SaveState`) and resumes it
+  into fresh objects built with a different seed, asserting the resumed
+  trajectory is bit-identical to uninterrupted training.
+- `examples/gradient-inspect` — trains a small LTC while printing
+  per-parameter gradient L2 norms, the global max-abs gradient,
+  NaN/Inf counts and parameter-update magnitudes every K iterations —
+  including a raw-vs-clipped norm comparison — as a template for
+  diagnosing stalled or diverging runs.
 
 ## Numerics and scale
 

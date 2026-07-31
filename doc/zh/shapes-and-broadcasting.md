@@ -12,7 +12,7 @@
 
 | 仅限 2D（其他秩 panic） | 任意秩 |
 |---|---|
-| `MatMul`、`Transpose`、`Rows`、`Cols`、`ConcatCol`、`SliceCol`、`SliceRow`、`SoftmaxRows`、`LogSoftmaxRows`、`SumRows`、`SumCols` | `Add`、`Sub`、`Hadamard`、`Scale`、`Neg`、`Apply`、`Tanh`、`Sigmoid`、`Exp`、`Log`、`Pow`、`Softplus`、`Clip`、`SumAll`、`MeanAll` |
+| `MatMul`、`MatMulTransA`、`MatMulTransB`、`Transpose`、`Rows`、`Cols`、`ConcatCol`、`SliceCol`、`SliceRow`、`SoftmaxRows`、`LogSoftmaxRows`、`SumRows`、`SumCols` | `Add`、`Sub`、`Hadamard`、`Scale`、`Neg`、`Apply`、`Tanh`、`Sigmoid`、`Exp`、`Log`、`Pow`、`Softplus`、`Clip`、`SumAll`、`MeanAll` |
 
 `MatMul` 只是矩阵乘法：`[m, k] × [k, n] → [m, n]`，秩或内维不匹配即 panic。
 

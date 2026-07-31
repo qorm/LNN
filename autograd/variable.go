@@ -1,8 +1,3 @@
-// Package autograd implements a small dynamic computation-graph engine.
-// Every operation tags its output Variable with an op kind (plus any scalar
-// payload), and Backward walks the graph in reverse topological order,
-// dispatching each node's gradient propagation and accumulating gradients
-// into leaf Variables (typically model parameters).
 package autograd
 
 import (
@@ -20,7 +15,15 @@ import (
 // adds a few bytes to this struct. The payload fields (scalar, from/to,
 // aux, idx) carry exactly the constants the former closures captured.
 type Variable struct {
+	// Data is the node's current value. For leaves it is the tensor the
+	// node was constructed over (not copied by Var/Const — see Var);
+	// for op nodes it is the eagerly computed forward result.
 	Data *tensor.Tensor
+	// Grad accumulates the gradient of a differentiated output with
+	// respect to this node. It is nil until the first Backward (or a
+	// manual seed) contributes to it, and Backward keeps it on leaf
+	// nodes only — see Backward for the accumulation and clearing
+	// semantics. ZeroGrad resets it to nil.
 	Grad *tensor.Tensor
 
 	parents  []*Variable
@@ -31,12 +34,19 @@ type Variable struct {
 	idx      []int          // GatherRows indices (copied at construction)
 }
 
-// Var wraps a tensor as a graph leaf (e.g. a parameter or an input).
+// Var wraps a tensor as a graph leaf (e.g. a parameter or an input). It
+// does not copy t: the leaf aliases the caller's tensor, so later writes
+// to t.Data change the leaf's value (the standard pattern for in-place
+// parameter updates). Grad starts out nil.
 func Var(t *tensor.Tensor) *Variable {
 	return &Variable{Data: t}
 }
 
-// New builds a leaf Variable from raw data and a shape.
+// New builds a leaf Variable from raw data and a shape, copying data
+// (via tensor.FromData): the returned leaf aliases nothing. Panics if
+// the shape does not match len(data), if any dimension is negative, or
+// if the element count overflows int64 — exactly the tensor.FromData
+// contract.
 func New(data []float32, shape ...int) *Variable {
 	return Var(tensor.FromData(data, shape...))
 }
@@ -136,5 +146,7 @@ func (v *Variable) Backward() {
 	}
 }
 
-// Value returns the scalar value of a size-1 variable.
+// Value returns the scalar value of a size-1 variable (the usual way to
+// read a loss). Panics if the variable's Data does not hold exactly one
+// element.
 func (v *Variable) Value() float32 { return v.Data.Scalar() }

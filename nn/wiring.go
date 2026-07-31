@@ -31,9 +31,10 @@ func FullyConnected(inDim, units int) *Wiring {
 	)
 }
 
-// RandomSparse returns a wiring where each synapse exists independently with
-// the given connection probability. Both probabilities must lie in [0, 1]
-// (NaN is rejected), and inDim and units must be at least 1.
+// RandomSparse returns a wiring where each synapse exists independently
+// with the given connection probability. rng must be non-nil. Panics
+// if inDim or units is less than 1, or if either probability lies
+// outside [0, 1] (NaN is rejected).
 func RandomSparse(inDim, units int, sensoryP, recurrentP float32, rng *rand.Rand) *Wiring {
 	checkWiringDims(inDim, units)
 	checkProbability("sensoryP", sensoryP)
@@ -90,8 +91,10 @@ func (w *Wiring) Sensory() *tensor.Tensor { return w.sensoryMask.Clone() }
 // returned tensor does not affect the wiring.
 func (w *Wiring) Recurrent() *tensor.Tensor { return w.recurrentMask.Clone() }
 
-// SensoryRow returns row i of the sensory mask with shape [1, units].
+// SensoryRow returns row i of the sensory mask as a fresh [1, units]
+// copy. Panics if i is outside [0, inDim).
 func (w *Wiring) SensoryRow(i int) *tensor.Tensor { return tensor.SliceRow(w.sensoryMask, i) }
 
-// RecurrentRow returns row i of the recurrent mask with shape [1, units].
+// RecurrentRow returns row i of the recurrent mask as a fresh
+// [1, units] copy. Panics if i is outside [0, units).
 func (w *Wiring) RecurrentRow(i int) *tensor.Tensor { return tensor.SliceRow(w.recurrentMask, i) }
