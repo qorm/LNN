@@ -393,10 +393,10 @@ func TestDivSingleNodeGraph(t *testing.T) {
 				return
 			}
 			seen[v] = true
-			if len(v.parents) > 0 {
+			if v.numParents() > 0 {
 				n++
 			}
-			for _, p := range v.parents {
+			for _, p := range v.parentsSlice() {
 				walk(p)
 			}
 		}
@@ -407,14 +407,121 @@ func TestDivSingleNodeGraph(t *testing.T) {
 	b := New([]float32{4, 3, 2, 1}, 2, 2)
 
 	d := Div(a, b)
-	if len(d.parents) != 2 || d.parents[0] != a || d.parents[1] != b {
-		t.Fatalf("Div must wire a and b directly, got %d parents", len(d.parents))
+	if d.numParents() != 2 || d.parent(0) != a || d.parent(1) != b {
+		t.Fatalf("Div must wire a and b directly, got %d parents", d.numParents())
 	}
 	if got := countOps(d); got != 1 {
 		t.Fatalf("Div graph has %d op nodes, want 1", got)
 	}
 	if got := countOps(legacyDiv(a, b)); got != 2 {
 		t.Fatalf("legacy composition has %d op nodes, want 2", got)
+	}
+}
+
+// TestConcatColParentStorage verifies the inline-slot/overflow boundary of
+// the parent storage on the one op whose arity is unbounded: ConcatCol with
+// up to inlineParents inputs must keep its parents in the node's inline
+// slots (overflow slice nil), and more than that must spill to the overflow
+// slice, in input order. Both paths must forward and backpropagate exactly
+// as the tensor-level concatenation dictates (each leaf's gradient is the
+// column slice of the output gradient — all ones for a sum loss).
+func TestConcatColParentStorage(t *testing.T) {
+	mk := func(cols int, base float32) *Variable {
+		d := make([]float32, 2*cols)
+		for i := range d {
+			d[i] = base + float32(i)
+		}
+		return New(d, 2, cols)
+	}
+	a, b, d := mk(2, 0), mk(1, 10), mk(3, 20)
+
+	// Slot path: exactly inlineParents inputs, overflow slice untouched.
+	c2 := ConcatCol(a, b)
+	if c2.numParents() != inlineParents || c2.parents != nil {
+		t.Fatalf("ConcatCol(a, b): want %d inline parents, got %d (overflow set: %v)",
+			inlineParents, c2.numParents(), c2.parents != nil)
+	}
+	if c2.parent(0) != a || c2.parent(1) != b {
+		t.Fatalf("ConcatCol(a, b) must wire a and b in input order")
+	}
+
+	// Overflow path: inlineParents+1 inputs, slice storage in input order.
+	c3 := ConcatCol(a, b, d)
+	if c3.numParents() != inlineParents+1 || c3.parents == nil {
+		t.Fatalf("ConcatCol(a, b, d): want %d overflow parents, got %d (overflow set: %v)",
+			inlineParents+1, c3.numParents(), c3.parents != nil)
+	}
+	for i, want := range []*Variable{a, b, d} {
+		if c3.parent(i) != want {
+			t.Fatalf("ConcatCol overflow parent %d wired out of order", i)
+		}
+	}
+
+	// Forward values: the node data is the tensor-level concatenation.
+	for _, c := range []*Variable{c2, c3} {
+		refs := make([]*tensor.Tensor, c.numParents())
+		for i := range refs {
+			refs[i] = c.parent(i).Data
+		}
+		want := tensor.ConcatCol(refs...)
+		if !tensor.SameShape(c.Data, want) {
+			t.Fatalf("ConcatCol forward shape %v, want %v", c.Data.Shape, want.Shape)
+		}
+		for i := range want.Data {
+			if c.Data.Data[i] != want.Data[i] {
+				t.Fatalf("ConcatCol forward element %d: got %v, want %v", i, c.Data.Data[i], want.Data[i])
+			}
+		}
+	}
+
+	// Backward through both representations: a sum loss sends all-ones
+	// gradients back through the column slices into every leaf.
+	for _, tt := range []struct {
+		name   string
+		root   *Variable
+		leaves []*Variable
+	}{
+		{"slots", c2, []*Variable{a, b}},
+		{"overflow", c3, []*Variable{a, b, d}},
+	} {
+		for _, l := range []*Variable{a, b, d} {
+			l.ZeroGrad()
+		}
+		SumAll(tt.root).Backward()
+		for _, l := range tt.leaves {
+			if l.Grad == nil || !tensor.SameShape(l.Grad, l.Data) {
+				t.Fatalf("%s: leaf gradient nil or wrong shape", tt.name)
+			}
+			for i, g := range l.Grad.Data {
+				if g != 1 {
+					t.Fatalf("%s: leaf gradient element %d = %v, want 1", tt.name, i, g)
+				}
+			}
+		}
+	}
+}
+
+// TestConcatColOverflowMixedGraph drives Backward through a graph that mixes
+// overflow nodes (ConcatCol with more than inlineParents inputs) with the
+// inline-slot nodes built on top of them, including a diamond reuse of the
+// overflow node — the traversal must visit both representations correctly.
+// The analytic gradients are checked against central finite differences.
+func TestConcatColOverflowMixedGraph(t *testing.T) {
+	rng := rand.New(rand.NewSource(14))
+	for _, n := range []int{inlineParents, inlineParents + 1, inlineParents + 2} {
+		inputs := make([]*Variable, n)
+		for i := range inputs {
+			inputs[i] = randVar(rng, -1, 1, 2, i+1)
+		}
+		f := func(v ...*Variable) *Variable {
+			c := ConcatCol(v...)
+			cols := c.Data.Cols()
+			// Diamond: the overflow node feeds two slot nodes whose
+			// gradients accumulate back into it.
+			w := Hadamard(SliceCol(c, 0, cols-1), Tanh(SliceCol(c, 1, cols)))
+			return SumAll(w)
+		}
+		gradCheck(t, fmt.Sprintf("ConcatCol %d inputs mixed", n), f, inputs...)
 	}
 }
 

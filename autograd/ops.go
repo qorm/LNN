@@ -40,8 +40,9 @@ const (
 
 // runBackward propagates v's accumulated gradient to its parents. The case
 // bodies are exactly the gradient formulas the per-op closures used to
-// carry; operands are read from v.parents and the captured constants from
-// v's payload fields.
+// carry; operands are read through the parent accessors (parent/parentsSlice,
+// which unify the inline slots and the overflow slice) and the captured
+// constants from v's payload fields.
 func (v *Variable) runBackward() {
 	switch v.kind {
 	case opLeaf:
@@ -50,7 +51,7 @@ func (v *Variable) runBackward() {
 		// MatMulTransB/MatMulTransA read the transposed entries in place —
 		// the identical products and accumulation order as MatMul over an
 		// explicit Transpose, minus the two transpose buffers.
-		a, b := v.parents[0], v.parents[1]
+		a, b := v.parent(0), v.parent(1)
 		a.addGrad(tensor.MatMulTransB(v.Grad, b.Data))
 		b.addGrad(tensor.MatMulTransA(a.Data, v.Grad))
 	case opAdd:
@@ -65,13 +66,13 @@ func (v *Variable) runBackward() {
 		// a.Grad and b.Grad would alias and later accumulation into either
 		// would corrupt the other (e.g. Add(x, y) with both leaves reused
 		// downstream).
-		a, b := v.parents[0], v.parents[1]
+		a, b := v.parent(0), v.parent(1)
 		a.addGrad(sumToShapeTake(v.Grad, a.Data.Shape))
 		b.addGrad(tensor.SumToShape(v.Grad, b.Data.Shape))
 	case opSub:
 		// The a-branch may take v.Grad directly (see opAdd). The b-branch
 		// goes through negReduce, whose result is always a fresh buffer.
-		a, b := v.parents[0], v.parents[1]
+		a, b := v.parent(0), v.parent(1)
 		a.addGrad(sumToShapeTake(v.Grad, a.Data.Shape))
 		b.addGrad(negReduce(v.Grad, b.Data.Shape))
 	case opHadamard:
@@ -79,15 +80,15 @@ func (v *Variable) runBackward() {
 		// full product when the shape matches, or the reduced gradient
 		// directly (two distinct buffers even when a == b). v.Grad is only
 		// read, never handed off, so addGrad may take either result.
-		a, b := v.parents[0], v.parents[1]
+		a, b := v.parent(0), v.parent(1)
 		a.addGrad(hadamardReduce(v.Grad, b.Data, a.Data.Shape))
 		b.addGrad(hadamardReduce(v.Grad, a.Data, b.Data.Shape))
 	case opScale:
-		v.parents[0].addGrad(tensor.Scale(v.Grad, v.scalar))
+		v.parent(0).addGrad(tensor.Scale(v.Grad, v.scalar))
 	case opTanh:
 		// Fused g ⊙ (1 − tanh²): the per-element operation sequence is
 		// unchanged from the former composition x*x, 1−r, g⊙r.
-		a := v.parents[0]
+		a := v.parent(0)
 		if !gradMatchesElemwise(v.Grad.Shape, a.Data.Shape) {
 			// Irregular seeded gradient: broadcast exactly as the legacy
 			// composition did (see gradMatchesElemwise).
@@ -110,7 +111,7 @@ func (v *Variable) runBackward() {
 	case opSigmoid:
 		// Fused g ⊙ σ ⊙ (1−σ), evaluating x*(1−x) per element exactly as
 		// the former Sub-then-Hadamard composition did.
-		a := v.parents[0]
+		a := v.parent(0)
 		if !gradMatchesElemwise(v.Grad.Shape, a.Data.Shape) {
 			one := v.Data.OnesLike()
 			deriv := tensor.Hadamard(v.Data, tensor.Sub(one, v.Data))
@@ -124,12 +125,12 @@ func (v *Variable) runBackward() {
 		}
 		a.addGrad(r)
 	case opExp:
-		a := v.parents[0]
+		a := v.parent(0)
 		a.addGrad(tensor.Hadamard(v.Grad, v.Data))
 	case opLog:
 		// Fused g ⊙ (1/x): the reciprocal is computed with the same
 		// float32 division as the former Apply, then multiplied.
-		a := v.parents[0]
+		a := v.parent(0)
 		if !gradMatchesElemwise(v.Grad.Shape, a.Data.Shape) {
 			inv := tensor.Apply(a.Data, func(x float32) float32 { return 1 / x })
 			a.addGrad(tensor.Hadamard(v.Grad, inv))
@@ -142,7 +143,7 @@ func (v *Variable) runBackward() {
 		}
 		a.addGrad(r)
 	case opPow:
-		a := v.parents[0]
+		a := v.parent(0)
 		p := v.scalar
 		if p == 0 {
 			// d/dx x^0 == 0 everywhere. Computing p*x^(p-1) directly would
@@ -167,12 +168,12 @@ func (v *Variable) runBackward() {
 		}
 		a.addGrad(r)
 	case opSoftplus:
-		a := v.parents[0]
+		a := v.parent(0)
 		a.addGrad(tensor.Hadamard(v.Grad, tensor.Sigmoid(a.Data)))
 	case opAbs:
 		// Fused g ⊙ sign(x): the same sign classification and the same
 		// g*mask multiplication as the former Apply-then-Hadamard pair.
-		a := v.parents[0]
+		a := v.parent(0)
 		if !gradMatchesElemwise(v.Grad.Shape, a.Data.Shape) {
 			sign := tensor.Apply(a.Data, func(x float32) float32 {
 				switch {
@@ -203,7 +204,7 @@ func (v *Variable) runBackward() {
 	case opRelu:
 		// Fused g ⊙ [x > 0]: the same mask and the same g*mask
 		// multiplication as the former Apply-then-Hadamard pair.
-		a := v.parents[0]
+		a := v.parent(0)
 		if !gradMatchesElemwise(v.Grad.Shape, a.Data.Shape) {
 			mask := tensor.Apply(a.Data, func(x float32) float32 {
 				if x > 0 {
@@ -229,19 +230,19 @@ func (v *Variable) runBackward() {
 		// the result is a fresh buffer dedicated to a.
 		// db = -g·a/b², reduced first, then scaled (see Div's doc comment).
 		// The final negated scaling is fused into one buffer.
-		a, b := v.parents[0], v.parents[1]
+		a, b := v.parent(0), v.parent(1)
 		inv := v.aux
 		a.addGrad(hadamardReduce(v.Grad, inv, a.Data.Shape))
 		ga := hadamardReduce(v.Grad, a.Data, b.Data.Shape)
 		b.addGrad(negHadamardPow2(ga, b.Data))
 	case opConcatCol:
 		off := 0
-		for _, p := range v.parents {
+		for _, p := range v.parentsSlice() {
 			p.addGrad(tensor.SliceCol(v.Grad, off, off+p.Data.Cols()))
 			off += p.Data.Cols()
 		}
 	case opSliceCol:
-		a := v.parents[0]
+		a := v.parent(0)
 		from, to := v.from, v.to
 		g := tensor.New(a.Data.Shape...)
 		rows, cols := a.Data.Rows(), to-from
@@ -250,7 +251,7 @@ func (v *Variable) runBackward() {
 		}
 		a.addGrad(g)
 	case opSliceRow:
-		a := v.parents[0]
+		a := v.parent(0)
 		g := tensor.New(a.Data.Shape...)
 		n := a.Data.Cols()
 		i := v.from
@@ -260,7 +261,7 @@ func (v *Variable) runBackward() {
 		// Broadcast the scalar gradient into a fresh buffer directly. The
 		// former OnesLike-then-Scale form multiplied each one by the
 		// scalar; 1*s == s is exact for every float32.
-		a := v.parents[0]
+		a := v.parent(0)
 		s := v.Grad.Scalar()
 		r := tensor.New(a.Data.Shape...)
 		for i := range r.Data {
@@ -270,7 +271,7 @@ func (v *Variable) runBackward() {
 	case opMeanAll:
 		// Broadcast g/size directly; see opSumAll for why dropping the
 		// multiply-by-one is bit-identical.
-		a := v.parents[0]
+		a := v.parent(0)
 		s := v.Grad.Scalar() / float32(a.Data.Size())
 		r := tensor.New(a.Data.Shape...)
 		for i := range r.Data {
@@ -278,7 +279,7 @@ func (v *Variable) runBackward() {
 		}
 		a.addGrad(r)
 	case opGatherRows:
-		a := v.parents[0]
+		a := v.parent(0)
 		g := tensor.New(a.Data.Shape...)
 		cols := a.Data.Cols()
 		for i, j := range v.idx {
@@ -288,7 +289,7 @@ func (v *Variable) runBackward() {
 	case opLogSoftmaxRows:
 		// Fused g − softmax⊙rowsum: per element the same product sm*rs is
 		// subtracted from g, in the same row-major order.
-		a := v.parents[0]
+		a := v.parent(0)
 		if !sameShape(v.Grad.Shape, v.Data.Shape) {
 			// Irregular seeded gradient: the legacy composition's SumCols
 			// reduction broadcasts differently (and panics on 1D seeds) —
@@ -323,7 +324,7 @@ func (v *Variable) runBackward() {
 		// fused loop then evaluated mul32(g⊙w, mul32(s, 1−s)) per element. The
 		// loop below rounds the g⊙w product through mul32 at the very same
 		// spot, so the regular path is bit-identical to the legacy chain.
-		z, w := v.parents[0], v.parents[1]
+		z, w := v.parent(0), v.parent(1)
 		s := v.aux
 		if s.Dims() == 2 && sameShape(v.Grad.Shape, s.Shape) {
 			// Regular 2D path (the LTC hot path): w broadcasts across s's rows

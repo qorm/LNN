@@ -21,6 +21,7 @@
 | 11 | 发布打磨：上手审计 + 长时 fuzz 浸泡 + GitHub Releases + pkg.go.dev 验证 | ✅ 完成（1.3 亿次 fuzz 零失败 · 新手审计零阻断 · 六版 Releases · pkg.go.dev 上线） |
 | 12 | 覆盖率净化至诚实终值 | ✅ 完成（v0.4.1：四包正当 100.0% + optimizer 99.6% 诚实残余 1/231） |
 | 13 | 文档完善：cookbook 任务式食谱 + FAQ + examples 扩充 + godoc 逐符号审计 + api.md 速查（双语） | ✅ 完成 |
+| 14 | parents 定长槽化（留档唯一性能余项，库主选定跑完） | 🔄 进行中（P-E 已派发） |
 
 ## 阶段 1：并行分析（已完成）
 

@@ -6,6 +6,13 @@ import (
 	"github.com/qorm/LNN/tensor"
 )
 
+// inlineParents is the parent capacity of a node's inline slots. Every
+// fixed-arity op has one or two parents (see the op constructors in ops.go),
+// so two slots hold every hot-path node's parent list inside the Variable
+// itself, with no per-node slice allocation; only ConcatCol with more than
+// two inputs overflows to the heap slice.
+const inlineParents = 2
+
 // Variable is a node in the computation graph: a tensor value plus its
 // accumulated gradient and the backward step that propagates it.
 //
@@ -14,6 +21,16 @@ import (
 // the largest allocation sources in deep unrolled graphs), while the tag
 // adds a few bytes to this struct. The payload fields (scalar, from/to,
 // aux, idx) carry exactly the constants the former closures captured.
+//
+// Parent links use the same small-vector trade: the former parents slice
+// header cost one heap allocation per graph node (pprof: ~11.7% of
+// UnrollBackward's allocation objects, matching the Variable struct
+// itself). The inline slots p now carry up to inlineParents parents inside
+// the struct — every unary/binary op node — and the parents slice is the
+// overflow storage for ConcatCol with more inputs than the slots hold
+// (cold: the library itself never calls ConcatCol). The struct grows a few
+// bytes per node in exchange, the same size-for-allocation trade as the
+// opKind tag above.
 type Variable struct {
 	// Data is the node's current value. For leaves it is the tensor the
 	// node was constructed over (not copied by Var/Const — see Var);
@@ -26,8 +43,10 @@ type Variable struct {
 	// semantics. ZeroGrad resets it to nil.
 	Grad *tensor.Tensor
 
-	parents  []*Variable
+	parents  []*Variable              // overflow parents (> inlineParents); nil when the slots hold the list
+	p        [inlineParents]*Variable // inline parent slots, in setting order
 	kind     opKind
+	np       uint8          // parent count when parents == nil (0..inlineParents)
 	scalar   float32        // Scale factor / Pow exponent
 	from, to int            // SliceCol column range / SliceRow row index
 	aux      *tensor.Tensor // Div's captured inverse of the denominator
@@ -59,7 +78,52 @@ func Const(t *tensor.Tensor) *Variable { return Var(t) }
 // newOp creates the output Variable of an operation and records its parents
 // and op kind; runBackward dispatches the gradient propagation on the kind.
 func newOp(data *tensor.Tensor, parents []*Variable, kind opKind) *Variable {
-	return &Variable{Data: data, parents: parents, kind: kind}
+	v := &Variable{Data: data, kind: kind}
+	v.setParents(parents)
+	return v
+}
+
+// setParents records the node's parents in construction order. Up to
+// inlineParents parents go into the inline slots; more than that — only
+// ConcatCol reaches this branch — goes into the overflow slice. Either way
+// the parents slice is only read, never retained (the overflow branch
+// copies), so the caller's []*Variable{a, b} literal does not escape and
+// the fixed-arity constructors allocate no per-node parent storage; the
+// copy also makes the node's parent list immune to later mutation of a
+// caller-owned slice (ConcatCol(slice...)).
+func (v *Variable) setParents(parents []*Variable) {
+	if len(parents) <= inlineParents {
+		copy(v.p[:], parents)
+		v.np = uint8(len(parents))
+		return
+	}
+	v.parents = append([]*Variable(nil), parents...)
+}
+
+// numParents returns the node's parent count (zero for leaves).
+func (v *Variable) numParents() int {
+	if v.parents != nil {
+		return len(v.parents)
+	}
+	return int(v.np)
+}
+
+// parent returns the i-th parent in construction order.
+func (v *Variable) parent(i int) *Variable {
+	if v.parents != nil {
+		return v.parents[i]
+	}
+	return v.p[i]
+}
+
+// parentsSlice returns the parents in construction order: the overflow
+// slice when set, otherwise a view over the inline slots. The view aliases
+// the node's slot storage; callers only range over it during traversal.
+func (v *Variable) parentsSlice() []*Variable {
+	if v.parents != nil {
+		return v.parents
+	}
+	return v.p[:v.np]
 }
 
 // addGrad accumulates g into the variable's gradient buffer. It panics if the
@@ -120,7 +184,7 @@ func (v *Variable) Backward() {
 			return
 		}
 		visited[n] = true
-		for _, p := range n.parents {
+		for _, p := range n.parentsSlice() {
 			build(p)
 		}
 		topo = append(topo, n)
@@ -130,7 +194,7 @@ func (v *Variable) Backward() {
 		topo[i].runBackward()
 	}
 	for _, n := range topo {
-		if n != v && len(n.parents) > 0 {
+		if n != v && n.numParents() > 0 {
 			n.Grad = nil
 		}
 	}

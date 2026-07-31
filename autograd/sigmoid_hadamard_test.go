@@ -233,10 +233,10 @@ func TestSigmoidHadamardSingleNodeGraph(t *testing.T) {
 				return
 			}
 			seen[v] = true
-			if len(v.parents) > 0 {
+			if v.numParents() > 0 {
 				n++
 			}
-			for _, p := range v.parents {
+			for _, p := range v.parentsSlice() {
 				walk(p)
 			}
 		}
@@ -247,8 +247,8 @@ func TestSigmoidHadamardSingleNodeGraph(t *testing.T) {
 	w := New([]float32{4, 3, 2, 1}, 2, 2)
 
 	f := SigmoidHadamard(z, w)
-	if len(f.parents) != 2 || f.parents[0] != z || f.parents[1] != w {
-		t.Fatalf("SigmoidHadamard must wire z and w directly, got %d parents", len(f.parents))
+	if f.numParents() != 2 || f.parent(0) != z || f.parent(1) != w {
+		t.Fatalf("SigmoidHadamard must wire z and w directly, got %d parents", f.numParents())
 	}
 	if got := countOps(f); got != 1 {
 		t.Fatalf("fused graph has %d op nodes, want 1", got)
