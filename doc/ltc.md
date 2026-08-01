@@ -331,7 +331,7 @@ Finiteness domains of the implementation (`scaledCapacitance`,
 | `ts` range | behavior |
 |---|---|
 | `ts ≳ 1e-3` (any real training regime) | the overflow guard is bit-identical to the naive `softplus(cm)·unfolds/ts` — a red-team sweep over `ts ∈ [1e-3, 100]` measured max diff `0`; full physical fidelity |
-| down to ≈ `1e-38` | still the true ODE; the first bit-level deviations from the naive formula appear around `ts ≈ 1e-37 – 1e-38` (the hard overflow clamp engages once `unfolds/ts` exceeds `MaxFloat32`, i.e. `ts ≲ 1.8e-38`), far below any schedule |
+| down to ≈ `1e-38` | still the true ODE; the first bit-level deviations from the naive formula appear around `ts ≈ 1e-37 – 1e-38` (measured at unfolds = 6: no deviation at `1e-36`, deviation at `1e-37`; the hard overflow clamp engages once `unfolds/ts` exceeds `MaxFloat32`, i.e. `ts ≲ 1.76e-38` at unfolds = 6), far below any schedule |
 | `0 < ts ≲ 1e-38` | `unfolds/ts` exceeds `MaxFloat32`; the scale is clamped and the capacitance product is capped by a smooth differentiable min. Outputs stay **finite** (verified at `ts = 1e-40` and `1e-300`), but this is a finiteness-only domain, not physical — no sane schedule goes here |
 | huge `ts` (`1e300` tested) | scale → 0, state relaxes to its steady state; finite |
 

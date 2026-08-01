@@ -338,12 +338,18 @@ tensor (benchmark allocations −18~−26%, wall-clock neutral; the
 exported `Tensor.Reshape` replacing direct `Shape` writes), deleted the
 unused `tensor.Stack`, and froze the asymmetric reduction conventions
 after evaluation (decision trail in
-[doc/shapes-and-broadcasting.md](doc/shapes-and-broadcasting.md)). The
-remaining roadmap is the technical-debt table in
+[doc/shapes-and-broadcasting.md](doc/shapes-and-broadcasting.md)). A
+later pass closed the last performance backlog item (fixed-capacity
+parent slots in the graph node: −10~−22% allocs, bitwise-equivalent),
+and the latest work fused the LTC's ODE unfolds into a single graph
+node — ~2.1–2.3× on the step and unroll benchmarks, bit-exact against
+the former graph path — and added `nn.UnrollRemat`, chunked
+backpropagation through time with bit-exact gradients at O(chunk) peak
+memory (mechanism in [doc/architecture.md](doc/architecture.md), recipe
+13 in [doc/cookbook.md](doc/cookbook.md)). The remaining roadmap is the
+technical-debt table in
 [doc/pitfalls.md](doc/pitfalls.md): every remaining entry is
-accepted-risk or informational grade — the sole performance-flavored
-candidate left (fixed-capacity parent slots in the graph node) is low
-priority.
+accepted-risk or informational grade.
 
 The full development history and audit trail is recorded in
 `PROGRESS.md`.
