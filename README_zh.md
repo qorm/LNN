@@ -11,6 +11,8 @@
 
 LNN 小而显式。它宁可牺牲覆盖面，也要保证内核可读、可审计：没有代码生成，没有 GPU 后端，没有运算符重载技巧——只有 Go。
 
+在当前的文献脉络里，液态细胞正被读作非线性状态空间模型（SSM）：Liquid-S4（[arXiv:2209.12951](https://arxiv.org/abs/2209.12951)，ICLR 2023）把 LTC 动力学装进了 S4 状态空间形式体系，LrcSSM（[arXiv:2505.21717](https://arxiv.org/abs/2505.21717)，NeurIPS 2025）则把液态动力学扩展成能线性时间处理长序列的非线性 SSM 层。从这个角度看，本库的细胞就是可解释、变步长（变 `ts`）、稀疏接线的非线性 SSM 细胞——CfC 更新步与 Mamba 选择性 SSM 步的公式级对应，见 [doc/zh/cfc.md](doc/zh/cfc.md)。
+
 ## 包结构
 
 | 包 | 职责 |
@@ -162,6 +164,13 @@ out, h := cell.Step(x, nil, 0.1)     // x: [batch,4], nil = 零初始状态, 时
 // 因此在 ys 上构建的损失只需一次 Backward 就能对时间求导。
 ys, hN := nn.Unroll(cell, xs, nil, 0.1) // xs: []*autograd.Variable，每个为 [batch,4]
 
+// 长序列：UnrollRemat 对 lossFn(ys) 做贯穿时间的求导，
+// 梯度与 Unroll + loss.Backward() 逐位相等，
+// 峰值图内存为 O(chunkSize) 而非 O(len(xs))。
+// params 必须列出细胞 Step 消费的每一个可训练叶（完备性有审计）；
+// lossFn 由 detach 后的逐步输出构建标量损失。
+ys, hN, loss := nn.UnrollRemat(cell, cell.Parameters(), xs, nil, 0.1, 8, lossFn)
+
 // CfC 是闭式兄弟细胞：同一条 ODE、同一套 13 参数突触参数化，
 // 但没有 unfolds——Lemma 1 闭式解一步推进整个时间跨度 ts（doc/zh/cfc.md）。
 cfc := nn.NewCfC(4, 8, nil, rng)
@@ -200,7 +209,7 @@ out2, h2 := cfc.Step(x, nil, 0.1)
 
   其他任何组合都会 panic，并附说明性消息。
 - **形状约定并非完全对称**（例如 `SumRows` 返回 `[1,n]` 而 `SumCols` 返回 `[m]`，1D⊕1D 的结果会被提升为 `[1,n]`）。依赖某个归约的输出形状之前，请先读 `tensor/ops.go` 里的文档注释。
-- **计算图保留到 `Backward` 为止。** 每个中间张量都被计算图持有，因此内存随算子数量增长。一次 LTC step 会把 `unfolds` 轮 ODE 迭代展开进图，每轮是 O(units) 个激活块加一次稀疏突触前收缩（sparse contraction）——`+0` 播种、末端归一化 MatMul 收尾的折叠（fold），全程不存在任何稠密 `[units², units]` 指示矩阵（indicator matrix）（`units = 1024` 全接线细胞的构造耗费约 32 MB，而非早期稠密指示矩阵设计所需的约 8 GiB）。历经多轮反向与分配优化，实测分配数已降至 `LTCStep` 2,707 allocs/op、`UnrollBackward` 31,994——自首个基准累计下降约 63%/73%。在这个引擎上，`units`、`unfolds` 和序列长度请保持适度；`CfC` 细胞（[doc/zh/cfc.md](doc/zh/cfc.md)）则完全没有 `unfolds` 因子。
+- **计算图保留到 `Backward` 为止。** 每个中间张量都被计算图持有，因此内存随算子数量增长。一次 LTC step 的 `unfolds` 轮 ODE 迭代以**单个融合图节点**运行（前向与梯度对旧的逐展开图路径逐位一致），前置同一套稀疏突触前收缩（sparse contraction）——`+0` 播种、末端归一化 MatMul 收尾的折叠（fold），全程不存在任何稠密 `[units², units]` 指示矩阵（indicator matrix）（`units = 1024` 全接线细胞的构造耗费约 32 MB，而非早期稠密指示矩阵设计所需的约 8 GiB）。历经多轮反向、分配与融合优化，本机实测（`-benchtime=200x`）分配数已降至 `LTCStep` **236 allocs/op**（约 87 µs）、`UnrollBackward` **6,662**（约 1.33 ms）——较最初的逐突触循环下降约 97%/94%，较融合前的图路径快约 2.1–2.3×。在这个引擎上，`units`、`unfolds` 和序列长度请保持适度；`CfC` 细胞（[doc/zh/cfc.md](doc/zh/cfc.md)）完全没有 `unfolds` 因子；而真正长的序列可用 `nn.UnrollRemat` 以 O(chunk) 峰值图内存代替 O(序列) 对时间求导——T = 512 实测保留约 0.65 MB，对比全展开驻留约 11.5 MB（内存语义与最坏情形见 [doc/zh/architecture.md](doc/zh/architecture.md) 与 [doc/zh/pitfalls.md](doc/zh/pitfalls.md)；完整食谱见 [doc/zh/cookbook.md](doc/zh/cookbook.md#13-长序列训练unrollremat-分块-bptt)）。
 
 ## 并发契约
 
@@ -220,7 +229,7 @@ out2, h2 := cfc.Step(x, nil, 0.1)
 |---|---|
 | `tensor` | 核心稳定、测试充分（约 99.7% 行覆盖率）。唯一残余的未覆盖语句是 `broadcastBinary` 里一处双常量填充循环体，已论证为不可达（该路径上列数恒为 `1`，循环永不执行，且 `[1,1]×[1,1]` 会被同形快路径先截）；列明而非强凑一个造作的测试。转置感知 MatMul 内核由 `autograd` 包的测试覆盖。v0.4.0 的内嵌形状 backing（embedded backing）消除了每次张量构造的一次堆分配（基准 allocs −18~−26%，墙钟在噪声内持平）。 |
 | `autograd` | 稳定、测试充分（100% 行覆盖率）；已覆盖路径上的梯度均通过有限差分与逐位差分检验，包括为异形手设梯度新增的旧组合回退分支，以及 Sigmoid–Hadamard 融合的常规与回退路径。 |
-| `nn` | 可用、测试充分（100% 行覆盖率）：LTC 与 CfC 的前向/反向路径有回归测试，包括闭式退化情形检验、微小/NaN `ts` 防护、接线校验与 Save/Load round-trip（加载上限处有 units=2048 合法流真实 round-trip）。两个细胞的反转电位都是固定的 ±1 常量，由稀疏收缩（sparse contraction）之上的行视图常量承载——不可训练，也没有死梯度（结构上不可能）。稀疏收缩有对旧指示矩阵（indicator matrix）实现的逐位回归与大型细胞内存门禁。CfC 是较新的细胞，API 仍可能演进。 |
+| `nn` | 可用、测试充分（约 99.9% 行覆盖率——唯一未覆盖语句是 `UnrollRemat` 单元扫描中一处构造性不可达的 nil-root 防火墙守卫，已在 `nn/remat.go` 注释中论证；与 optimizer 行同一披露纪律）：LTC 与 CfC 的前向/反向路径有回归测试，包括闭式退化情形检验、微小/NaN `ts` 防护、接线校验与 Save/Load round-trip（加载上限处有 units=2048 合法流真实 round-trip）。两个细胞的反转电位都是固定的 ±1 常量，由稀疏收缩（sparse contraction）之上的行视图常量承载——不可训练，也没有死梯度（结构上不可能）。稀疏收缩有对旧指示矩阵（indicator matrix）实现的逐位回归与大型细胞内存门禁。LTC 的 ODE 展开以单个融合 `FusedOp` 节点运行，对融合前图路径在多种细胞形状、损失形状与对抗性非有限输入下逐位回归；`UnrollRemat` 的分块 BPTT 以「配置 × 损失形状」差分矩阵对全图反向逐位回归。CfC 是较新的细胞，API 仍可能演进。 |
 | `optimizer` | 稳定，约 99.6% 行覆盖率（唯一未覆盖语句为物理不可达的参数计数守卫）：三条更新规则均与独立参考实现对照验证（SGD 逐位一致，Adam 对 float64 参考最大偏差约 1.6e-6），指针键状态语义有回归测试；状态持久化（`SaveState`/`LoadState`，`"LNO1"` 状态流）以续训逐位等价测试（50+50 vs 100 步，三优化器）与恶意流测试（先全验后应用、零副作用、字节预算门禁）钉住。 |
 | `serialize` | 稳定，97.8% 行覆盖率：round-trip 逐位精确性（含 NaN 与 −0）有回归测试，并以提交的黄金向量做字节级钉死；不可信流契约——固定限额先校验后分配（含加载路径 `units`/`inDim` 上限 2048，按稀疏收缩的 O(units²) 加载期内存量级核定）、未知长度读端渐进分配——以分配计数与字节预算测试钉住；变异模糊测试数千个变异体 0 panic，资源耗尽加固后再测一轮依然 0 panic。资源边界文档见 [doc/zh/persistence.md](doc/zh/persistence.md)。 |
 

@@ -127,6 +127,7 @@ order. The whole graph stays resident until `Backward` runs.
 | [`Var`](https://pkg.go.dev/github.com/qorm/LNN/autograd#Var) | `Var(t) *Variable` | leaf; **aliases** `t` (no copy) — in-place updates work | — |
 | [`New`](https://pkg.go.dev/github.com/qorm/LNN/autograd#New) | `New(data []float32, shape ...int) *Variable` | leaf; copies data (`tensor.FromData`) | panic: shape/length mismatch |
 | [`Const`](https://pkg.go.dev/github.com/qorm/LNN/autograd#Const) | `Const(t) *Variable` | `Var` alias documenting constant intent; gradients still flow — ignore them | — |
+| [`Detach`](https://pkg.go.dev/github.com/qorm/LNN/autograd#Detach) | `Detach(v) *Variable` | `v`'s value as a fresh parentless leaf — **aliases** `v.Data` (zero copy); cuts gradient flow into `v`'s ancestors, not storage (an in-place update still moves a detached parameter) | — |
 
 ### Ops (each returns a fresh node; forward panics = the wrapped `tensor` op's panics)
 
@@ -144,6 +145,7 @@ order. The whole graph stays resident until `Backward` runs.
 | [`SumAll`](https://pkg.go.dev/github.com/qorm/LNN/autograd#SumAll) / [`MeanAll`](https://pkg.go.dev/github.com/qorm/LNN/autograd#MeanAll) | `(a) *Variable` | scalar `[1]`; backward broadcasts `g` / `g/size` | panic (MeanAll): empty |
 | [`GatherRows`](https://pkg.go.dev/github.com/qorm/LNN/autograd#GatherRows) | `(a, idx []int) *Variable` | `out[i] = a[i, idx[i]]` → 1D `[rows]`; idx copied | panic: non-2D, len(idx)≠rows, idx out of bounds |
 | [`LogSoftmaxRows`](https://pkg.go.dev/github.com/qorm/LNN/autograd#LogSoftmaxRows) | `(a) *Variable` | stable per-row log-softmax, fused backward | panic: non-2D |
+| [`FusedOp`](https://pkg.go.dev/github.com/qorm/LNN/autograd#FusedOp) | `FusedOp(data, parents, backward) *Variable` | custom op node: the caller computes the forward, the closure runs the node's **entire** backward — every `addGrad` to the parents plus the replaced subgraph's accumulation order is the closure's contract (the fused-LTC integration point, `nn/ltc_fused.go`) | panic: nil backward |
 
 ### Backward & inspection
 
@@ -152,6 +154,8 @@ order. The whole graph stays resident until `Backward` runs.
 | [`Backward`](https://pkg.go.dev/github.com/qorm/LNN/autograd#Variable.Backward) | `(*Variable).Backward()` | reverse-mode from a scalar receiver; leaf gradients **accumulate** across calls and graphs; non-leaf grads cleared | panic: non-scalar receiver without a seeded `Grad` |
 | [`ZeroGrad`](https://pkg.go.dev/github.com/qorm/LNN/autograd#Variable.ZeroGrad) | `(*Variable).ZeroGrad()` | `Grad = nil` — call before every backward pass | — |
 | [`Value`](https://pkg.go.dev/github.com/qorm/LNN/autograd#Variable.Value) | `(*Variable).Value() float32` | read a size-1 node (a loss) | panic: not size-1 |
+| [`TopoOrder`](https://pkg.go.dev/github.com/qorm/LNN/autograd#TopoOrder) | `TopoOrder(v) []*Variable` | DFS post-order of the graph rooted at `v` (parents before children, in construction order) — exactly `Backward`'s build order; read-only introspection | — |
+| [`Parents`](https://pkg.go.dev/github.com/qorm/LNN/autograd#Variable.Parents) | `(*Variable).Parents() []*Variable` | the node's parent list in construction order (empty for leaves); a **fresh copy per call** — mutating it cannot rewire the node | — |
 
 ## nn — [godoc](https://pkg.go.dev/github.com/qorm/LNN/nn) · [ltc](ltc.md) · [cfc](cfc.md) · [persistence](persistence.md)
 
@@ -172,6 +176,7 @@ order. The whole graph stays resident until `Backward` runs.
 |---|---|---|---|
 | [`Cell`](https://pkg.go.dev/github.com/qorm/LNN/nn#Cell) | `interface{ Step(x, h, ts) (out, hNew); StateSize() int }` | one RNN step; `x [batch,inDim]`, `h [batch,units]` or nil | — |
 | [`Unroll`](https://pkg.go.dev/github.com/qorm/LNN/nn#Unroll) | `Unroll(cell, xs, h0, ts) (ys, hN)` | thread a cell over a sequence in one graph — one `Backward` through time; empty `xs` → empty `ys`, `hN = h0` | panic: per `Step` |
+| [`UnrollRemat`](https://pkg.go.dev/github.com/qorm/LNN/nn#UnrollRemat) | `UnrollRemat(cell, params, xs, h0, ts, chunkSize, lossFn) (ys, hN, loss)` | chunked BPTT with rematerialization (gradient checkpointing): the gradients of `Unroll` + `lossFn` + `loss.Backward()` **bit for bit**, with peak graph memory O(chunkSize) instead of O(len(xs)) — an adversarial loss visit order can exceed even full unroll (worst case, documented); `params` must list **every** `Step`-consumed trainable leaf (completeness audited), and the cell's per-step graph shape must be value-independent; returned `ys`/`hN` are detached (safe to read, no graph behind them) | panic: chunkSize < 1, params audit, loss-side consumer order, multi-class shared leaf, per `Step` |
 | [`LTC`](https://pkg.go.dev/github.com/qorm/LNN/nn#LTC) | struct | Liquid Time-Constant cell (Hasani 2021): semi-implicit Euler over `unfolds` substeps, softplus positivity constraints, fixed ±1 reversal potentials (not in `Parameters()`) | — |
 | [`NewLTC`](https://pkg.go.dev/github.com/qorm/LNN/nn#NewLTC) | `NewLTC(inDim, units, wiring, unfolds, rng) *LTC` | nil wiring = fully connected; init ranges follow the reference; fixed seed → bit-identical cell | panic: dims < 1, unfolds < 1, mask shape mismatch, nil rng |
 | [`CfC`](https://pkg.go.dev/github.com/qorm/LNN/nn#CfC) | struct | Closed-form Continuous-time cell (Hasani 2022): the LTC's ODE advanced by its Lemma-1 closed form, no unfolding | — |

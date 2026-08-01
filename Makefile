@@ -9,7 +9,7 @@ FUZZTIME ?= 30s
 # Per-target window for `make fuzz-smoke` (CI gate; override for longer runs).
 SMOKETIME ?= 10s
 
-.PHONY: all fmt vet test cover build bench fuzz fuzz-smoke
+.PHONY: all fmt vet test cover build bench pgo-profile pgo-bench fuzz fuzz-smoke
 
 # Default: format, vet, and run the whole test suite with the race detector.
 all: fmt vet test
@@ -38,6 +38,25 @@ build:
 # a full benchmark run is slow.
 bench:
 	$(GO) test ./... -run '^$$' -bench $(BENCH) -benchmem
+
+# PGO measurement targets (see doc/pgo.md for the full workflow and the
+# numbers they reproduce). The profile is a throwaway measurement artifact:
+# it lands outside the repository (override PGOFILE to change where) and is
+# never committed. When overriding PGOFILE, pass an ABSOLUTE path: the
+# profile is written by `go test ./nn`, so a relative path would land in the
+# nn package's directory instead of the repository root.
+PGOFILE ?= /tmp/lnn.pprof
+
+# Collect a CPU profile from the two nn benchmarks — the library's
+# representative cell-level workloads (LTC ODE step; full unroll+backward).
+pgo-profile:
+	$(GO) test ./nn -run '^$$' -bench 'BenchmarkLTCStep|BenchmarkUnrollBackward' -benchtime=2s -cpuprofile=$(PGOFILE)
+
+# Re-run the benchmark suite with the collected profile applied. Compare
+# against `make bench` output — e.g. `make bench > base.txt`, then
+# `make pgo-bench > pgo.txt`, then benchstat base.txt pgo.txt.
+pgo-bench:
+	$(GO) test ./... -run '^$$' -bench $(BENCH) -benchmem -pgo=$(PGOFILE)
 
 # The native Go fuzz targets (func FuzzXxx), as package/Name pairs. These
 # crystallize the red team's ad-hoc mutation discipline into sustainable

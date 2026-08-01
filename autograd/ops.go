@@ -36,6 +36,7 @@ const (
 	opGatherRows
 	opLogSoftmaxRows
 	opSigmoidHadamard
+	opFused
 )
 
 // runBackward propagates v's accumulated gradient to its parents. The case
@@ -364,6 +365,11 @@ func (v *Variable) runBackward() {
 			r.Data[i] = mul32(gsd[i], mul32(sd[i], 1-sd[i]))
 		}
 		z.addGrad(r)
+	case opFused:
+		// The constructor recorded a hand-written backward; it is
+		// responsible for every addGrad call to the parents, replicating
+		// the accumulation order of the graph it replaced.
+		v.fused(v)
 	}
 }
 
@@ -954,6 +960,31 @@ func GatherRows(a *Variable, idx []int) *Variable {
 	}
 	out := newOp(tensor.FromData(data, m), []*Variable{a}, opGatherRows)
 	out.idx = idx
+	return out
+}
+
+// FusedOp creates an op node with a caller-supplied backward step: the
+// forward value is data (computed by the caller, exactly as for the fixed
+// op constructors), and backward is invoked by runBackward with the node
+// after its Grad has fully accumulated. The backward is responsible for
+// every addGrad call to the parents — nothing is dispatched automatically.
+//
+// This is the integration point for hand-written fused kernels (the LTC's
+// ODE unfold loop, nn/ltc_fused.go): one node replaces a whole subgraph,
+// and the closure must replicate the replaced subgraph's backward
+// accumulation order contribution for contribution, bit for bit. It exists
+// because a fused kernel's backward cannot be expressed by composing the
+// fixed ops without re-materializing the very graph the fusion removes.
+// Unlike the fixed ops, the closure allocates one heap object per node —
+// negligible at the intended rate of one node per RNN step (against the
+// hundreds of nodes the fused subgraph used to record per step). Panics
+// if backward is nil.
+func FusedOp(data *tensor.Tensor, parents []*Variable, backward func(v *Variable)) *Variable {
+	if backward == nil {
+		panic("autograd.FusedOp: nil backward")
+	}
+	out := newOp(data, parents, opFused)
+	out.fused = backward
 	return out
 }
 

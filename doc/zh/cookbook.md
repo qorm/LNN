@@ -45,6 +45,7 @@ replace github.com/qorm/LNN => /path/to/LNN   // 你的仓库检出路径
 | 10 | [安全加载不可信模型文件](#10-安全加载不可信模型文件) | 错误分类范式：kind / version / 上限 / 截断。 |
 | 11 | [训练中途退火学习率](#11-训练中途退火学习率) | 超参就是导出字段：写 `opt.LR`，下一次 `Step` 起生效。 |
 | 12 | [确定性复现](#12-确定性复现) | 种子纪律：同样的 seed ⇒ 逐位一致的运行。 |
+| 13 | [长序列训练：UnrollRemat 分块 BPTT](#13-长序列训练unrollremat-分块-bptt) | 梯度逐位一致、峰值图内存 O(chunk)：为超出全图驻留模型的序列准备的重实体化。 |
 
 ---
 
@@ -1648,3 +1649,226 @@ vector）一节——跨平台的细微之处：格式布局在任何平台都�
 冻结，但跨架构时浮点载荷每次融合乘加（FMA）可差 ≤ 1 ULP
 （arm64 对 amd64），因此黄金向量测试在生成架构之外断言 16 ULP
 窗口；[faq.md](faq.md) "不同机器上结果末位不同正常吗？"。
+
+---
+
+## 13. 长序列训练：UnrollRemat 分块 BPTT
+
+**场景：** 序列长到「整图驻留至 `Backward`」成为内存之墙——T = 512 时
+全展开要钉住约 11.5 MB 的存活图，而 `UnrollRemat` 只保留约 0.65 MB
+（约 18×；`BenchmarkUnrollPeakMemory512` /
+`BenchmarkUnrollRematPeakMemory512`，chunk 16、units 8、batch 16 实测）。
+`nn.UnrollRemat` 对 `lossFn(ys)` 做贯穿时间的求导，梯度与
+`Unroll` + `loss.Backward()` **逐位一致**，峰值图内存为
+O(chunkSize) 而非 O(len(xs))。下面的程序先对两种细胞证明逐位一致，
+再用它真实训练。
+
+```go
+package main
+
+import (
+	"fmt"
+	"math"
+	"math/rand"
+
+	"github.com/qorm/LNN/autograd"
+	"github.com/qorm/LNN/nn"
+	"github.com/qorm/LNN/optimizer"
+	"github.com/qorm/LNN/tensor"
+)
+
+const (
+	inDim, units  = 1, 8
+	seqLen, batch = 48, 16
+	chunk         = 8
+	lr, ts        = 0.01, 1.0
+	iters         = 250
+)
+
+// makeBatch 抽取一批全新的带界累加器数据：
+// s_t = clip(s_{t-1} + 0.25*u_t, -1, 1)，u_t ∈ {-1, +1}。
+func makeBatch(rng *rand.Rand) (xs, targets []*autograd.Variable) {
+	xs = make([]*autograd.Variable, seqLen)
+	targets = make([]*autograd.Variable, seqLen)
+	state := make([]float32, batch)
+	for t := 0; t < seqLen; t++ {
+		xb := make([]float32, batch)
+		yb := make([]float32, batch)
+		for b := 0; b < batch; b++ {
+			u := float32(1)
+			if rng.Intn(2) == 0 {
+				u = -1
+			}
+			xb[b] = u
+			s := state[b] + 0.25*u
+			if s > 1 {
+				s = 1
+			} else if s < -1 {
+				s = -1
+			}
+			state[b] = s
+			yb[b] = s
+		}
+		xs[t] = autograd.Var(tensor.FromData(xb, batch, inDim))
+		targets[t] = autograd.Var(tensor.FromData(yb, batch, 1))
+	}
+	return xs, targets
+}
+
+// mseLoss 是逐步 MSE 读出损失。它的拼写使损失图的 DFS 按升序
+// （t = 0, 1, 2, …）访问各步输出——remat 的快路径；降序拼写是
+// 已文档化的最坏情形（见本食谱的取舍表）。
+func mseLoss(readout *nn.Linear, targets []*autograd.Variable) func(ys []*autograd.Variable) *autograd.Variable {
+	return func(ys []*autograd.Variable) *autograd.Variable {
+		var acc *autograd.Variable
+		for t, y := range ys {
+			diff := autograd.Sub(readout.Forward(y), targets[t])
+			sq := autograd.Hadamard(diff, diff)
+			if t == 0 {
+				acc = sq
+			} else {
+				acc = autograd.Add(acc, sq)
+			}
+		}
+		return autograd.Scale(autograd.MeanAll(acc), 1/float32(len(ys)))
+	}
+}
+
+// bitIdentical 在同一细胞、同一批数据、同一损失上各跑一次
+// 全图反向（参照）与一次 UnrollRemat，报告损失值与每个参数梯度
+// 是否逐位一致。
+func bitIdentical(cell interface {
+	nn.Cell
+	nn.Module
+}, rng, data *rand.Rand) bool {
+	readout := nn.NewLinear(units, 1, rng)
+	params := nn.ParametersOf(cell, readout)
+	xs, targets := makeBatch(data)
+	lossFn := mseLoss(readout, targets)
+
+	for _, p := range params {
+		p.ZeroGrad()
+	}
+	ys, _ := nn.Unroll(cell, xs, nil, ts)
+	ref := lossFn(ys)
+	ref.Backward()
+	refGrads := make([][]float32, len(params))
+	for i, p := range params {
+		refGrads[i] = append([]float32(nil), p.Grad.Data...)
+	}
+
+	for _, p := range params {
+		p.ZeroGrad()
+	}
+	_, _, rmLoss := nn.UnrollRemat(cell, params, xs, nil, ts, chunk, lossFn)
+	if math.Float32bits(ref.Value()) != math.Float32bits(rmLoss.Value()) {
+		return false
+	}
+	for i, p := range params {
+		for j := range p.Grad.Data {
+			if math.Float32bits(p.Grad.Data[j]) != math.Float32bits(refGrads[i][j]) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func main() {
+	// 1. 对全图反向的逐位一致性，两种细胞各验一次
+	//    （LTC 会额外走过它脊柱类所需的 σ 扫描）。
+	ltc := nn.NewLTC(inDim, units, nil, 4, rand.New(rand.NewSource(42)))
+	cfc := nn.NewCfC(inDim, units, nil, rand.New(rand.NewSource(42)))
+	fmt.Printf("T=%d chunk=%d, remat vs whole-graph backward, bit-identical: LTC %v, CfC %v\n",
+		seqLen, chunk,
+		bitIdentical(ltc, rand.New(rand.NewSource(1)), rand.New(rand.NewSource(7))),
+		bitIdentical(cfc, rand.New(rand.NewSource(1)), rand.New(rand.NewSource(7))))
+
+	// 2. 用 UnrollRemat 的真实训练循环：四阶段纪律不变，
+	//    只是 loss 返回时反向已经完成。
+	rng := rand.New(rand.NewSource(42))
+	cell := nn.NewCfC(inDim, units, nil, rng)
+	readout := nn.NewLinear(units, 1, rng)
+	params := nn.ParametersOf(cell, readout) // 每一个可训练叶——有审计
+	opt := optimizer.NewAdamDefault(lr)
+	data := rand.New(rand.NewSource(7))
+	var first, last float64
+	for it := 0; it < iters; it++ {
+		xs, targets := makeBatch(data)
+		for _, p := range params {
+			p.ZeroGrad()
+		}
+		_, _, loss := nn.UnrollRemat(cell, params, xs, nil, ts, chunk, mseLoss(readout, targets))
+		opt.Step(params)
+		if it == 0 {
+			first = float64(loss.Value())
+		}
+		last = float64(loss.Value())
+		if it%50 == 0 || it == iters-1 {
+			fmt.Printf("iter %3d  loss=%.6f\n", it, loss.Value())
+		}
+	}
+	fmt.Printf("first=%.6f last=%.6f\n", first, last)
+}
+```
+
+实测输出（seed 42 / 1 / 7——确定性）：
+
+```
+T=48 chunk=8, remat vs whole-graph backward, bit-identical: LTC true, CfC true
+iter   0  loss=0.750716
+iter  50  loss=0.075355
+iter 100  loss=0.016325
+iter 150  loss=0.012297
+iter 200  loss=0.015780
+iter 249  loss=0.010747
+first=0.750716 last=0.010747
+```
+
+**关键行：**
+
+- `params := nn.ParametersOf(cell, readout)` 必须列出细胞 `Step`
+  消费的**每一个**可训练叶：结构探针会审计完备性，缺漏时按编号
+  指名 panic——漏列的叶会在每次扫描中静默多累加一份梯度
+  （错成 2–3 倍）。只被损失消费的叶（读出层的）可列可不列；
+  `xs`/`h0` 的梯度始终参与。
+- `lossFn` 收到的是 **detach 后**的逐步输出（值逐位一致、背后无
+  图），且恰好被调用一次；它的返回值在 `UnrollRemat` 返回时已经
+  反向完毕——梯度如同 `loss.Backward()` 之后一样落在叶节点里，
+  因此 `ZeroGrad` → `Step` 纪律照旧。返回的 `ys`/`hN` 同样是
+  detach 的：可安全读取、可喂给后续计算，但无法再对它们求导
+  （求导已经发生过了）。
+- 「逐位一致」用 `math.Float32bits` 断言，而不是打印小数——
+  两次运行可以打出相同的 `%.6f` 而末位不同（食谱 12）。T = 48
+  配 chunk = 8 恰好切成 6 个重算单元。
+- LTC 的检验额外走过了它的脊柱类 `cm` 所需的 σ 扫描；CfC 只走
+  rest 扫描（两次前向、一次反向——remat 的理想代价）。两者都与
+  全图反向逐位一致。
+
+**chunkSize 怎么选：** 峰值图内存与 `chunkSize` 近似线性（chunk 8
+约为上面 chunk 16 数字的一半），而 O(T) 的 detach 输出/状态都很小
+（每步一个 `[batch, units]` 张量），因此更小的 chunk 只多付逐单元
+固定开销——本引擎上 4–16 是合理区间。一个结构性告诫：被播种的步
+若*不是*损失访问序的纪录高（record high），会与后继步粘连，使重算
+单元合并超出 `chunkSize`。请把损失拼成按升序访问各步输出（上面的
+自然累加次序），单元便恰好等于 `chunkSize`；降序访问配小 chunk 是
+极端最坏情形——全部合并为一个 O(T) 单元，此时 `UnrollRemat` 的峰值
+内存*和*算力都严格贵于一次全图反向（这是逐位保真的代价，不是
+bug）。闭合引用参数的正则项是合法的（损失只调用一次），但必须写成
+数据在前——`Add(data, penalty)`，绝不 `Add(penalty, data)`——或者
+干脆做成常量；违规会被探针 panic。
+
+| | `Unroll` + `loss.Backward()` | `UnrollRemat` |
+|---|---|---|
+| 峰值图内存 | O(T × 逐步子图)——T = 512：驻留约 11.5 MB | O(chunkSize × 逐步子图) + O(T) 小张量——T = 512、chunk 16：保留约 0.65 MB |
+| 每次迭代算力 | 1 次前向 + 1 次反向 | CfC：2 前向 + 1 反向；LTC：3 前向 + 2 反向（σ 扫描）；非升序损失对两种细胞都再加一趟仿射补扫 |
+| 梯度 | 参照基准 | 与参照逐位一致（两种细胞，见上） |
+| 损失形状 | 任意 | 升序访问是快路径；对抗性访问序迫使单元合并（最坏可超全展开） |
+| `params` 参数 | — | 必须列出 `Step` 消费的每一个可训练叶；有审计，缺漏 panic |
+| 对细胞的要求 | 任意 `nn.Cell` | 逐步图结构必须是 `(x, h)` 的纯函数——两种内置细胞均满足；值依赖的分支会不可探地漂约 1–2 ULP（[pitfalls.md](pitfalls.md)） |
+| 何时使用 | 默认；中短序列 | 长序列，或内存吃紧的部署 |
+
+**延伸阅读：** 两遍法机制与它重放的三个折叠类见
+[architecture.md](architecture.md)；留档的残余角落（最坏情形、
+值依赖细胞、双 NaN 载荷角）见 [pitfalls.md](pitfalls.md)；完整
+契约见 `nn.UnrollRemat` 的 godoc；一行式条目见 [api.md](api.md)。

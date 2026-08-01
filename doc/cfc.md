@@ -65,15 +65,15 @@ v_new = A + (v − A)·e^{−κ·ts},   κ = G/cm
 `F ∈ [0, 1]`, so `v_new` is a convex combination of the old state `v`
 and the instantaneous reversal state `A`: the state stays bounded with
 no solver unfolds at all. The code follows the second form
-(`nn/cfc.go`, `Step`, lines 210–253):
+(`nn/cfc.go`, `Step`, lines 225–268):
 
 | quantity | code | lines |
 |---|---|---|
-| `G = gleak + Σ actⱼ` | `g := autograd.Add(gleak, autograd.Add(denS, denR))` | 237 |
-| `A = (gleak·vleak + Σ actⱼ·erevⱼ) / (G + eps)` | `a := autograd.Div(…, autograd.Add(g, epsV))` | 239–242 |
-| `B = κ·ts`, overflow/sign-capped | `b := c.decayRate(g, cm, epsV, ts)` | 244 |
-| `F(B) = 1 − e^{−B}`, exprel-stabilized | `f := c.decayFactor(b)` | 246 |
-| `v_new = v + (A − v)·F` | `vNew := autograd.Add(h, autograd.Hadamard(autograd.Sub(a, h), f))` | 249 |
+| `G = gleak + Σ actⱼ` | `g := autograd.Add(gleak, autograd.Add(denS, denR))` | 252 |
+| `A = (gleak·vleak + Σ actⱼ·erevⱼ) / (G + eps)` | `a := autograd.Div(…, autograd.Add(g, epsV))` | 254–257 |
+| `B = κ·ts`, overflow/sign-capped | `b := c.decayRate(g, cm, epsV, ts)` | 259 |
+| `F(B) = 1 − e^{−B}`, exprel-stabilized | `f := c.decayFactor(b)` | 261 |
+| `v_new = v + (A − v)·F` | `vNew := autograd.Add(h, autograd.Hadamard(autograd.Sub(a, h), f))` | 264 |
 
 One honest code-level deviation from the paper's bare equations: the
 divisors are guarded, `κ = G/(cm + eps)` and `A = …/(G + eps)` with
@@ -87,9 +87,9 @@ invisible; it exists to keep adversarial parameter draws from producing
 The paper's Algorithm 1 compiles an LTC into its closed-form update
 synapse by synapse, allowing arbitrary sparse adjacency. LNN mirrors
 that structure with the same sparse contraction the LTC uses:
-`drive()` (`nn/cfc.go:274-291`) builds one `[batch, units]` activation
+`drive()` (`nn/cfc.go:289-306`) builds one `[batch, units]` activation
 block per presynaptic neuron `i` — the column⊙row outer product gated
-by wiring mask row `i` — and `contract` (`nn/cfc.go:307-323`) reduces
+by wiring mask row `i` — and `contract` (`nn/cfc.go:322-338`) reduces
 the presynaptic axis as a `+0`-seeded ascending fold of the blocks (the
 denominator) and of the blocks scaled by their reversal rows (the
 numerator), each ended by a MatMul against the units×units identity.
@@ -148,12 +148,75 @@ If you need to reproduce MLP-backbone outputs from those repositories
 bit-for-bit, this is not that cell; if you want the ODE's closed-form
 solution with this library's LTC parameterization, it is.
 
+## Relation to state-space models (SSMs)
+
+The CfC update step has the same skeleton as a selective-SSM step.
+Take one scalar channel of Mamba's S6 (Gu & Dao,
+[*Mamba: Linear-Time Sequence Modeling with Selective State
+Spaces*](https://arxiv.org/abs/2312.00752), arXiv:2312.00752): the
+recurrence `h_t = Ā·h_{t-1} + B̄·x_t` (its Eq. (2a)) with the
+zero-order-hold discretization `Ā = e^{Δa}`, `B̄ = (e^{Δa} − 1)·b/a`
+(its Eq. (4), scalar `a`) rewrites, in the stable regime `a < 0`, as a
+convex combination
+
+```
+h_t = e^{Δ(x)·a} · h_{t-1}  +  (1 − e^{Δ(x)·a}) · (−(b/a)·x_t)
+```
+
+of the previous state and the input's steady state `−(b/a)·x`, where
+S6 makes `Δ(x) = softplus(param + Linear(x))` (and `B`, `C`) functions
+of the input — the selection mechanism of its Section 3.2. The Lemma 1
+update derived above is the same skeleton:
+
+```
+v_new = e^{−κ·ts} · v  +  (1 − e^{−κ·ts}) · A,     κ = G(x, v)/cm
+```
+
+Term by term, against this library's parameterization:
+
+| selective SSM (Mamba, scalar channel) | CfC (this library) |
+|---|---|
+| decay `e^{Δ(x)·a} ∈ (0, 1)` | decay `e^{−(G(x,v)/cm)·ts} ∈ (0, 1)` |
+| non-negative rate `−Δ(x)·a`, input-dependent | non-negative rate `G(x,v)/cm` — input- **and state**-dependent: the synaptic gating `actⱼ = softplus(wⱼ)·sigmoid(σⱼ·(v_pre − μⱼ))` reads the recurrent state |
+| target `−(b/a)·x_t`, the steady state of `h′ = a·h + b·x` | target `A = (gleak·vleak + Σⱼ actⱼ·erevⱼ)/G`, the steady state of the membrane ODE |
+| step size folded into the learned/predicted `Δ(x)` | step size explicit: caller-supplied `ts` per step (variable, event-driven) |
+| diagonal `A` (scalar per channel) | diagonal per-unit dynamics: units couple through the rates/targets (the synaptic sums in `G` and `A`), never through a dense transition matrix |
+| readout `y_t = C·h_t` | readout `outW ⊙ v + outB` (per-unit affine) |
+
+So `G(x,v)/cm` plays exactly the role of `Δ(x)·|a|`: both are
+non-negative, input-conditioned decay rates, and both steps interpolate
+between the previous state and the current input's steady state. Two
+honest differences: the CfC rate depends on the state `v` itself —
+which makes the recurrence genuinely non-linear in `v`, whereas S6's
+`Δ`, `B`, `C` are functions of the input alone — and CfC keeps `ts`
+explicit, so one cell handles irregularly sampled or event-driven
+sequences with no retraining.
+
+This reading is the literature's direction, not only ours. Liquid-S4
+(Hasani et al., [arXiv:2209.12951](https://arxiv.org/abs/2209.12951),
+ICLR 2023) built a structural SSM whose state transition is a linear
+LTC — an "input-dependent state transition module" in its authors'
+words. LrcSSM (Farsang et al.,
+[arXiv:2505.21717](https://arxiv.org/abs/2505.21717), NeurIPS 2025)
+scales the liquid-resistance liquid-capacitance dynamics of
+[arXiv:2403.08791](https://arxiv.org/abs/2403.08791) into "a non-linear
+recurrent model that processes long sequences as fast as today's linear
+state-space layers", explicitly grouping Liquid-S4 and Mamba as fellow
+input-varying systems. And the same research lineage continues into
+Liquid AI's LFM2 on-device foundation models
+([technical report](https://arxiv.org/abs/2511.23404),
+arXiv:2511.23404), whose hybrid backbone combines gated short
+convolutions with grouped-query attention blocks. From that angle the
+cells in this library are interpretable, variable-step, sparsely-wired
+non-linear SSM cells — small enough that every term above can be read
+off the code.
+
 ## The exprel stabilization
 
 The famous closed-form-CT trap is the raw quotient `(1 − e^{−B})/B` at
 `B → 0`: `1 − e^{−B}` cancels to 0 in finite precision and dividing by
 `B` yields garbage (and a dead gradient). `decayFactor`
-(`nn/cfc.go:373-398`) sidesteps it by computing the whole product
+(`nn/cfc.go:388-413`) sidesteps it by computing the whole product
 `F(B) = B·exprel(B)` with a per-element branch:
 
 | branch | formula | why |
@@ -170,7 +233,7 @@ value and slope at the threshold (red-team scan of 8001 points crossing
 `1e-2`: jump `≤ 2.98e-8`; regression-tested by
 `TestCfCExprelBoundaryContinuity`).
 
-`B` itself is protected upstream in `decayRate` (`nn/cfc.go:336-349`):
+`B` itself is protected upstream in `decayRate` (`nn/cfc.go:351-364`):
 the time scale is computed in `float64` and capped at `1e30` before
 conversion, and the conductance ratio gets the same smooth
 differentiable cap the LTC uses for its capacitance scaling
@@ -180,7 +243,7 @@ a negative decay rate would turn `e^{−B}` into a blow-up.
 ## The time span `ts`
 
 The contract is the LTC's: `ts` must be positive and finite; `NaN`,
-`±Inf`, zero and negative values panic (`nn/cfc.go:213-215`). Behavior
+`±Inf`, zero and negative values panic (`nn/cfc.go:228-230`). Behavior
 at the extremes:
 
 | `ts` | behavior |
@@ -211,7 +274,7 @@ constraints — see [ltc.md](ltc.md) for the derivation of each range):
 | `sErev` | `[inDim, units]` | random ±1 | **fixed — not trainable** | sensory reversal potentials |
 
 `Parameters()` returns the same 13 trainable tensors as the LTC
-(`nn/cfc.go:197-204`); `erev`/`sErev` are excluded for the same
+(`nn/cfc.go:208-215`); `erev`/`sErev` are excluded for the same
 structural reason as in the LTC — learning them would flip synapse
 polarity.
 

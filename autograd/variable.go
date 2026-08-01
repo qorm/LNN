@@ -46,11 +46,12 @@ type Variable struct {
 	parents  []*Variable              // overflow parents (> inlineParents); nil when the slots hold the list
 	p        [inlineParents]*Variable // inline parent slots, in setting order
 	kind     opKind
-	np       uint8          // parent count when parents == nil (0..inlineParents)
-	scalar   float32        // Scale factor / Pow exponent
-	from, to int            // SliceCol column range / SliceRow row index
-	aux      *tensor.Tensor // Div's captured inverse of the denominator
-	idx      []int          // GatherRows indices (copied at construction)
+	np       uint8             // parent count when parents == nil (0..inlineParents)
+	scalar   float32           // Scale factor / Pow exponent
+	from, to int               // SliceCol column range / SliceRow row index
+	aux      *tensor.Tensor    // Div's captured inverse of the denominator
+	idx      []int             // GatherRows indices (copied at construction)
+	fused    func(v *Variable) // FusedOp's hand-written backward step
 }
 
 // Var wraps a tensor as a graph leaf (e.g. a parameter or an input). It
@@ -74,6 +75,26 @@ func New(data []float32, shape ...int) *Variable {
 // a constant input rather than a trainable parameter. Gradients still flow
 // into it if it sits inside the graph; simply ignore them.
 func Const(t *tensor.Tensor) *Variable { return Var(t) }
+
+// Detach returns v's value as a new graph leaf: the same Data tensor, no
+// parents, a nil Grad. It is the canonical way to cut a graph in two —
+// gradients of any loss built on the detached leaf (or on nodes derived
+// from it) accumulate on that leaf and never flow back through v into
+// v's ancestors. v itself is untouched: it keeps its place in the original
+// graph, and a Backward rooted inside that graph still behaves exactly as
+// before.
+//
+// Detach shares v's tensor storage without copying, exactly as Var shares
+// its argument. That is safe against everything the library itself does:
+// no op mutates an existing tensor in place (every forward allocates a
+// fresh output buffer), so a detached activation stays bit-stable while
+// the graph grows and backward passes run. The one way the detached value
+// moves is the caller mutating the shared storage — e.g. an in-place
+// parameter update after detaching a parameter leaf — the same caveat Var
+// documents. Detach cuts gradient flow, not storage.
+func Detach(v *Variable) *Variable {
+	return &Variable{Data: v.Data}
+}
 
 // newOp creates the output Variable of an operation and records its parents
 // and op kind; runBackward dispatches the gradient propagation on the kind.
@@ -214,3 +235,44 @@ func (v *Variable) Backward() {
 // read a loss). Panics if the variable's Data does not hold exactly one
 // element.
 func (v *Variable) Value() float32 { return v.Data.Scalar() }
+
+// TopoOrder returns the depth-first post-order of the graph rooted at v —
+// parents before children, parents in construction order, each node once.
+// It is exactly the order Backward's build pass produces, i.e. the reverse
+// of the order Backward dispatches each node's backward step in, and it is
+// deterministic under the engine's single-threaded fixed-op-order
+// contract. The traversal only reads the graph; nothing is mutated. It is
+// exported for graph-introspection tooling — nn.UnrollRemat uses it to
+// classify per-leaf gradient accumulation order — and costs one slice plus
+// one visited set the size of the reachable graph.
+func TopoOrder(v *Variable) []*Variable {
+	topo := make([]*Variable, 0, 16)
+	visited := make(map[*Variable]bool)
+	var build func(n *Variable)
+	build = func(n *Variable) {
+		if visited[n] {
+			return
+		}
+		visited[n] = true
+		for _, p := range n.parentsSlice() {
+			build(p)
+		}
+		topo = append(topo, n)
+	}
+	build(v)
+	return topo
+}
+
+// Parents returns the node's parent list in construction order — empty
+// for leaves. It is the read-only counterpart of TopoOrder for graph
+// introspection (nn.UnrollRemat classifies a leaf's gradient fold by the
+// topological position of the nodes consuming it). The result is a fresh
+// copy each call: mutating it does not rewire the node — the internal
+// storage (the inline slots or the overflow slice) stays authoritative,
+// the same reason setParents copies caller slices on the way in.
+func (v *Variable) Parents() []*Variable {
+	ps := v.parentsSlice()
+	out := make([]*Variable, len(ps))
+	copy(out, ps)
+	return out
+}

@@ -120,6 +120,7 @@ go doc -all github.com/qorm/LNN/autograd   # 包内全部符号
 | [`Var`](https://pkg.go.dev/github.com/qorm/LNN/autograd#Var) | `Var(t) *Variable` | 叶节点；**别名** `t`（不复制）——原地更新直接生效 | — |
 | [`New`](https://pkg.go.dev/github.com/qorm/LNN/autograd#New) | `New(data []float32, shape ...int) *Variable` | 叶节点；复制 data（经 `tensor.FromData`） | panic：形状/长度不符 |
 | [`Const`](https://pkg.go.dev/github.com/qorm/LNN/autograd#Const) | `Const(t) *Variable` | `Var` 的别名，标明常量意图；梯度仍会流入——忽略即可 | — |
+| [`Detach`](https://pkg.go.dev/github.com/qorm/LNN/autograd#Detach) | `Detach(v) *Variable` | 以 `v` 的值新建无父叶节点——**别名** `v.Data`（零拷贝）；切断流向 `v` 祖先的梯度，但不断存储（原地参数更新仍会带动被 detach 的参数） | — |
 
 ### 算子（均返回新节点；前向 panic = 所包装 `tensor` 算子的 panic）
 
@@ -137,6 +138,7 @@ go doc -all github.com/qorm/LNN/autograd   # 包内全部符号
 | [`SumAll`](https://pkg.go.dev/github.com/qorm/LNN/autograd#SumAll) / [`MeanAll`](https://pkg.go.dev/github.com/qorm/LNN/autograd#MeanAll) | `(a) *Variable` | 标量 `[1]`；反向广播 `g` / `g/size` | panic（MeanAll）：空张量 |
 | [`GatherRows`](https://pkg.go.dev/github.com/qorm/LNN/autograd#GatherRows) | `(a, idx []int) *Variable` | `out[i] = a[i, idx[i]]` → 1D `[rows]`；idx 入场即复制 | panic：非 2D、len(idx)≠行数、idx 越界 |
 | [`LogSoftmaxRows`](https://pkg.go.dev/github.com/qorm/LNN/autograd#LogSoftmaxRows) | `(a) *Variable` | 稳定的逐行 log-softmax，融合反向 | panic：非 2D |
+| [`FusedOp`](https://pkg.go.dev/github.com/qorm/LNN/autograd#FusedOp) | `FusedOp(data, parents, backward) *Variable` | 自定义算子节点：前向由调用方算好，闭包负责该节点**全部**反向工作——对父节点的每一次 `addGrad` 以及被替换子图的累加序都是闭包自己的契约（融合 LTC 的集成点，`nn/ltc_fused.go`） | panic：nil backward |
 
 ### 反向与检视
 
@@ -145,6 +147,8 @@ go doc -all github.com/qorm/LNN/autograd   # 包内全部符号
 | [`Backward`](https://pkg.go.dev/github.com/qorm/LNN/autograd#Variable.Backward) | `(*Variable).Backward()` | 从标量接收者反向传播；叶梯度跨调用、跨图**累加**；非叶节点梯度遍历后清空 | panic：接收者非标量且未预置 `Grad` |
 | [`ZeroGrad`](https://pkg.go.dev/github.com/qorm/LNN/autograd#Variable.ZeroGrad) | `(*Variable).ZeroGrad()` | `Grad = nil`——每次反向之前必须调用 | — |
 | [`Value`](https://pkg.go.dev/github.com/qorm/LNN/autograd#Variable.Value) | `(*Variable).Value() float32` | 读取单元素节点（损失值） | panic：非单元素 |
+| [`TopoOrder`](https://pkg.go.dev/github.com/qorm/LNN/autograd#TopoOrder) | `TopoOrder(v) []*Variable` | 以 `v` 为根的图的 DFS 后序（父先于子，按构造次序）——与 `Backward` 的构建序完全一致；只读内省 | — |
+| [`Parents`](https://pkg.go.dev/github.com/qorm/LNN/autograd#Variable.Parents) | `(*Variable).Parents() []*Variable` | 节点的父列表，按构造次序（叶节点为空）；**每次调用返回新副本**——修改它不会重接图 | — |
 
 ## nn — [godoc](https://pkg.go.dev/github.com/qorm/LNN/nn) · [ltc](ltc.md) · [cfc](cfc.md) · [持久化](persistence.md)
 
@@ -165,6 +169,7 @@ go doc -all github.com/qorm/LNN/autograd   # 包内全部符号
 |---|---|---|---|
 | [`Cell`](https://pkg.go.dev/github.com/qorm/LNN/nn#Cell) | `interface{ Step(x, h, ts) (out, hNew); StateSize() int }` | 单步 RNN 推进；`x [batch,inDim]`、`h [batch,units]` 或 nil | — |
 | [`Unroll`](https://pkg.go.dev/github.com/qorm/LNN/nn#Unroll) | `Unroll(cell, xs, h0, ts) (ys, hN)` | 在一张图里把细胞展开过整个序列——一次 `Backward` 贯穿时间；空 `xs` → 空 `ys`、`hN = h0` | panic：随 `Step` |
+| [`UnrollRemat`](https://pkg.go.dev/github.com/qorm/LNN/nn#UnrollRemat) | `UnrollRemat(cell, params, xs, h0, ts, chunkSize, lossFn) (ys, hN, loss)` | 重实体化（rematerialization，梯度检查点）分块 BPTT：梯度与 `Unroll` + `lossFn` + `loss.Backward()` **逐位相等**，峰值图内存由 O(len(xs)) 降为 O(chunkSize)——对抗性 loss 访问序的最坏情形可超过全展开（已如实文档化）；`params` 必须列出**每一个** `Step` 消费的可训练叶（完备性有审计），细胞逐步图结构须与值无关；返回的 `ys`/`hN` 是 detach 的（可安全读取，背后无图） | panic：chunkSize < 1、params 审计、loss 侧消费者次序、跨类共享叶、随 `Step` |
 | [`LTC`](https://pkg.go.dev/github.com/qorm/LNN/nn#LTC) | struct | 液态时间常数细胞（Hasani 2021）：`unfolds` 个子步的半隐式 Euler，softplus 正性约束，固定 ±1 反转电位（不在 `Parameters()` 中） | — |
 | [`NewLTC`](https://pkg.go.dev/github.com/qorm/LNN/nn#NewLTC) | `NewLTC(inDim, units, wiring, unfolds, rng) *LTC` | nil wiring = 全连接；初始化区间遵循参考实现；固定种子 → 位级一致 | panic：维度 < 1、unfolds < 1、掩码形状不符、nil rng |
 | [`CfC`](https://pkg.go.dev/github.com/qorm/LNN/nn#CfC) | struct | 闭式连续时间细胞（Hasani 2022）：同一膜 ODE 以 Lemma 1 闭式解推进，无需展开 | — |

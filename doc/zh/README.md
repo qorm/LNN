@@ -20,9 +20,10 @@
 | [cfc.md](cfc.md) | 闭式连续时间（Closed-form Continuous-time）细胞（Nature Machine Intelligence 2022）：Lemma 1 闭式解（closed-form solution）、Algorithm 1「LTC 编译为闭式」、exprel 稳定化，以及与 LTC 的关系——同一 ODE，解析积分器（analytical integrator）取代欧拉循环。 |
 | [architecture.md](architecture.md) | 三层设计（tensor → autograd → nn）外加 optimizer 与 serialize 包、张量为何没有 stride、计算图按算子种类标签派发的反向传播与融合梯度循环如何工作。 |
 | [pitfalls.md](pitfalls.md) | 红队审计得出的已知边界与残余风险，以用户须知形式呈现：并发、float32 溢出、重复 Backward、微小 `ts`、不可信模型文件，以及技术债路线图。 |
-| [cookbook.md](cookbook.md) | 任务式食谱集，每条都是完整的实测程序：最小回路、Adam 加裁剪、梯度累积、逐位一致的断点续训、变 `ts` 事件驱动序列、模型检查、自定义损失、LTC 与 CfC 选型、多模块组合、不可信文件加载、学习率退火、确定性复现。 |
+| [cookbook.md](cookbook.md) | 任务式食谱集，每条都是完整的实测程序：最小回路、Adam 加裁剪、梯度累积、逐位一致的断点续训、变 `ts` 事件驱动序列、模型检查、自定义损失、LTC 与 CfC 选型、多模块组合、不可信文件加载、学习率退火、确定性复现、`UnrollRemat` 长序列训练（分块 BPTT）。 |
 | [faq.md](faq.md) | 常见问题，简短回答：loss 不降、`NaN` 损失、`ts`/`units`/`unfolds` 选取、梯度累积语义、跨平台末位差异、加载报错解读、Adam 续训。 |
 | [api.md](api.md) | API 速查：各包导出符号的一行式名录，并指向其权威文档（godoc / 概念指南）。（新增——由并行的文档任务创建。） |
+| [pgo.md](pgo.md) | PGO（画像引导优化）的诚实实测：为什么库本身不附带画像、给自己的二进制采画像的工作流，以及本仓库的基准数字——包括头条收益所悬的那个双态内联决策。 |
 
 ## 按读者画像选路
 

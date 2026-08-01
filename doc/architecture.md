@@ -118,12 +118,14 @@ type Variable struct {
     Data *tensor.Tensor   // forward value
     Grad *tensor.Tensor   // accumulated gradient (nil until first backward)
 
-    parents  []*Variable  // inputs of the op that produced this node
+    p        [2]*Variable // inline parent slots (every unary/binary op node)
+    parents  []*Variable  // overflow parents (ConcatCol with more inputs)
     kind     opKind       // tag: which gradient formula runBackward dispatches
     scalar   float32      // payload: Scale factor / Pow exponent
     from, to int          // payload: SliceCol range / SliceRow index
     aux      *tensor.Tensor // payload: Div's inverse denominator / SigmoidHadamard's sigmoid buffer
     idx      []int        // payload: GatherRows indices (copied at construction)
+    fused    func(*Variable) // payload: FusedOp's hand-written backward step
 }
 ```
 
@@ -136,8 +138,9 @@ type Variable struct {
   heap object per graph node: one of the largest allocation sources in
   deep unrolled graphs. The tag dispatch of the phase-7 overhaul replaces
   that with a `uint8` kind and a few payload fields on the struct;
-  `runBackward` is a 23-case switch (one case per `opKind`, including the
-  no-op `opLeaf`) whose case bodies are exactly the gradient formulas the
+  `runBackward` is a 24-case switch (one case per `opKind`, including the
+  no-op `opLeaf` and the `opFused` escape hatch below) whose case bodies
+  are exactly the gradient formulas the
   closures used to carry. A few cases (e.g.
   `opLog`) read a *parent's* `Data` at backward time, so leaf data must
   not be mutated between forward and backward ([pitfalls.md](pitfalls.md)
@@ -315,6 +318,95 @@ API-hygiene pass deleted `tensor.Stack` (3D output no op consumes, zero
 in-library callers) and moved the ownership-contract `SumToShapeTake`
 into autograd internals (above).
 
+### The fused LTC unfold kernel — one node per Step (stage 16)
+
+`autograd.FusedOp(data, parents, backward)` is the engine's escape hatch
+from the fixed op set: the caller computes the forward value, and the
+closure owns the node's **entire** backward — every `addGrad` to the
+parents and the accumulation order they fire in are the closure's
+contract, bit for bit. It costs one heap closure per node, negligible at
+the intended rate of one node per RNN step.
+
+The LTC's `Step` is where that rate pays: its `unfolds` ODE iterations
+used to record ~`6·units` graph nodes per unfold, and stage-15 profiling
+showed ~80% of the step's wall clock was per-node interpreter overhead,
+not math. Stage 16 replaces the whole unfolds loop with **one** `FusedOp`
+node (`nn/ltc_fused.go`): the forward replays the identical float32
+operation sequence in a single loop nest (the same per-element kernels,
+the same `mul32` FMA barriers wherever a product feeds an accumulation),
+and the backward is a hand-written VJP that replays the replaced
+subgraph's backward sweep contribution for contribution. The contract is
+bit-identity against the pre-fusion graph path, not a tolerance — finite
+values and NaN positions match exactly (the one archived exception, the
+payload/sign of a NaN produced by *two* NaN operands, is in
+[pitfalls.md](pitfalls.md)); it is gated by a differential matrix over
+cell shapes, loss shapes and adversarial non-finite inputs, and the
+public API is unchanged. One subtlety worth knowing exists, no more:
+the fused node is paired with a second, parentless `FusedOp` (the `hvN`
+delivery node) that emits one dense state-gradient contribution at
+exactly the topological slot the graph path's `Hadamard(cmT, v)` node
+completed in — that is how contributions arriving from *outside* the
+kernel (the output affine, chained inputs, loss-side terms) interleave
+with the kernel's deliveries bit-identically.
+
+Measured (`-benchtime=200x`, this machine): `LTCStep` ~203 µs / 2,122
+allocs → **~87 µs / 236 allocs/op**, `UnrollBackward` ~2.8–3.3 ms /
+28,273 allocs → **~1.33 ms / 6,662** — about 2.1–2.3× wall clock, with
+allocation counts down ~89%/76%. The remat benchmarks shrink along
+(`UnrollRemat` ~3.3–3.6 ms, `UnrollRematCfC` ~1.9–2.2 ms), because
+their recompute sweeps run the same fused steps.
+
+### Rematerialized BPTT — `nn.UnrollRemat` (stage 16)
+
+The memory model above makes BPTT cost O(T × per-step graph): the whole
+sequence stays in the graph until `Backward`. `nn.UnrollRemat` trades
+recomputation for that memory — gradient checkpointing — while keeping
+the gradients **bit-for-bit identical** to `Unroll` + `loss.Backward()`.
+Two passes: the first walks the sequence step by step,
+[`Detach`](api.md)ing every step's output and input state so the live
+graph never exceeds one step, then builds the loss once over the
+detached outputs and backwards it — yielding exactly the whole-graph
+backward's per-step output seeds. The second recomputes chunk-sized
+units of steps in reverse and backpropagates the saved seeds through
+them, threading the state gradient through the detached boundary states.
+
+The hard part is *order*, not math: `float32` addition is not
+associative, and the whole-graph backward folds each leaf's
+contributions in an order fixed by the graph's DFS shape and by which
+step outputs the loss visits first. Conceptually there are three fold
+classes — the per-step state subgraph folds in strictly reverse step
+order; the output affine (e.g. `outW`/`outB`) folds in the loss's
+reverse visit order over the seeded steps; and the LTC's `cm` "spine"
+folds run by run of the visit order's record highs. A one-step
+structural probe sorts every swept leaf into its class, and the sweeps
+(rest, plus a σ sweep for spine-class cells like the LTC, plus an
+affine pass for non-ascending losses) replay each class's fold — the
+association `((A+r₁)+r₂)` vs `(A+(r₁+r₂))` differs by one rounding, so
+replaying the *sequence* is what makes the result bitwise rather than
+merely close. The full argument and the sweep structure are in
+`nn/remat.go`'s godoc; this paragraph is the map, not the territory.
+
+Memory semantics: peak graph memory drops to O(chunkSize × per-step
+graph) plus O(T) small detached tensors (one `[batch, StateSize()]`
+tensor per step) — measured at T = 512: **~0.65 MB retained vs ~11.5 MB
+live** for the full unroll (~18×). The worst case is honest: a loss
+visiting the outputs in an adversarial order (a descending visit with a
+small chunkSize is the extreme) forces recompute units to merge up to
+O(T) long, so peak memory returns to the full-unroll figure — paid on
+top of the sweeps' recomputation. In that corner `UnrollRemat` costs
+strictly more peak memory AND more compute than one whole-graph
+backward; that is the price of bitwise fidelity, not a bug. The caller
+contracts, all probe-enforced with panics: `params` must list **every**
+trainable leaf the cell's `Step` consumes (an unlisted leaf would
+silently accumulate a 2–3× wrong gradient across sweeps); the cell's
+per-step graph structure must be a pure function of `(x, h)` — a
+value-dependent branch is the one case the probe cannot see and drifts
+~1–2 ULP, archived in [pitfalls.md](pitfalls.md); and a loss closing
+over a step-consumed leaf must visit every loss-side consumer of it
+after the seeded outputs (spell penalties data-first:
+`Add(data, penalty)`). A runnable recipe with chunk-size guidance is
+[cookbook.md](cookbook.md#13-long-sequence-training-chunked-bptt-with-unrollremat).
+
 ### Non-leaf gradients are set to nil after each traversal — and why
 
 Intermediate gradients are transient by design. If stale intermediate
@@ -343,9 +435,11 @@ see [persistence.md](persistence.md)). The phase-7 backward overhaul
 (above) halved the per-node allocation count, and the phase-8
 Sigmoid–Hadamard fusion took it further still, and the phase-10
 embedded shape backing (above) removed one more allocation per tensor
-construction. Measured now: `LTCStep` **2,707 allocs/op** and
-`UnrollBackward` **31,994** — cumulative **−63% and −73%** from the
-original per-synapse loop (7,360 / 120,163). The phase-9 step is an honest trade: allocs went
+construction. Measured now (stage 16, `-benchtime=200x`): `LTCStep`
+**236 allocs/op** and `UnrollBackward` **6,662** — cumulative **−97% and
+−94%** from the original per-synapse loop (7,360 / 120,163), the last
+step being the fused unfold kernel above (~2.1–2.3× wall clock against
+the pre-fusion graph path). The phase-9 step is an honest trade: allocs went
 *up* ~43%/~30% over the phase-8 values (2,306 / 31,983; the fold's
 per-stage cloning) but ns/op went *down* ~21%/~13% (independent
 red-team rerun), because the dense indicator MatMuls' O(units³) idle
@@ -357,7 +451,9 @@ now allocates ~32 MB (measured: 36.4 MiB for `NewLTC`, 32.4 MiB for
 `NewCfC`; red-team re-verification agrees), not the old ~8 GiB of
 indicators. Graph memory still grows with `units · unfolds · sequence
 length`, so keep all three modest on this engine; a `CfC` step
-([cfc.md](cfc.md)) avoids the `unfolds` factor entirely.
+([cfc.md](cfc.md)) avoids the `unfolds` factor entirely, and
+`nn.UnrollRemat` (above) caps peak graph memory at O(chunk) for long
+sequences.
 
 ## float32 is a global constraint
 

@@ -121,7 +121,7 @@ fmt.Println(m.Grad.Data) // [1 0 0 1] —— 依然正确
 
 ## 9. 图就是内存模型
 
-每个中间张量都保持存活，直到 `Backward` 完成。一次 LTC step 展开 `unfolds` 轮 ODE 迭代，自阶段 6 的突触向量化起每轮是 O(units) 个激活块（从 O(units²) 个逐突触节点降下来），自阶段 9 的稀疏收缩（sparse contraction）消灭稠密 `[units², units]` 指示矩阵（indicator matrix）起，突触前轴归约是 `+0` 播种、末端归一化 MatMul 收尾的折叠（fold）（见 [ltc.md](ltc.md)），阶段 7 的反向深改把逐节点分配数砍掉一半，阶段 8 的 Sigmoid–Hadamard 融合再进一步，阶段 10 的内嵌形状 backing（embedded backing，内联 `[4]int` 形状存储，每个张量少一次分配）再削一刀（`UnrollBackward` 31,994 allocs/op，较最初循环累计 −73%；阶段 9 这一步曾使 allocs 上升约 30% 但墙钟下降约 13%，阶段 10 再降 allocs 约 23% 而墙钟持平——见 [architecture.md](architecture.md)）；`T` 步的序列会把这一切再乘以 `T`。内存随每次迭代的算子数增长，而不仅仅随参数增长——`units`、`unfolds` 和序列长度都要保持适度；或者改用 `CfC` 细胞（[cfc.md](cfc.md)），它的闭式步进没有 `unfolds` 因子。
+每个中间张量都保持存活，直到 `Backward` 完成。一次 LTC step 展开 `unfolds` 轮 ODE 迭代，自阶段 6 的突触向量化起每轮是 O(units) 个激活块（从 O(units²) 个逐突触节点降下来），自阶段 9 的稀疏收缩（sparse contraction）消灭稠密 `[units², units]` 指示矩阵（indicator matrix）起，突触前轴归约是 `+0` 播种、末端归一化 MatMul 收尾的折叠（fold）（见 [ltc.md](ltc.md)），阶段 7 的反向深改把逐节点分配数砍掉一半，阶段 8 的 Sigmoid–Hadamard 融合再进一步，阶段 10 的内嵌形状 backing（embedded backing，内联 `[4]int` 形状存储，每个张量少一次分配）再削一刀，阶段 16 的融合展开内核（每个 LTC step 一个 `FusedOp` 节点，对图路径逐位）把它带到 `UnrollBackward` **6,662 allocs/op**——较最初循环累计 −94%，`LTCStep` **236**（阶段 9 这一步曾使 allocs 上升约 30% 但墙钟下降约 13%，阶段 10 再降 allocs 约 23% 而墙钟持平，阶段 16 再砍墙钟约 2.1–2.3×——见 [architecture.md](architecture.md)）；`T` 步的序列会把这一切再乘以 `T`。内存随每次迭代的算子数增长，而不仅仅随参数增长——`units`、`unfolds` 和序列长度都要保持适度；或者改用 `CfC` 细胞（[cfc.md](cfc.md)），它的闭式步进没有 `unfolds` 因子；或者用 `nn.UnrollRemat` 把峰值图内存封顶在 O(chunk)（[architecture.md](architecture.md)；[cookbook.md](cookbook.md#13-长序列训练unrollremat-分块-bptt) 食谱 13）。
 
 ## 10. 持久化把模型文件当作不可信输入
 
@@ -135,6 +135,18 @@ fmt.Println(m.Grad.Data) // [1 0 0 1] —— 依然正确
 
 格式规格、API 指南与完整契约——包括版本规则（只读 version 1；未知版本报错而非误解析）——见 [persistence.md](persistence.md)。
 
+## 阶段 16 残余留档
+
+阶段 16 两项工作（融合 LTC 内核与 `UnrollRemat`）的留档角落——选择披露而非修复；在文档所述用法下没有一项构成阻碍；体例照审计的留档表（问题/来源/严重度/处置）：
+
+| # | 问题 | 来源 | 严重度 | 处置 |
+|---|---|---|---|---|
+| 1 | 融合 LTC 路径：**两个**操作数都是 NaN 的算子产出的 NaN，其载荷/符号位在融合路径与旧图路径之间不保真（NaN 位置集与一切有限值逐位一致） | 阶段 16 红队 | Low（接受） | 与单源符号位角落 F9-1 同一接受级——与训练无关、轨迹无可观测分歧；载荷取决于编译器的指令选择，不属于任何可复刻的舍入结构。契约见 `nn/ltc_fused.go` 头注的 NaN 语义节 |
+| 2 | `UnrollRemat` 用于**逐步图结构依赖于张量值**的细胞时漂移约 1–2 ULP，单步结构探针不可探 | 阶段 16 红队 | Low（接受） | godoc 契约：`Step` 的图结构必须是 `(x, h)` 的纯函数；两种内置细胞均满足。值分支的自定义细胞在构造上即越出契约 |
+| 3 | `UnrollRemat` 最坏情形：对抗性 loss 访问序（降序访问配小 chunkSize 为极端）迫使重算单元合并至 O(T)——峰值内存*和*算力均可超过一次全图反向 | 阶段 16 红队 | Info | 已写入 godoc 与食谱的 chunkSize 指引；把损失拼成升序访问各步输出（数据在前）即保 O(chunk) 快路径 |
+| 4 | params 完备性审计的诚实性取决于细胞自报的 `Parameters()`：`Module` 若在自报列表中漏掉某个 `Step` 消费的叶，审计即失效，该叶会被静默多算（2–3 倍错梯度） | 阶段 16 红队 | Low（接受） | 两种内置细胞自报完备；对自定义细胞，`Parameters()` 的完备是细胞一侧的契约——审计覆盖细胞所披露的范围 |
+| 5 | `nn` 覆盖率为 99.9% 而非 100%：唯一未覆盖语句是 `UnrollRemat` 单元扫描中一处构造性不可达的 nil-root 防火墙守卫 | 阶段 16 API 总扫 | Info | 作为防御未来单元切分改动的防火墙保留，不可达论证注释在 `nn/remat.go`；已在 README 状态表披露（照 optimizer 行 99.6% 的纪律） |
+
 ## 路线图与技术债
 
 公开追踪；在文档所述范围（单线程、适度规模、合理的 `ts`/`lr`、调用方裁剪梯度）内，没有一项阻碍生产使用：
@@ -142,7 +154,7 @@ fmt.Println(m.Grad.Data) // [1 0 0 1] —— 依然正确
 | 条目 | 状态 |
 |---|---|
 | `autograd.Div` 闭式化 | **已完成：** 单图节点 + 商法则反向（`da = g/b`、`db = −g·a/b²`，`autograd/ops.go:829-846`）。注意小除数固有的 `1/b²` 梯度放大依然存在——以 LTC 的 `eps = 1e-8` 下限计，最高约 `1e16` 倍——因此仍建议梯度裁剪 |
-| LTC 突触向量化 | **已完成（阶段 6；收缩于阶段 9 重做）：** 掩码折叠出热路径；逐突触前神经元向量块（[ltc.md](ltc.md)）。阶段 6 以指示矩阵（indicator matrix）MatMul 收缩突触前轴（`LTCStep` 7,360 → 3,440 allocs/op、`UnrollBackward` 120,163 → 68,688）；阶段 9 以 `+0` 播种、末端单位阵归一 MatMul 收尾的稀疏折叠（fold）取代指示阵——与指示阵实现在正向和反向均逐位相同（对发布版 oracle 1,164 组差分 + 红队独立复测），而整 `Step` 相对*最初*的逐突触循环保持 ULP 级等价（前向 ≤ 1.79e-7、梯度 ≤ 1.19e-7）。阶段 9 使 allocs 上升约 43%/30%（折叠每级克隆），但 ns/op 下降约 21%/13%——墙钟净受益；阶段 10 的内嵌形状 backing（下两行）再降 allocs −18%/−23% 而墙钟持平。当前值 `LTCStep` 2,707 / `UnrollBackward` 31,994 allocs/op |
+| LTC 突触向量化 | **已完成（阶段 6；收缩于阶段 9 重做）：** 掩码折叠出热路径；逐突触前神经元向量块（[ltc.md](ltc.md)）。阶段 6 以指示矩阵（indicator matrix）MatMul 收缩突触前轴（`LTCStep` 7,360 → 3,440 allocs/op、`UnrollBackward` 120,163 → 68,688）；阶段 9 以 `+0` 播种、末端单位阵归一 MatMul 收尾的稀疏折叠（fold）取代指示阵——与指示阵实现在正向和反向均逐位相同（对发布版 oracle 1,164 组差分 + 红队独立复测），而整 `Step` 相对*最初*的逐突触循环保持 ULP 级等价（前向 ≤ 1.79e-7、梯度 ≤ 1.19e-7）。阶段 9 使 allocs 上升约 43%/30%（折叠每级克隆），但 ns/op 下降约 21%/13%——墙钟净受益；阶段 10 的内嵌形状 backing（下两行）再降 allocs −18%/−23% 而墙钟持平。阶段 16 之前的数值：`LTCStep` 2,707 / `UnrollBackward` 31,994 allocs/op——已被下文阶段 16 融合行取代 |
 | autograd 反向深改（闭包、融合、`addGrad` 克隆） | **已完成（阶段 7）：** 逐节点反向闭包改为 opKind 标签派发；`addGrad` 首次贡献所有权移交（所有权移交，ownership transfer；Clone 占比约 20% → 约 1%）；一元反向链融合（Sigmoid/Tanh 4→1 节点）、MatMul 转置缓冲消除、乘积-归约融合——全部以对重写前 oracle 的 52k 差分图逐位门禁，arm64 FMA 转换屏障保证融合循环保持两次舍入精确（[architecture.md](architecture.md)）。`UnrollBackward` 68,688 → 33,963 allocs/op（−50.55%）；另外四项基准 −23%…−58%，零回归。剩余的逐节点开销由下面的 `tensor.New` 一项追踪 |
 | `tensor.New` 的逐节点固定开销（`Shape`/`Data` 双分配） | **已完成（v0.4.0，②内嵌 backing）：** 剖析显示剩余分配的 64.9% 是每个节点的前向输出及其 `Shape`/`Data` 双分配（实施前复测 60.4%）。v0.4.0 以**内嵌 `[4]int` 形状缓冲**（embedded backing，结构体内联 `shapeBuf`）消除 `Shape` 一半的堆分配：rank ≤ 4 零堆分配，超出则堆回退（保 `serialize` rank-8 流兼容）。五基准 allocs −18~−26%（每个 tensor 算子恰少一次 shape 分配），墙钟实测持平（±数% 噪声内）、字节 +3%——收益在分配次数与 GC 卫生，而非墙钟。选②内嵌 backing（约 10 个内部触点、零 API 破坏）而非①值类型形状字段（收益相同却破坏 233 处 `.Shape` 访问与 7 处直写）；新增导出的 `Tensor.Reshape` 取代 `Shape` 直写（负维度 panic）。余项（低优先）：parents 定长槽化（受阻于既有结构断言测试） |
 | Sigmoid–Hadamard 融合反向（LTC 热路径模式） | **已完成（阶段 8）：** `autograd.SigmoidHadamard(z, w)` 把热路径的 `Hadamard(Sigmoid(z), w)` 融合成单节点（采纳于 `nn/ltc.go:423`）。前向逐位为构造性（逐字调用同一批 tensor 算子）；常规 2D 反向通过把 `g⊙w` 乘积在完全相同的位点舍入，达成与旧双节点链的逐位等价；异形或手设种子则逐字回退到旧组合（怪癖与 panic 契约一并保留）。`LTCStep` 2,442 → **2,306** allocs/op（−5.6%）、`UnrollBackward` 33,963 → **31,983**（−5.8%）——个位数收益，且为实测的结构上限：每个点位恰好省一个图节点加一个反向中间张量，剩余由 `tensor.New` 的逐节点固定开销主导（上一项）。见 [architecture.md](architecture.md) |
@@ -154,4 +166,5 @@ fmt.Println(m.Grad.Data) // [1 0 0 1] —— 依然正确
 | CfC（Closed-form Continuous-time）细胞 | **已完成（阶段 6）：** `nn.CfC`（`nn/cfc.go`）——与 LTC 同一 ODE、同一套突触参数化，以 Lemma 1 闭式解驱动；论文↔代码对照与验证留痕见 [cfc.md](cfc.md)。新 API：仍可能演进 |
 | 内置优化器 | **已完成（阶段 6）：** `optimizer` 包（SGD/Momentum/Adam，覆盖率 100%）；手写循环依然是理解引擎以及实现该包未覆盖规则的受支持范式——[training.md](training.md) 覆盖两种形态 |
 | 序列化（Save/Load） | **已完成（阶段 7）：** `serialize` 包（带版本的 `"LNNS"` 张量流）外加 `nn` 的六个 Save/Load 函数（LTC/CfC/Linear）；对恶意流安全——只有 error 绝不 panic、固定限额先校验后分配、未知长度读端渐进分配（4 GiB 声明在 18 字节后停止仅峰值约 33 KiB）。红队变异模糊：7,500 个变异体 0 panic，资源耗尽加固后再测 1,200 个变异体，依然 0 panic。格式规格、API 指南与完整安全契约见 [persistence.md](persistence.md) |
-| 基准/CI 工具 | **已完成：** `make bench`（13 项基准）+ GitHub Actions CI（gofmt 门禁、vet、build、`test -race`、example 冒烟） |
+| 基准/CI 工具 | **已完成：** `make bench`（17 项基准）+ GitHub Actions CI（gofmt 门禁、vet、build、`test -race`、example 冒烟） |
+| LTC ODE 展开的图算子融合；重实体化 BPTT | **已完成（阶段 16）：** `autograd.FusedOp`（调用方自持反向闭包）+ LTC 展开融合为单图节点（`nn/ltc_fused.go`）——前向与梯度对融合前图路径逐位一致，公开 API 零变更。实测（`-benchtime=200x`）：`LTCStep` 约 203 µs / 2,122 allocs → **约 87 µs / 236**，`UnrollBackward` 约 2.8–3.3 ms / 28,273 → **约 1.33 ms / 6,662**（约 2.1–2.3×）。`nn.UnrollRemat` 提供分块 BPTT：梯度逐位一致，峰值图内存 O(chunk)（T = 512：保留约 0.65 MB 对比驻留约 11.5 MB）。留档角落见上文残余留档表；机制见 [architecture.md](architecture.md)，用法食谱见 [cookbook.md](cookbook.md#13-长序列训练unrollremat-分块-bptt) |

@@ -47,6 +47,7 @@ last-digit differences across machines matter?").
 | 10 | [Loading untrusted model files safely](#10-loading-untrusted-model-files-safely) | Error classification pattern: kind / version / limits / truncation. |
 | 11 | [Annealing the learning rate mid-training](#11-annealing-the-learning-rate-mid-training) | Hyperparameters are exported fields: write `opt.LR`, in effect from the next `Step`. |
 | 12 | [Deterministic reproduction](#12-deterministic-reproduction) | Seed discipline: same seeds ⇒ bit-identical runs. |
+| 13 | [Long-sequence training: chunked BPTT with UnrollRemat](#13-long-sequence-training-chunked-bptt-with-unrollremat) | Bit-identical gradients at O(chunk) peak graph memory: rematerialization for sequences that outgrow the whole-graph model. |
 
 ---
 
@@ -1691,3 +1692,237 @@ but float payloads can differ by ≤ 1 ULP per fused multiply-add across
 architectures (arm64 vs amd64), so the golden tests assert a 16 ULP
 window off the generating architecture; [faq.md](faq.md) "do last-digit
 differences across machines matter?".
+
+---
+
+## 13. Long-sequence training: chunked BPTT with UnrollRemat
+
+**Scenario:** the sequence grows long enough that "the whole graph stays
+resident until `Backward`" becomes the memory wall — at T = 512 a full
+unroll pins ~11.5 MB of live graph where `UnrollRemat` retains ~0.65 MB
+(~18×; `BenchmarkUnrollPeakMemory512` /
+`BenchmarkUnrollRematPeakMemory512`, chunk 16, units 8, batch 16).
+`nn.UnrollRemat` differentiates `lossFn(ys)` through time with
+**bit-identical gradients** to `Unroll` + `loss.Backward()`, at
+O(chunkSize) peak graph memory instead of O(len(xs)). The program below
+proves the bit-identity for both cells, then trains with it.
+
+```go
+package main
+
+import (
+	"fmt"
+	"math"
+	"math/rand"
+
+	"github.com/qorm/LNN/autograd"
+	"github.com/qorm/LNN/nn"
+	"github.com/qorm/LNN/optimizer"
+	"github.com/qorm/LNN/tensor"
+)
+
+const (
+	inDim, units  = 1, 8
+	seqLen, batch = 48, 16
+	chunk         = 8
+	lr, ts        = 0.01, 1.0
+	iters         = 250
+)
+
+// makeBatch draws one fresh bounded-accumulator batch:
+// s_t = clip(s_{t-1} + 0.25*u_t, -1, 1), u_t in {-1, +1}.
+func makeBatch(rng *rand.Rand) (xs, targets []*autograd.Variable) {
+	xs = make([]*autograd.Variable, seqLen)
+	targets = make([]*autograd.Variable, seqLen)
+	state := make([]float32, batch)
+	for t := 0; t < seqLen; t++ {
+		xb := make([]float32, batch)
+		yb := make([]float32, batch)
+		for b := 0; b < batch; b++ {
+			u := float32(1)
+			if rng.Intn(2) == 0 {
+				u = -1
+			}
+			xb[b] = u
+			s := state[b] + 0.25*u
+			if s > 1 {
+				s = 1
+			} else if s < -1 {
+				s = -1
+			}
+			state[b] = s
+			yb[b] = s
+		}
+		xs[t] = autograd.Var(tensor.FromData(xb, batch, inDim))
+		targets[t] = autograd.Var(tensor.FromData(yb, batch, 1))
+	}
+	return xs, targets
+}
+
+// mseLoss is the per-step MSE readout loss. It is spelled so the loss
+// graph's DFS visits the step outputs in ascending order (t = 0, 1, 2,
+// ...) — the remat fast path; a descending spelling is the documented
+// worst case (see the trade-off table in the recipe).
+func mseLoss(readout *nn.Linear, targets []*autograd.Variable) func(ys []*autograd.Variable) *autograd.Variable {
+	return func(ys []*autograd.Variable) *autograd.Variable {
+		var acc *autograd.Variable
+		for t, y := range ys {
+			diff := autograd.Sub(readout.Forward(y), targets[t])
+			sq := autograd.Hadamard(diff, diff)
+			if t == 0 {
+				acc = sq
+			} else {
+				acc = autograd.Add(acc, sq)
+			}
+		}
+		return autograd.Scale(autograd.MeanAll(acc), 1/float32(len(ys)))
+	}
+}
+
+// bitIdentical runs one whole-graph backward (the reference) and one
+// UnrollRemat call over the same cell, data and loss, and reports
+// whether loss value and every parameter gradient agree bit for bit.
+func bitIdentical(cell interface {
+	nn.Cell
+	nn.Module
+}, rng, data *rand.Rand) bool {
+	readout := nn.NewLinear(units, 1, rng)
+	params := nn.ParametersOf(cell, readout)
+	xs, targets := makeBatch(data)
+	lossFn := mseLoss(readout, targets)
+
+	for _, p := range params {
+		p.ZeroGrad()
+	}
+	ys, _ := nn.Unroll(cell, xs, nil, ts)
+	ref := lossFn(ys)
+	ref.Backward()
+	refGrads := make([][]float32, len(params))
+	for i, p := range params {
+		refGrads[i] = append([]float32(nil), p.Grad.Data...)
+	}
+
+	for _, p := range params {
+		p.ZeroGrad()
+	}
+	_, _, rmLoss := nn.UnrollRemat(cell, params, xs, nil, ts, chunk, lossFn)
+	if math.Float32bits(ref.Value()) != math.Float32bits(rmLoss.Value()) {
+		return false
+	}
+	for i, p := range params {
+		for j := range p.Grad.Data {
+			if math.Float32bits(p.Grad.Data[j]) != math.Float32bits(refGrads[i][j]) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func main() {
+	// 1. Bit-identity against the whole-graph backward, for both cells
+	//    (the LTC exercises the extra sigma sweep of its spine class).
+	ltc := nn.NewLTC(inDim, units, nil, 4, rand.New(rand.NewSource(42)))
+	cfc := nn.NewCfC(inDim, units, nil, rand.New(rand.NewSource(42)))
+	fmt.Printf("T=%d chunk=%d, remat vs whole-graph backward, bit-identical: LTC %v, CfC %v\n",
+		seqLen, chunk,
+		bitIdentical(ltc, rand.New(rand.NewSource(1)), rand.New(rand.NewSource(7))),
+		bitIdentical(cfc, rand.New(rand.NewSource(1)), rand.New(rand.NewSource(7))))
+
+	// 2. A real training loop with UnrollRemat: same four-phase
+	//    discipline, the loss just comes back already backpropagated.
+	rng := rand.New(rand.NewSource(42))
+	cell := nn.NewCfC(inDim, units, nil, rng)
+	readout := nn.NewLinear(units, 1, rng)
+	params := nn.ParametersOf(cell, readout) // every trainable leaf — audited
+	opt := optimizer.NewAdamDefault(lr)
+	data := rand.New(rand.NewSource(7))
+	var first, last float64
+	for it := 0; it < iters; it++ {
+		xs, targets := makeBatch(data)
+		for _, p := range params {
+			p.ZeroGrad()
+		}
+		_, _, loss := nn.UnrollRemat(cell, params, xs, nil, ts, chunk, mseLoss(readout, targets))
+		opt.Step(params)
+		if it == 0 {
+			first = float64(loss.Value())
+		}
+		last = float64(loss.Value())
+		if it%50 == 0 || it == iters-1 {
+			fmt.Printf("iter %3d  loss=%.6f\n", it, loss.Value())
+		}
+	}
+	fmt.Printf("first=%.6f last=%.6f\n", first, last)
+}
+```
+
+Measured output (seeds 42 / 1 / 7 — deterministic):
+
+```
+T=48 chunk=8, remat vs whole-graph backward, bit-identical: LTC true, CfC true
+iter   0  loss=0.750716
+iter  50  loss=0.075355
+iter 100  loss=0.016325
+iter 150  loss=0.012297
+iter 200  loss=0.015780
+iter 249  loss=0.010747
+first=0.750716 last=0.010747
+```
+
+**Key lines:**
+
+- `params := nn.ParametersOf(cell, readout)` must list **every**
+  trainable leaf the cell's `Step` consumes: the structural probe
+  audits completeness and panics naming the missing index — an
+  unlisted leaf would silently accumulate one extra gradient copy per
+  sweep (a 2–3× wrong value). Loss-only leaves (the readout's) may be
+  listed but need not be; `xs`/`h0` gradients always participate.
+- `lossFn` receives the **detached** per-step outputs (bit-identical
+  values, no graph behind them) and is called exactly once; its return
+  value comes back already backpropagated — the gradients sit in the
+  leaves as after `loss.Backward()`, so the `ZeroGrad` → `Step`
+  discipline is unchanged. The returned `ys`/`hN` are detached too:
+  safe to read and to feed into further computation, impossible to
+  differentiate through (that already happened).
+- "Bit-identical" is asserted with `math.Float32bits`, not printed
+  decimals — two runs can print the same `%.6f` and differ in the last
+  bit (recipe 12). T = 48 with chunk = 8 cuts six recompute units.
+- The LTC check exercises the σ sweep its spine-class `cm` requires;
+  the CfC takes the rest sweep alone (two forwards, one backward — the
+  ideal remat price). Both match the whole-graph backward bit for bit.
+
+**Choosing `chunkSize`:** peak graph memory scales ~linearly with
+`chunkSize` (chunk 8 ≈ half the chunk-16 figure above), while the O(T)
+detached outputs/states are tiny (one `[batch, units]` tensor per
+step), so smaller chunks cost only per-unit fixed overhead — 4–16 is
+the sane band on this engine. One structural caveat: a seeded step that
+is *not* a record high of the loss's visit order glues itself to its
+successor, merging recompute units beyond `chunkSize`. Spell the loss
+so the outputs are visited in ascending step order (the natural
+accumulation order above) and units stay exactly `chunkSize`; a
+descending visit order with a small chunk is the extreme worst case —
+everything merges into one O(T) unit and `UnrollRemat` then costs
+strictly more peak memory AND more compute than one whole-graph
+backward (the price of bitwise fidelity, not a bug). A regularizer
+closing over parameters is legal (the loss is called exactly once) but
+must be spelled data-first — `Add(data, penalty)`, never
+`Add(penalty, data)` — or made a constant; the probe panics on a
+violation.
+
+| | `Unroll` + `loss.Backward()` | `UnrollRemat` |
+|---|---|---|
+| peak graph memory | O(T × per-step graph) — T = 512: ~11.5 MB live | O(chunkSize × per-step graph) + O(T) small tensors — T = 512, chunk 16: ~0.65 MB retained |
+| compute per iteration | 1 forward + 1 backward | CfC: 2 forwards + 1 backward; LTC: 3 forwards + 2 backwards (σ sweep); a non-ascending loss adds one affine pass for either cell |
+| gradients | the reference | bit-identical to the reference (both cells, above) |
+| loss shape | anything | ascending visit order is the fast path; adversarial orders force unit merges (worst case can exceed full unroll) |
+| `params` argument | — | must list every `Step`-consumed trainable leaf; audited, panics |
+| cell requirement | any `nn.Cell` | per-step graph structure must be a pure function of `(x, h)` — both provided cells qualify; a value-dependent branch drifts ~1–2 ULP undetectably ([pitfalls.md](pitfalls.md)) |
+| use when | the default; short-to-medium sequences | long sequences, or memory-tight deployments |
+
+**See also:** [architecture.md](architecture.md) for the two-pass
+mechanism and the three fold classes it replays;
+[pitfalls.md](pitfalls.md) for the archived residual corners (worst
+case, value-dependent cells, the double-NaN payload corner); the
+`nn.UnrollRemat` godoc for the full contract; [api.md](api.md) for the
+one-line entry.

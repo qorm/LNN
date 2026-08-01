@@ -217,14 +217,15 @@ randomized configurations — measures a maximum difference of
 **1.79e-7** forward and **1.19e-7** on all-parameter BPTT gradients:
 ULP-level, benign, but not "bitwise".
 
-**Measured cost.** Current values (this machine, `-benchtime=100x`,
-re-verified): `LTCStep` **2,707 allocs/op** and `UnrollBackward`
-**31,994 allocs/op** — cumulative **−63%/−73%** from the original
+**Measured cost.** Current values (this machine, `-benchtime=200x`,
+re-verified): `LTCStep` **236 allocs/op** and `UnrollBackward`
+**6,662 allocs/op** — cumulative **−97%/−94%** from the original
 per-synapse loop (7,360 / 120,163; the phase-6 vectorization took it
 to 3,440 / 68,688, the phase-7 backward overhaul to 33,963 on the
-backward, the phase-8 Sigmoid–Hadamard fusion to 2,306 / 31,983, and
-the phase-10 embedded shape backing to the current values — a further
-−18%/−23% of allocations with wall-clock flat,
+backward, the phase-8 Sigmoid–Hadamard fusion to 2,306 / 31,983, the
+phase-10 embedded shape backing to 2,707 / 31,994 — a further
+−18%/−23% of allocations with wall-clock flat — and the stage-16
+fused unfold kernel to the current values,
 [architecture.md](architecture.md)). One honest disclosure for the
 phase-9 step: the sparse contraction **raised** allocs ~43%/~30% over
 phase 8 (the per-stage fold cloning) — the expectation "neutral or

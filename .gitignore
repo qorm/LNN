@@ -1,5 +1,6 @@
 /bin/
 *.out
 *.test
+*.pprof
 coverage.txt
 .DS_Store

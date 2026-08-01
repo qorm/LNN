@@ -36,6 +36,14 @@
 // with a single Backward. Unroll over an empty sequence returns an empty
 // output slice and h0 unchanged (possibly nil).
 //
+// UnrollRemat is the memory-bounded counterpart: it rematerializes the
+// sequence chunk by chunk (gradient checkpointing) instead of keeping the
+// whole graph, so peak graph memory scales with the chunk size rather than
+// the sequence length, at the price of recomputing the forward. Its leaf
+// gradients are bit-identical to Unroll + loss.Backward() — including the
+// whole-graph backward's exact accumulation order, which is where the
+// implementation's substance lives (see its doc comment).
+//
 // # Liquid Time-Constant cells
 //
 // LTC implements the Liquid Time-Constant cell of Hasani et al., "Liquid

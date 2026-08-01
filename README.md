@@ -16,6 +16,16 @@ import). The LTC implementation follows Hasani et al.,
 LNN is small and explicit. It favors readable, auditable kernels over breadth:
 no code generation, no GPU backend, no operator overloading tricks — just Go.
 
+In the current literature, liquid cells are read as non-linear state-space
+models (SSMs): Liquid-S4 ([arXiv:2209.12951](https://arxiv.org/abs/2209.12951),
+ICLR 2023) put LTC dynamics inside the S4 state-space formulation, and LrcSSM
+([arXiv:2505.21717](https://arxiv.org/abs/2505.21717), NeurIPS 2025) scaled
+liquid dynamics into a non-linear SSM layer that processes long sequences in
+linear time. From that angle, this library's cells are interpretable,
+variable-`ts`, sparsely-wired non-linear SSM cells —
+[doc/cfc.md](doc/cfc.md) works out the formula-level correspondence between
+the CfC update step and Mamba's selective-SSM step.
+
 ## Packages
 
 | Package | Purpose |
@@ -176,6 +186,13 @@ out, h := cell.Step(x, nil, 0.1)     // x: [batch,4], nil = zero initial state, 
 // so a loss built on ys differentiates through time with one Backward.
 ys, hN := nn.Unroll(cell, xs, nil, 0.1) // xs: []*autograd.Variable of [batch,4]
 
+// Long sequences: UnrollRemat differentiates lossFn(ys) through time with
+// the same gradients as Unroll + loss.Backward(), bit for bit, at
+// O(chunkSize) peak graph memory instead of O(len(xs)). params must list
+// every trainable leaf the cell's Step consumes (completeness is audited);
+// lossFn builds the scalar loss from the detached per-step outputs.
+ys, hN, loss := nn.UnrollRemat(cell, cell.Parameters(), xs, nil, 0.1, 8, lossFn)
+
 // CfC is the closed-form sibling cell: same ODE and same 13-parameter
 // synapse parameterization, but no unfolds — the Lemma 1 closed-form
 // update advances the full span ts in a single step (doc/cfc.md).
@@ -251,17 +268,27 @@ losses, event-driven time steps, and more) are in
   reduction's output shape.
 - **The graph is retained until `Backward`.** Every intermediate tensor is
   kept alive by the computation graph, so memory grows with the number of
-  ops. An LTC step unrolls `unfolds` ODE iterations into the graph, each
-  `O(units)` activation blocks plus a sparse presynaptic contraction — a
+  ops. An LTC step's `unfolds` ODE iterations run as **one fused graph
+  node** (forward and gradients bit-identical to the former per-unfold
+  graph path), preceded by the same sparse presynaptic contraction — a
   `+0`-seeded fold ended by normalizing MatMuls, with no dense
   `[units², units]` indicator matrices anywhere (construction of a
   fully-wired `units = 1024` cell costs ~32 MB, not the ~8 GiB the
-  earlier dense-indicator design required). Successive backward and
-  allocation overhauls have brought the measured counts down to
-  `LTCStep` 2,707 allocs/op and `UnrollBackward` 31,994 — allocations
-  about 63%/73% below the original loop. Keep `units`, `unfolds` and
+  earlier dense-indicator design required). Successive backward,
+  allocation and fusion overhauls have brought the measured counts down
+  to `LTCStep` **236 allocs/op** (~87 µs) and `UnrollBackward`
+  **6,662** (~1.33 ms) on this machine (`-benchtime=200x`) — about
+  97%/94% below the original per-synapse loop, and ~2.1–2.3× faster
+  than the pre-fusion graph path. Keep `units`, `unfolds` and
   sequence length modest on this engine; the `CfC` cell
-  ([doc/cfc.md](doc/cfc.md)) has no `unfolds` factor at all.
+  ([doc/cfc.md](doc/cfc.md)) has no `unfolds` factor at all, and for
+  genuinely long sequences `nn.UnrollRemat` differentiates through time
+  at O(chunk) peak graph memory instead of O(sequence) — T = 512
+  measured ~0.65 MB retained vs ~11.5 MB live for a full unroll
+  (memory semantics and the worst case:
+  [doc/architecture.md](doc/architecture.md),
+  [doc/pitfalls.md](doc/pitfalls.md); a full recipe:
+  [doc/cookbook.md](doc/cookbook.md#13-long-sequence-training-chunked-bptt-with-unrollremat)).
 
 ## Concurrency contract
 
@@ -287,7 +314,7 @@ Honest maturity assessment as of this commit (coverage measured with
 |---|---|
 | `tensor` | Core is stable and well tested (~99.7% line coverage). The single residual uncovered statement is a double-constant fill-loop body in `broadcastBinary` that is argued unreachable (its column count is always `1` on that path, so the loop never executes, and the `[1,1]×[1,1]` case is intercepted by the same-shape fast path first); it is documented rather than padded with a contrived test. The transpose-aware MatMul kernels are exercised through the `autograd` package's tests. The v0.4.0 embedded shape backing removed one heap allocation per tensor construction (benchmark allocations −18~−26%, wall-clock neutral within noise). |
 | `autograd` | Stable and well tested (100% line coverage); gradients pass finite-difference and bitwise-differential checks across the covered paths, including the legacy-composition fallback branches for irregular manually seeded gradients and the Sigmoid–Hadamard fusion's regular and fallback paths. |
-| `nn` | Functional and well tested (100% line coverage): the LTC and CfC forward/backward paths are regression-tested, including closed-form degenerate-case checks, tiny/NaN `ts` guards, wiring validation, and Save/Load round-trips (a legitimate `units = 2048` stream round-trips at the load limit). Reversal potentials are fixed ±1 constants in both cells, carried by row-view constants over the sparse contraction — not trainable, and with no dead gradient (structurally impossible). The sparse contraction is regression-tested bitwise against the former indicator-matrix implementation, with a large-cell memory gate. CfC is the newer cell, and its API may still evolve. |
+| `nn` | Functional and well tested (~99.9% line coverage — the sole uncovered statement is a constructively unreachable nil-root firewall guard in `UnrollRemat`'s unit sweep, annotated in `nn/remat.go`; same disclosure discipline as the optimizer row): the LTC and CfC forward/backward paths are regression-tested, including closed-form degenerate-case checks, tiny/NaN `ts` guards, wiring validation, and Save/Load round-trips (a legitimate `units = 2048` stream round-trips at the load limit). Reversal potentials are fixed ±1 constants in both cells, carried by row-view constants over the sparse contraction — not trainable, and with no dead gradient (structurally impossible). The sparse contraction is regression-tested bitwise against the former indicator-matrix implementation, with a large-cell memory gate. The LTC's ODE unfolds run as one fused `FusedOp` node, regression-tested bitwise against the pre-fusion graph path across cell shapes, loss shapes and adversarial non-finite inputs; `UnrollRemat`'s chunked BPTT is regression-tested bit-for-bit against whole-graph backward over a configuration × loss-shape differential matrix. CfC is the newer cell, and its API may still evolve. |
 | `optimizer` | Stable, ~99.6% line coverage (the sole uncovered statement is a physically unreachable parameter-count guard): the three update rules are verified against independent reference implementations (SGD bit-for-bit, Adam ~1.6e-6 vs a float64 reference), the pointer-keyed state semantics are regression-tested, and state persistence (`SaveState`/`LoadState`, `"LNO1"` streams) is pinned by bit-exact resume tests (50+50 vs 100 steps, all three optimizers) and hostile-stream tests (validate-all-then-apply with zero side effects, byte-budget gates). |
 | `serialize` | Stable, 97.8% line coverage: round-trip bit-exactness (NaN and −0 included) is regression-tested and byte-pinned by committed golden vectors; the hostile-stream contract — fixed limits validated before allocation (including the load-path `units`/`inDim` cap of 2048, sized for the sparse contraction's O(units²) load-time memory), progressive allocation on unknown-length readers — is pinned by allocation-count and byte-budget tests; and mutation fuzzing produced zero panics across thousands of mutants, plus a further round after the resource-exhaustion hardening. The resource bounds are documented in [doc/persistence.md](doc/persistence.md). |
 

@@ -323,25 +323,17 @@ func (c *LTC) Step(x, h *autograd.Variable, ts float64) (out, hNew *autograd.Var
 	// Sensory (input) synapses are loop-invariant over the ODE unfolds.
 	numS, denS := c.synapses(inputs, c.sMu, c.sSigma, sWm, c.erevRowsS)
 
-	// Recurrent parameter rows are Step-invariant: slice them once and reuse
-	// the rows across every ODE unfold below.
-	muRs := c.rows(c.mu)
-	sigRs := c.rows(c.sigma)
-	wmRs := c.rows(wM)
-
-	// Membrane-update terms that stay constant across the unfolds. eps joins
-	// denBase here (it is a cell constant), saving one Add per unfold; the
-	// regrouping changes only float32 association, by O(1e-7) relatively.
+	// Membrane-update numerator terms that stay constant across the unfolds.
 	numConst := autograd.Add(autograd.Hadamard(gleak, c.vleak), numS)
-	denBase := autograd.Add(autograd.Add(autograd.Add(cmT, gleak), denS), c.epsV)
 
-	v := h
-	for t := 0; t < c.unfolds; t++ {
-		numR, denR := c.synapsesRows(v, muRs, sigRs, wmRs, c.erevRowsR)
-		// num = cm_t .* v + gleak .* vleak + synapses
-		num := autograd.Add(autograd.Add(autograd.Hadamard(cmT, v), numConst), numR)
-		v = autograd.Div(num, autograd.Add(denBase, denR))
-	}
+	// The ODE unfolds run as one fused kernel (nn/ltc_fused.go): a single
+	// graph node whose forward replays the per-unfold synapse blocks,
+	// contraction folds and membrane update (the denBase chain
+	// ((cmT + gleak) + denS) + eps included) with identical rounding
+	// boundaries, and whose hand-written VJP replays the former subgraph's
+	// backward accumulation order contribution for contribution. The
+	// node count per Step drops from O(unfolds × units) to O(1).
+	v := c.fusedUnfolds(cmT, h, numConst, gleak, denS, wM)
 
 	out = autograd.Add(autograd.Hadamard(v, c.outW), c.outB)
 	return out, v
@@ -376,19 +368,6 @@ func (c *LTC) scaledCapacitance(ts float64) *autograd.Variable {
 	return autograd.Scale(capped, float32(scale64))
 }
 
-// rows slices every row of m as a [1, cols] variable. The rows of the
-// recurrent mu/sigma and the masked-weight matrix are Step-invariant, so
-// slicing them once per Step — instead of once per presynaptic neuron per
-// ODE unfold — keeps units*(unfolds-1) SliceRow nodes per matrix out of the
-// graph.
-func (c *LTC) rows(m *autograd.Variable) []*autograd.Variable {
-	rs := make([]*autograd.Variable, m.Data.Rows())
-	for i := range rs {
-		rs[i] = autograd.SliceRow(m, i)
-	}
-	return rs
-}
-
 // synapses accumulates numerator and denominator synaptic currents from a
 // presynaptic source (inputs or previous state), vectorized per presynaptic
 // neuron rather than per synapse pair. For presynaptic neuron i the whole
@@ -402,10 +381,10 @@ func (c *LTC) rows(m *autograd.Variable) []*autograd.Variable {
 //	den[:, j] = Σ_i block_i[:, j]
 //	num[:, j] = Σ_i block_i[:, j] · erev[i, j]
 //
-// with erevRows carrying the (fixed) reversal rows. The sensory and
-// recurrent paths share this single calling convention; the recurrent path
-// additionally reuses one set of pre-sliced rows across all unfolds via
-// synapsesRows.
+// with erevRows carrying the (fixed) reversal rows. The sensory path is
+// its only caller (the recurrent path runs inside the fused unfold kernel,
+// nn/ltc_fused.go); synapsesRows factors the per-presynaptic block build
+// out of the row slicing.
 func (c *LTC) synapses(
 	pre, mu, sigma, wm *autograd.Variable, erevRows []*autograd.Variable,
 ) (num, den *autograd.Variable) {
@@ -421,9 +400,9 @@ func (c *LTC) synapses(
 	return c.synapsesRows(pre, muRs, sigRs, wmRs, erevRows)
 }
 
-// synapsesRows is the per-unfold inner loop: one activation block per
-// presynaptic neuron from the pre-sliced parameter rows, then the sparse
-// contraction of contract.
+// synapsesRows builds one activation block per presynaptic neuron from the
+// pre-sliced parameter rows, then the sparse contraction of contract. It
+// serves the sensory path (the recurrent blocks live in the fused kernel).
 func (c *LTC) synapsesRows(
 	pre *autograd.Variable,
 	muRs, sigRs, wmRs []*autograd.Variable,

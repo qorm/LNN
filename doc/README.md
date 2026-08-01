@@ -25,9 +25,10 @@ understand the engine, take the reading order below.
 | [cfc.md](cfc.md) | The Closed-form Continuous-time cell (Nature Machine Intelligence 2022): the Lemma 1 closed-form solution, Algorithm 1's LTC-to-closed-form compilation, exprel stabilization, and its relation to the LTC — same ODE, analytic integrator instead of Euler. |
 | [architecture.md](architecture.md) | The three-layer design (tensor → autograd → nn) plus the optimizer and serialize packages, why tensors have no strides, how the computation graph's op-kind-tagged backward and fused gradient loops work. |
 | [pitfalls.md](pitfalls.md) | Known boundaries and residual risks from the red-team audit, as user-facing caveats: concurrency, float32 overflow, repeated Backward, tiny `ts`, untrusted model files, and the technical-debt roadmap. |
-| [cookbook.md](cookbook.md) | Task recipes, each a complete measured program: the minimal loop, Adam + clipping, gradient accumulation, bit-exact checkpoint/resume, variable-`ts` event-driven sequences, model inspection, custom losses, LTC-vs-CfC, multi-module composition, loading untrusted files, LR annealing, deterministic reproduction. |
+| [cookbook.md](cookbook.md) | Task recipes, each a complete measured program: the minimal loop, Adam + clipping, gradient accumulation, bit-exact checkpoint/resume, variable-`ts` event-driven sequences, model inspection, custom losses, LTC-vs-CfC, multi-module composition, loading untrusted files, LR annealing, deterministic reproduction, long-sequence training with `UnrollRemat` (chunked BPTT). |
 | [faq.md](faq.md) | Frequent questions, short answers: loss not falling, `NaN` losses, choosing `ts`/`units`/`unfolds`, gradient accumulation semantics, cross-platform last digits, reading load errors, resuming with Adam. |
 | [api.md](api.md) | API quick reference: every exported symbol per package in one line, with a pointer to its canonical documentation (godoc / concept guides). (New — created by a parallel documentation task.) |
+| [pgo.md](pgo.md) | Profile-guided optimization, measured honestly: why a library ships no profile, the workflow for profiling your own binary, and this repo's benchmark numbers — including the single bistable inlining decision the headline gains hinge on. |
 
 A complete Simplified Chinese mirror of these guides lives in [`zh/`](zh/README.md), one file per row above.
 
