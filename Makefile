@@ -60,13 +60,21 @@ pgo-bench:
 
 # The native Go fuzz targets (func FuzzXxx), as package/Name pairs. These
 # crystallize the red team's ad-hoc mutation discipline into sustainable
-# `go test -fuzz` targets over the untrusted-stream and constructor surfaces.
+# `go test -fuzz` targets: eight over the untrusted-stream and constructor
+# surfaces, plus three bitwise differential oracles — the fused LTC kernel
+# vs the pre-fusion graph path and UnrollRemat vs whole-graph
+# Unroll+Backward (resident since v0.5.0), and the fused CfC step kernel
+# vs its pre-fusion graph path (stage 18b) — Float32bits, panic parity
+# included.
 FUZZ_TARGETS = \
 	serialize/FuzzReadTensors \
 	serialize/FuzzLoadParameters \
 	nn/FuzzLoadLTC \
 	nn/FuzzLoadCfC \
 	nn/FuzzLoadLinear \
+	nn/FuzzLTCFusedDifferential \
+	nn/FuzzCfCFusedDifferential \
+	nn/FuzzUnrollRematDifferential \
 	optimizer/FuzzLoadState \
 	tensor/FuzzTensorConstructors \
 	autograd/FuzzOpGraphs

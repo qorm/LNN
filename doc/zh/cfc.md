@@ -54,6 +54,20 @@ v_new = A + (v − A)·e^{−κ·ts},   κ = G/cm
 
 论文的 Algorithm 1 把 LTC 逐突触编译成闭式更新，允许任意稀疏邻接。LNN 以 LTC 所用的同一套稀疏收缩（sparse contraction）与之同构：`drive()`（`nn/cfc.go:289-306`）为每个突触前神经元 `i` 构建一个 `[batch, units]` 激活块——以接线（wiring）掩码（mask）第 `i` 行门控的「列⊙行」外积——`contract`（`nn/cfc.go:322-338`）以 `+0` 播种的升序折叠（fold）收缩突触前轴：分母折叠各块，分子折叠按反转电位行加权的各块，二者都以与 units×units 单位阵的 MatMul 收尾。常量 `±1` 反转电位由共享 `erev`/`sErev` 存储的行视图常量承载（`erevRowViews`，与 `ltc.go` 共享），从不以叶节点入图。该收缩与 LTC 的 `contract` 逐行同构——同样四条约束、同一份逐位等价证明（见 [ltc.md](ltc.md) 稀疏收缩一节）——`±0` 角落也相同：全掩蔽突触后列落在 `+0` 而非旧 `Add` 链的 `−0`（下游不可观测，`(±0)² = +0`）；多源反向把零梯度归一为 `+0`；单源角落（`inDim = 1` 或 `units = 1`、零值梯度、`erev = −1`）可令零梯度携带 `−0`——值为 0 且不可观测，红队对 CfC 的全扫描未测出轨迹分歧。由于电位是行视图而非图叶，`erev`/`sErev` 完全不再入图——死梯度从结构上消失，而不仅仅为零。约定与二值接线掩码都沿用 LTC，因此 `NewCfC(inDim, units, wiring, rng)` 接受的 `Wiring` 拓扑与 `NewLTC` 完全相同（`nil` 即全连接）。
 
+## 融合内核：每个 Step 一个节点（阶段 18）
+
+自阶段 18 起，上文整个逐步子图——两路突触驱动、`g`/`a` 装配、`decayRate` 封顶链与 exprel 稳定化的 `decayFactor`——塌缩为**一个** `autograd.FusedOp` 节点（`nn/cfc_fused.go`），即 LTC 融合展开内核的姊妹（[architecture.md](architecture.md)）。闭式解没有 unfolds，因此 LTC 内核融合的是一个*子循环*，而 CfC 内核融合的是*整个*步：一个 Step 过去记录 `66 + 14·(inDim+units)` 个图节点（`inDim=1, units=8` 时 190 个，`4, 16` 时 346 个），现在在**任意维度下都是 24 个节点**（9 个算子节点 + 15 个叶——上述两种形状下节点数下降 87%/93%）。刻意留在图层的部分：输入仿射、四条 softplus 正性约束与输出仿射——softplus 链承载着已文档化的 `[1, units]` 1D 升维叶梯度形状，仿射叶承载输出折叠类，输入仿射则是链式输入拓扑进入一步的位置。
+
+契约与 LTC 内核相同、一字未改：**对融合前图路径逐位一致，而非容差**——前向值与全部梯度逐位吻合，链式/堆叠拓扑亦同（同样的逐元素操作序列保持分立语句，凡乘积馈入累加处同样过 `mul32` FMA 屏障）。两个 CfC 特有的要点：exprel 分支是*值选择而非控制流*——两个分支都求值并按图路径的次序掩码相加，因此不存在需要重放的分歧；融合节点以 `h` 为**第一**父节点，使所有可训练叶保持状态 rest 折叠类——CfC 没有脊柱（spine）类，因此 [`nn.UnrollRemat`](api.md) 在融合步上保持其理想代价（两次前向、一次反向），且不需要 `hvN` 式投递节点（LTC 的稠密 `cmT` 乘积位于展开深处，外部贡献可在该处交错；CfC 的三类状态梯度贡献在任一纪录高结合法下都相互紧邻）。公开 API 与行为除此之外不变；无新增导出符号。
+
+本机实测（`-benchtime=200x`；`CfCStep` 为 `in=4, units=16, batch=8`）：**约 34 µs / 52 allocs/op**，融合前约 83.5 µs / 1,066——墙钟约 2.4×，分配数 −95%；`UnrollRematCfC` **约 0.83 ms / 5,000 allocs/op**，原约 1.86 ms / 22,106——约 2.2×，−77%。
+
+三条诚实的行为注记，前两条由差分测试钉住：
+
+- **状态形状严格化（缺陷修复，非回归）。** 图路径对多数错误状态形状在 tensor 层 panic，但对可广播的错形状态（如 `[batch, 1]` 或 `[1, units]`）曾*静默广播*，产出形状错误的梯度——而这些输入本就是 `Cell` 契约一直禁止的（`h` 必须是 `[batch, StateSize()]`）。融合 `Step` 在入口处校验 `h`，任何偏差一律 panic（`state shape %v incompatible with [batch, units]`），与 LTC 融合内核先于此做出的同一裁决一致。
+- **recover 之后丢弃该图。** 图路径上，反向 panic 会留下已投递但不可重放的内部累加器——对受污染的图重试 `Backward` 会再次 panic。融合内核在任何投递*之前* panic，重试时保持干净。无论哪条路径，受支持的做法相同：`recover` 之后弃图重建。
+- 双 NaN 载荷角落与 LTC 内核同级，接受标准相同——见 [pitfalls.md](pitfalls.md) 的残余留档表。
+
 ## 与 LTC 的关系：同一 ODE，两种积分器
 
 `CfC` 与 `LTC` 离散化的是**同一条** ODE；差别在积分器：
@@ -61,7 +75,7 @@ v_new = A + (v − A)·e^{−κ·ts},   κ = G/cm
 | | `LTC` | `CfC` |
 |---|---|---|
 | 方案 | `unfolds` 个子步上的半隐式欧拉（semi-implicit Euler，见 [ltc.md](ltc.md)） | 解析积分器（analytical integrator）：一步走完 Lemma 1 闭式解 |
-| 每个 RNN 步的图开销 | 随 `unfolds` 增长 | 与时间跨度无关的常量——没有子步循环 |
+| 每个 RNN 步的图节点数 | 自阶段 16 起为单个融合节点（子步不再录图；内核暂存仍随 `unfolds` 增长） | 自阶段 18 起为单个融合节点——任意维度 24 个节点 |
 | 构造器 | `NewLTC(inDim, units, wiring, unfolds, rng)` | `NewCfC(inDim, units, wiring, rng)`——没有 `unfolds` |
 | 其余一切 | 共享：13 个可训练张量、初始化区间、固定 ±1 且不在 `Parameters()` 中的反转电位、`ts` 契约、`Cell` 接口——`nn.Unroll` 驱动两者无需任何改动 |
 

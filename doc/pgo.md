@@ -53,9 +53,11 @@ workload — which only you have.
 Environment: `go1.26.5 darwin/arm64`, Apple M4 (10 cores, 16 GB),
 macOS 26.5.2 (Darwin 25.5.0). Method: profile collected from the two `nn`
 benchmarks (`go test ./nn -run '^$' -bench 'BenchmarkLTCStep|BenchmarkUnrollBackward'
--benchtime=2s -cpuprofile=…`), then the full 17-benchmark suite run
+-benchtime=2s -cpuprofile=…`), then the full benchmark suite run
 with `-pgo` on and off, interleaved A/B/A/B, `-count=3` per pass (n = 6
-per cell), `-benchmem`. All 17 benchmarks, mean ns/op (measured on the
+per cell), `-benchmem` — 17 benchmarks at collection time; stage 18
+added `BenchmarkCfCStep`, whose row was measured later against the
+*same* profile with the identical method. Mean ns/op (measured on the
 post-fusion tree; the `tensor`/`autograd` baseline column agrees with
 this table's pre-fusion edition within run-to-run noise, and the two
 headline `nn` rows are the fused-kernel baselines):
@@ -76,6 +78,7 @@ headline `nn` rows are the fused-kernel baselines):
 | tensor/MatMul64 | 76,079 | 74,341 | −2.3 % | unchanged |
 | tensor/MatMul128 | 647,442 | 636,798 | −1.6 % | unchanged |
 | tensor/SumCols | 7,378 | 7,313 | −0.9 % | unchanged |
+| nn/CfCStep | 33,899 | 34,541 | +1.9 % (within run-to-run spread; stage-18 addition, same profile) | unchanged |
 | tensor/SoftmaxRows | 44,036 | 45,828 | +4.1 % (within spread) | unchanged |
 | tensor/SumRows | 8,262 | 7,405 | −10.4 % (one baseline outlier; medians 7,642 → 7,411) | unchanged |
 | tensor/Transpose | 10,482 | 11,093 | +5.8 % (within run-to-run spread) | unchanged |
@@ -85,7 +88,8 @@ AddBroadcastRow 64.3, Hadamard 73.7, ChainForwardBackward 10.7,
 UnrollRemat 5.6, DivDenLoop 5.1 — all clearly significant. LTCStep
 (2.1) and UnrollBackward (2.9) are marginal; GatherRowsBackward (1.1),
 UnrollRematCfC (1.9), the MatMul pair (~1.6) and
-SoftmaxRows/SumRows/SumCols/Transpose move less than their own spread.
+SoftmaxRows/SumRows/SumCols/Transpose — plus the stage-18 CfCStep
+(−1.6, sign-flipped) — move less than their own spread.
 
 ### The catch: one bistable inlining decision
 
@@ -112,7 +116,9 @@ executes the ODE unfolds as one `FusedOp` node that no longer routes
 through the broadcast wrappers at all, so only the non-fused remainder
 of the step benefits (LTCStep/UnrollBackward −3.6 %), while the remat
 pair — whose recompute sweeps rebuild ordinary per-step graphs — keeps
-a larger share (−6 %).
+a larger share (−6 %). The fused CfC step (stage 18) fuses even more
+of the step into its single node, and its PGO delta is likewise ≈ 0
+(+1.9 %, within spread).
 
 But the decision is bistable. Three profiles were collected with the
 *identical* command minutes apart, plus a merge of all three

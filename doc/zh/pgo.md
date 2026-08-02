@@ -21,7 +21,7 @@ PGO 是**按 main 包**应用的：画像要么是放在*你的* `package main` 
 
 ## 在本仓库上的实测
 
-环境：`go1.26.5 darwin/arm64`，Apple M4（10 核，16 GB），macOS 26.5.2（Darwin 25.5.0）。方法：从两个 `nn` 基准采集画像（`go test ./nn -run '^$' -bench 'BenchmarkLTCStep|BenchmarkUnrollBackward' -benchtime=2s -cpuprofile=…`），然后完整 17 个基准在 `-pgo` 开/关下交错 A/B/A/B 运行，每轮 `-count=3`（每格 n = 6），带 `-benchmem`。全部 17 个基准的平均 ns/op（在融合后的树上实测；`tensor`/`autograd` 基线列与本表融合前版本在轮间噪声内一致，两个头条 `nn` 行为融合内核基线）：
+环境：`go1.26.5 darwin/arm64`，Apple M4（10 核，16 GB），macOS 26.5.2（Darwin 25.5.0）。方法：从两个 `nn` 基准采集画像（`go test ./nn -run '^$' -bench 'BenchmarkLTCStep|BenchmarkUnrollBackward' -benchtime=2s -cpuprofile=…`），然后完整基准套件在 `-pgo` 开/关下交错 A/B/A/B 运行，每轮 `-count=3`（每格 n = 6），带 `-benchmem`——采集时为 17 个基准；阶段 18 新增 `BenchmarkCfCStep`，其行以*同一*画像、同一方法于事后补测。平均 ns/op（在融合后的树上实测；`tensor`/`autograd` 基线列与本表融合前版本在轮间噪声内一致，两个头条 `nn` 行为融合内核基线）：
 
 | 基准 | 基线 | PGO | Δ ns/op | 分配 |
 |---|---:|---:|---:|---|
@@ -39,11 +39,12 @@ PGO 是**按 main 包**应用的：画像要么是放在*你的* `package main` 
 | tensor/MatMul64 | 76,079 | 74,341 | −2.3 % | 不变 |
 | tensor/MatMul128 | 647,442 | 636,798 | −1.6 % | 不变 |
 | tensor/SumCols | 7,378 | 7,313 | −0.9 % | 不变 |
+| nn/CfCStep | 33,899 | 34,541 | +1.9 %（在轮间散布之内；阶段 18 新增，同一画像） | 不变 |
 | tensor/SoftmaxRows | 44,036 | 45,828 | +4.1 %（在散布之内） | 不变 |
 | tensor/SumRows | 8,262 | 7,405 | −10.4 %（基线有一个离群点；中位数 7,642 → 7,411） | 不变 |
 | tensor/Transpose | 10,482 | 11,093 | +5.8 %（在轮间散布之内） | 不变 |
 
-五个大幅移动的基准的 Welch t 统计量（n = 6 对 6）：AddBroadcastRow 64.3、Hadamard 73.7、ChainForwardBackward 10.7、UnrollRemat 5.6、DivDenLoop 5.1——全部显著。LTCStep（2.1）与 UnrollBackward（2.9）处于边缘；GatherRowsBackward（1.1）、UnrollRematCfC（1.9）、MatMul 对（约 1.6）以及 SoftmaxRows/SumRows/SumCols/Transpose 的移动小于自身散布。
+五个大幅移动的基准的 Welch t 统计量（n = 6 对 6）：AddBroadcastRow 64.3、Hadamard 73.7、ChainForwardBackward 10.7、UnrollRemat 5.6、DivDenLoop 5.1——全部显著。LTCStep（2.1）与 UnrollBackward（2.9）处于边缘；GatherRowsBackward（1.1）、UnrollRematCfC（1.9）、MatMul 对（约 1.6）以及 SoftmaxRows/SumRows/SumCols/Transpose——外加阶段 18 的 CfCStep（−1.6，符号翻转）——的移动小于自身散布。
 
 ### 关键陷阱：一个双态的内联决策
 
@@ -54,7 +55,7 @@ tensor/ops.go:272:24: inlining call to broadcastBinary
 tensor/ops.go:272:24: inlining call to Add.func1
 ```
 
-每元素一次间接调用被消除：128×128 基准上是 16,384 次调用，31.0 µs → 9.4 µs（约 1.9 → 0.57 ns/元素）。热循环由包装函数算术构成的基准按比例受益：`ChainForwardBackward`（16 层 `Add(Hadamard(v, w), x)`）−20.5%、`DivDenLoop` −7.9%。`nn` 细胞基准的收益小于阶段 16 之前实测的 −7%：融合 LTC 内核（`nn/ltc_fused.go`）把 ODE 展开作为一个 `FusedOp` 节点执行，完全不再经过广播包装函数，因此只有步内未融合的残余部分受益（LTCStep/UnrollBackward −3.6%）；而 remat 一对基准——其重算扫描重建的是普通的逐步子图——保留了更大份额（−6%）。
+每元素一次间接调用被消除：128×128 基准上是 16,384 次调用，31.0 µs → 9.4 µs（约 1.9 → 0.57 ns/元素）。热循环由包装函数算术构成的基准按比例受益：`ChainForwardBackward`（16 层 `Add(Hadamard(v, w), x)`）−20.5%、`DivDenLoop` −7.9%。`nn` 细胞基准的收益小于阶段 16 之前实测的 −7%：融合 LTC 内核（`nn/ltc_fused.go`）把 ODE 展开作为一个 `FusedOp` 节点执行，完全不再经过广播包装函数，因此只有步内未融合的残余部分受益（LTCStep/UnrollBackward −3.6%）；而 remat 一对基准——其重算扫描重建的是普通的逐步子图——保留了更大份额（−6%）。融合 CfC 步（阶段 18）把更多的步融进单节点，其 PGO 增量同样 ≈ 0（+1.9%，在散布之内）。
 
 但这个决策是双态的。我们用*完全相同*的命令、相隔几分钟采集了三份画像，外加三者的合并（`go tool pprof -proto a b c`）：
 

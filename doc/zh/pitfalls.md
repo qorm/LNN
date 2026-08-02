@@ -135,17 +135,19 @@ fmt.Println(m.Grad.Data) // [1 0 0 1] —— 依然正确
 
 格式规格、API 指南与完整契约——包括版本规则（只读 version 1；未知版本报错而非误解析）——见 [persistence.md](persistence.md)。
 
-## 阶段 16 残余留档
+## 残余留档（阶段 16 与 18）
 
-阶段 16 两项工作（融合 LTC 内核与 `UnrollRemat`）的留档角落——选择披露而非修复；在文档所述用法下没有一项构成阻碍；体例照审计的留档表（问题/来源/严重度/处置）：
+阶段 16（融合 LTC 内核与 `UnrollRemat`）与阶段 18（融合 CfC 内核）工作的留档角落——选择披露而非修复；在文档所述用法下没有一项构成阻碍；体例照审计的留档表（问题/来源/严重度/处置）：
 
 | # | 问题 | 来源 | 严重度 | 处置 |
 |---|---|---|---|---|
-| 1 | 融合 LTC 路径：**两个**操作数都是 NaN 的算子产出的 NaN，其载荷/符号位在融合路径与旧图路径之间不保真（NaN 位置集与一切有限值逐位一致） | 阶段 16 红队 | Low（接受） | 与单源符号位角落 F9-1 同一接受级——与训练无关、轨迹无可观测分歧；载荷取决于编译器的指令选择，不属于任何可复刻的舍入结构。契约见 `nn/ltc_fused.go` 头注的 NaN 语义节 |
+| 1 | 融合 LTC 路径：**两个**操作数都是 NaN 的算子产出的 NaN，其载荷/符号位在融合路径与旧图路径之间不保真（NaN 位置集与一切有限值逐位一致）。融合 CfC 步（阶段 18）接受标准相同 | 阶段 16 红队 | Low（接受） | 与单源符号位角落 F9-1 同一接受级——与训练无关、轨迹无可观测分歧；载荷取决于编译器的指令选择，不属于任何可复刻的舍入结构。契约见 `nn/ltc_fused.go` 与 `nn/cfc_fused.go` 头注的 NaN 语义节 |
 | 2 | `UnrollRemat` 用于**逐步图结构依赖于张量值**的细胞时漂移约 1–2 ULP，单步结构探针不可探 | 阶段 16 红队 | Low（接受） | godoc 契约：`Step` 的图结构必须是 `(x, h)` 的纯函数；两种内置细胞均满足。值分支的自定义细胞在构造上即越出契约 |
 | 3 | `UnrollRemat` 最坏情形：对抗性 loss 访问序（降序访问配小 chunkSize 为极端）迫使重算单元合并至 O(T)——峰值内存*和*算力均可超过一次全图反向 | 阶段 16 红队 | Info | 已写入 godoc 与食谱的 chunkSize 指引；把损失拼成升序访问各步输出（数据在前）即保 O(chunk) 快路径 |
 | 4 | params 完备性审计的诚实性取决于细胞自报的 `Parameters()`：`Module` 若在自报列表中漏掉某个 `Step` 消费的叶，审计即失效，该叶会被静默多算（2–3 倍错梯度） | 阶段 16 红队 | Low（接受） | 两种内置细胞自报完备；对自定义细胞，`Parameters()` 的完备是细胞一侧的契约——审计覆盖细胞所披露的范围 |
 | 5 | `nn` 覆盖率为 99.9% 而非 100%：唯一未覆盖语句是 `UnrollRemat` 单元扫描中一处构造性不可达的 nil-root 防火墙守卫 | 阶段 16 API 总扫 | Info | 作为防御未来单元切分改动的防火墙保留，不可达论证注释在 `nn/remat.go`；已在 README 状态表披露（照 optimizer 行 99.6% 的纪律） |
+| 6 | 融合内核对**状态形状**严于图路径：可广播的错形 `h`（如 `[batch, 1]`、`[1, units]`）过去会被静默广播、产出形状错误的梯度；两个融合细胞现在都在入口处 panic | 阶段 18 红队 | Info（缺陷修复） | `Cell` 契约本就要求 `h` 为 `[batch, StateSize()]`——图路径的宽贷是缺陷，panic 才是契约。两内核同一裁决（LTC 在先，CfC 于阶段 18）；差分测试已钉住 |
+| 7 | **反向 panic** 之后两路径行为不同：图路径会留下已投递的内部累加器残量（对受污染的图重试 `Backward` 会再次 panic），融合内核在任何投递之前 panic、重试保持干净 | 阶段 18 红队 | Info | 不复刻——干净的行为严格更优，且污染本就不可复现。指引与路径无关：`recover` 之后弃图重建 |
 
 ## 路线图与技术债
 
@@ -166,5 +168,6 @@ fmt.Println(m.Grad.Data) // [1 0 0 1] —— 依然正确
 | CfC（Closed-form Continuous-time）细胞 | **已完成（阶段 6）：** `nn.CfC`（`nn/cfc.go`）——与 LTC 同一 ODE、同一套突触参数化，以 Lemma 1 闭式解驱动；论文↔代码对照与验证留痕见 [cfc.md](cfc.md)。新 API：仍可能演进 |
 | 内置优化器 | **已完成（阶段 6）：** `optimizer` 包（SGD/Momentum/Adam，覆盖率 100%）；手写循环依然是理解引擎以及实现该包未覆盖规则的受支持范式——[training.md](training.md) 覆盖两种形态 |
 | 序列化（Save/Load） | **已完成（阶段 7）：** `serialize` 包（带版本的 `"LNNS"` 张量流）外加 `nn` 的六个 Save/Load 函数（LTC/CfC/Linear）；对恶意流安全——只有 error 绝不 panic、固定限额先校验后分配、未知长度读端渐进分配（4 GiB 声明在 18 字节后停止仅峰值约 33 KiB）。红队变异模糊：7,500 个变异体 0 panic，资源耗尽加固后再测 1,200 个变异体，依然 0 panic。格式规格、API 指南与完整安全契约见 [persistence.md](persistence.md) |
-| 基准/CI 工具 | **已完成：** `make bench`（17 项基准）+ GitHub Actions CI（gofmt 门禁、vet、build、`test -race`、example 冒烟） |
+| 基准/CI 工具 | **已完成：** `make bench`（18 项基准）+ GitHub Actions CI 双架构（ubuntu-latest + ubuntu-24.04-arm；gofmt 门禁、vet、build、`test -race`、example 冒烟、11 个原生 fuzz 目标冒烟） |
 | LTC ODE 展开的图算子融合；重实体化 BPTT | **已完成（阶段 16）：** `autograd.FusedOp`（调用方自持反向闭包）+ LTC 展开融合为单图节点（`nn/ltc_fused.go`）——前向与梯度对融合前图路径逐位一致，公开 API 零变更。实测（`-benchtime=200x`）：`LTCStep` 约 203 µs / 2,122 allocs → **约 87 µs / 236**，`UnrollBackward` 约 2.8–3.3 ms / 28,273 → **约 1.33 ms / 6,662**（约 2.1–2.3×）。`nn.UnrollRemat` 提供分块 BPTT：梯度逐位一致，峰值图内存 O(chunk)（T = 512：保留约 0.65 MB 对比驻留约 11.5 MB）。留档角落见上文残余留档表；机制见 [architecture.md](architecture.md)，用法食谱见 [cookbook.md](cookbook.md#13-长序列训练unrollremat-分块-bptt) |
+| CfC 闭式步融合；差分 fuzz 常驻化；CI 双架构 | **已完成（阶段 18）：** CfC 整个逐步子图融合为单个 `FusedOp` 节点（`nn/cfc_fused.go`）——`66 + 14·(inDim+units)` 个节点 → **任意维度 24 个**（`inDim=1, units=8` 时 190→24、`4, 16` 时 346→24），前向与梯度对图路径逐位一致（链式/堆叠含），公开 API 零变更、无新增导出符号；`h` 居父列表首位使 CfC 保持无脊柱类，`UnrollRemat` 维持 2F+1B 理想代价。实测（`-benchtime=200x`）：`CfCStep` 约 83.5 µs / 1,066 allocs → **约 34 µs / 52**（约 2.4×，allocs −95%），`UnrollRematCfC` 约 1.86 ms / 22,106 → **约 0.83 ms / 5,000**（约 2.2×，−77%）。三个逐位差分 fuzz 目标（`FuzzLTCFusedDifferential`、`FuzzCfCFusedDifferential`、`FuzzUnrollRematDifferential`；36 条种子语料）加入 fuzz 套件（8 → 11 目标），CI 全部六门禁在 amd64 与 arm64 双架构同跑。两处行为收紧（状态形状严格化、投递前 panic）见上文残余留档表 |

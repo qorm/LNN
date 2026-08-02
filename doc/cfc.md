@@ -112,6 +112,68 @@ and the binary wiring masks are the LTC's, so
 `NewCfC(inDim, units, wiring, rng)` accepts exactly the `Wiring`
 topologies `NewLTC` does (`nil` means fully connected).
 
+## The fused kernel: one node per Step (stage 18)
+
+Since stage 18 the whole per-step subgraph above — the two synaptic
+drives, the `g`/`a` assembly, the `decayRate` cap chain and the
+exprel-stabilized `decayFactor` — collapses into **one**
+`autograd.FusedOp` node (`nn/cfc_fused.go`), the sibling of the LTC's
+fused unfold kernel ([architecture.md](architecture.md)). The closed
+form has no unfolds, so where the LTC kernel fused a *sub-loop*, the
+CfC kernel fuses the *entire* step: a Step used to record
+`66 + 14·(inDim+units)` graph nodes (190 at `inDim=1, units=8`, 346 at
+`4, 16`) and now records **24 nodes at any dimensions** (9 op nodes +
+15 leaves — a −87%/−93% node cut at those two shapes). What
+deliberately stays graph-level: the input affine, the four softplus
+positivity constraints and the output affine — the softplus chain owns
+the documented `[1, units]` 1D-lift leaf-gradient shapes, the affine
+leaves own the output fold class, and the input affine is where
+chained-input topologies enter the step.
+
+The contract is the LTC kernel's, unchanged: **bit-identity against
+the pre-fusion graph path, not a tolerance** — forward values and all
+gradients match bit for bit, chained and stacked topologies included
+(the same per-element operation sequence kept as separate statements,
+the same `mul32` FMA barrier wherever a product feeds an addition).
+Two CfC-specific points: the exprel branch is *value selection, not
+control flow* — both branches are evaluated and mask-added in the
+graph's order, so there is no divergence to replay; and the fused node
+takes `h` as its **first** parent, keeping every trainable leaf in the
+state-rest fold class — the CfC has no spine class, so
+[`nn.UnrollRemat`](api.md) keeps its ideal price (two forwards, one
+backward) over the fused step, and no `hvN`-style delivery node is
+needed (the LTC's dense `cmT` product sat unfolds-deep where external
+contributions could interleave; the CfC's three state-gradient
+contribution classes are mutually contiguous under either record-high
+association). Public API and behavior are otherwise unchanged; no new
+exported symbols.
+
+Measured (this machine, `-benchtime=200x`; `CfCStep` at `in=4,
+units=16, batch=8`): **~34 µs / 52 allocs/op**, from ~83.5 µs / 1,066
+before fusion — ~2.4× wall clock, −95% allocations; `UnrollRematCfC`
+**~0.83 ms / 5,000 allocs/op**, from ~1.86 ms / 22,106 — ~2.2×, −77%.
+
+Three honest behavioral notes, the first two pinned by the
+differential tests:
+
+- **State-shape strictness (a defect fix, not a regression).** The
+  graph path panicked in the tensor layer for most wrong state shapes
+  but *silently broadcast* a broadcast-compatible wrong state (e.g.
+  `[batch, 1]` or `[1, units]`), producing wrongly shaped gradients —
+  for inputs the `Cell` contract always forbade (`h` must be
+  `[batch, StateSize()]`). The fused `Step` validates `h` up front and
+  panics on every deviation (`state shape %v incompatible with [batch,
+  units]`), the same call the LTC's fused kernel made earlier.
+- **Discard the graph after a caught panic.** On the graph path, a
+  panicked backward leaves internal accumulators delivered but
+  unreplayable — a retried `Backward` panics again on the polluted
+  graph. The fused kernel panics *before* any delivery and stays clean
+  on a retry. Either way the supported move is the same: after a
+  `recover`, drop the graph and build a fresh one.
+- The double-NaN payload corner is the LTC kernel's, at the identical
+  acceptance level — see the residual register in
+  [pitfalls.md](pitfalls.md).
+
 ## Relation to the LTC: same ODE, two integrators
 
 `CfC` and `LTC` discretize the **same** ODE; the difference is the
@@ -120,7 +182,7 @@ integrator:
 | | `LTC` | `CfC` |
 |---|---|---|
 | scheme | semi-implicit Euler over `unfolds` substeps ([ltc.md](ltc.md)) | analytic integrator (解析积分器): the Lemma 1 closed form in one step |
-| graph cost per RNN step | grows with `unfolds` | constant in the time span — no substep loop |
+| graph nodes per RNN step | one fused node since stage 16 (substeps no longer recorded; the kernel's stash still scales with `unfolds`) | one fused node since stage 18 — 24 nodes at any dimensions |
 | constructor | `NewLTC(inDim, units, wiring, unfolds, rng)` | `NewCfC(inDim, units, wiring, rng)` — no `unfolds` |
 | everything else | shared: the 13 trainable tensors, init ranges, fixed ±1 reversal potentials excluded from `Parameters()`, the `ts` contract, the `Cell` interface — `nn.Unroll` drives both unchanged |
 

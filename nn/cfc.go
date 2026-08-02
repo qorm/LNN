@@ -221,7 +221,22 @@ func (c *CfC) Parameters() []*autograd.Variable {
 // shape [batch, units] and the new raw state vNew with shape
 // [batch, units]. Panics if ts is not positive and finite (NaN, +/-Inf,
 // zero and negative values are all rejected), or if x/h do not have the
-// expected rank and widths (the tensor-layer contract).
+// expected rank and widths (h is validated explicitly; see
+// nn/cfc_fused.go for the strictness note).
+//
+// The two drives, the g/a assembly, the decayRate cap chain and the
+// exprel-stabilized decayFactor run as one fused kernel (nn/cfc_fused.go,
+// stage 18b): a single graph node whose forward replays the per-element
+// operation sequence with identical rounding boundaries, and whose
+// hand-written VJP replays the graph path's backward accumulation order
+// contribution for contribution, bit for bit. The input affine, the four
+// softplus constraints and the output affine stay graph-level (the
+// softplus chain owns the documented 1D-lift leaf gradient shapes, the
+// affine leaves own the OUTPUT fold class). The node count per Step
+// drops from 66 + 14*(inDim+units) to 24. drive/contract/decayRate/
+// decayFactor below remain as the fused kernel's white-box oracle (the
+// pre-fusion graph path, reassembled verbatim by legacyCfCStep in
+// nn/cfc_fused_diff_test.go).
 func (c *CfC) Step(x, h *autograd.Variable, ts float64) (out, hNew *autograd.Variable) {
 	// NaN-aware positivity check: NaN > 0 is false, so NaN panics here too;
 	// both infinities are rejected explicitly, as in the LTC.
@@ -233,35 +248,19 @@ func (c *CfC) Step(x, h *autograd.Variable, ts float64) (out, hNew *autograd.Var
 		h = autograd.Var(tensor.New(batch, c.units))
 	}
 
-	// Affine input mapping.
+	// Affine input mapping (graph-level: chained-input topologies enter
+	// the step here).
 	inputs := autograd.Add(autograd.Hadamard(x, c.inW), c.inB)
 
-	// Positivity-constrained parameters (softplus).
+	// Positivity-constrained parameters (softplus, graph-level: the chain
+	// owns the documented [1, units] 1D-lift leaf gradient shapes).
 	gleak := autograd.Softplus(c.gleak)
 	cm := autograd.Softplus(c.cm)
 	wPos := autograd.Softplus(c.w)
 	sWPos := autograd.Softplus(c.sW)
 
-	// Synaptic drives: num = sum_j act_j*erev_j, den = sum_j act_j, with the
-	// erev signs carried by the erevRows constants (see drive and contract).
-	numS, denS := c.drive(inputs, c.sMu, c.sSigma, sWPos, c.erevRowsS, c.wiring.SensoryRow)
-	numR, denR := c.drive(h, c.mu, c.sigma, wPos, c.erevRowsR, c.wiring.RecurrentRow)
-
-	epsV := autograd.Const(tensor.FromData([]float32{c.eps}, 1))
-	// G = gleak + den, the total conductance [batch, units].
-	g := autograd.Add(gleak, autograd.Add(denS, denR))
-	// A = (gleak*vleak + num) / (G + eps): the instantaneous reversal state.
-	a := autograd.Div(
-		autograd.Add(autograd.Hadamard(gleak, c.vleak), autograd.Add(numS, numR)),
-		autograd.Add(g, epsV),
-	)
-	// B = kappa*ts = G/cm * ts, with the overflow/sign cap of decayRate.
-	b := c.decayRate(g, cm, epsV, ts)
-	// F = 1 - exp(-B), exprel-stabilized (see decayFactor).
-	f := c.decayFactor(b)
-
-	// v_new = v + (A - v)*F, the closed-form solution over the span ts.
-	vNew := autograd.Add(h, autograd.Hadamard(autograd.Sub(a, h), f))
+	// The closed-form update runs as one fused kernel (nn/cfc_fused.go).
+	vNew := c.fusedStep(h, inputs, gleak, cm, wPos, sWPos, ts)
 
 	out = autograd.Add(autograd.Hadamard(vNew, c.outW), c.outB)
 	return out, vNew

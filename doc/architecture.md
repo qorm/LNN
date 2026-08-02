@@ -356,6 +356,36 @@ allocation counts down ~89%/76%. The remat benchmarks shrink along
 (`UnrollRemat` ~3.3–3.6 ms, `UnrollRematCfC` ~1.9–2.2 ms), because
 their recompute sweeps run the same fused steps.
 
+### The fused CfC step — the whole step as one node (stage 18)
+
+Stage 18 applies the same recipe to the CfC (`nn/cfc_fused.go`), with
+three structural differences worth knowing. First, the closed form has
+no unfolds, so the kernel fuses the *entire* per-step subgraph — both
+drives, the `g`/`a` assembly, the `decayRate` cap chain and the
+exprel `decayFactor` — not a sub-loop: `66 + 14·(inDim+units)` graph
+nodes (190 at `inDim=1, units=8`, 346 at `4, 16`) become **24 nodes at
+any dimensions** (9 op nodes + 15 leaves), with only the input affine,
+the four softplus constraints and the output affine staying
+graph-level. Second, there is **no `hvN` delivery node**: the LTC's
+dense `cmT` contribution sat unfolds-deep where external contributions
+could interleave, but the CfC's three state-gradient contribution
+classes are mutually contiguous under either record-high association,
+so one atomic VJP suffices. Third, the exprel branch is value
+selection rather than control flow — both branches are evaluated and
+mask-added in the graph's order, so there is no branch divergence to
+replay. The bitwise contract (forward and gradients, chained/stacked
+topologies included) and the `mul32` discipline are the LTC kernel's;
+`h` sits first in the parent list, which keeps the CfC spine-free and
+`UnrollRemat` at its two-forwards-one-backward ideal. Measured
+(`-benchtime=200x`): `CfCStep` ~83.5 µs / 1,066 allocs → **~34 µs /
+52**, `UnrollRematCfC` ~1.86 ms / 22,106 → **~0.83 ms / 5,000**. Two
+deliberate behavioral tightenings ride along — upfront state-shape
+validation (broadcast-compatible wrong `h` shapes the graph path
+silently broadcast now panic, as the `Cell` contract always required)
+and a pre-delivery panic point (a caught panic leaves the fused kernel
+clean; discard the graph after a `recover` regardless) — both
+documented in [cfc.md](cfc.md).
+
 ### Rematerialized BPTT — `nn.UnrollRemat` (stage 16)
 
 The memory model above makes BPTT cost O(T × per-step graph): the whole
@@ -451,7 +481,8 @@ now allocates ~32 MB (measured: 36.4 MiB for `NewLTC`, 32.4 MiB for
 `NewCfC`; red-team re-verification agrees), not the old ~8 GiB of
 indicators. Graph memory still grows with `units · unfolds · sequence
 length`, so keep all three modest on this engine; a `CfC` step
-([cfc.md](cfc.md)) avoids the `unfolds` factor entirely, and
+([cfc.md](cfc.md)) avoids the `unfolds` factor entirely — one fused
+node per step since stage 18 (52 allocs/op) — and
 `nn.UnrollRemat` (above) caps peak graph memory at O(chunk) for long
 sequences.
 

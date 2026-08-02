@@ -1077,8 +1077,8 @@ cost, precision and convenience, not expressiveness.
 | | LTC (`nn.NewLTC`) | CfC (`nn.NewCfC`) |
 |---|---|---|
 | integrator | semi-implicit Euler over `unfolds` substeps | Lemma 1 closed form, one analytic step |
-| graph cost per RNN step | grows with `unfolds` (each substep is in the graph) | constant in the time span — no substep loop |
-| backward memory | `∝ units × unfolds × seqLen` activation blocks held to `Backward` | `∝ units × seqLen` — no `unfolds` factor |
+| graph nodes per RNN step | one fused node since stage 16 (substeps no longer recorded; the kernel's stash still scales with `unfolds`) | one fused node since stage 18 — 24 nodes at any dimensions |
+| backward memory | `∝ units × unfolds × seqLen` held to `Backward` (the fused kernel's stash) | `∝ units × seqLen` — no `unfolds` factor |
 | large `ts` behavior | relaxes toward steady state (stable, implicit scheme) | relaxes toward steady state (exact for frozen activations) |
 | variable `ts` | yes — per step ([recipe 5](#5-event-driven-sequences-with-variable-ts)) | yes — same contract |
 | precision vs the ODE | first-order in `ts/unfolds`; raise `unfolds` to tighten | first-order in `ts` (Lemma 1 freezes activations); the two converge as `ts → 0` |

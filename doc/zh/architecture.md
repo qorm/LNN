@@ -148,6 +148,10 @@ LTC 的 `Step` 正是这个速率兑现的地方：它的 `unfolds` 轮 ODE 迭�
 
 本机实测（`-benchtime=200x`）：`LTCStep` 约 203 µs / 2,122 allocs → **约 87 µs / 236 allocs/op**，`UnrollBackward` 约 2.8–3.3 ms / 28,273 allocs → **约 1.33 ms / 6,662**——墙钟约 2.1–2.3×，分配数下降约 89%/76%。remat 基准同步缩小（`UnrollRemat` 约 3.3–3.6 ms、`UnrollRematCfC` 约 1.9–2.2 ms），因为它们的重算扫描跑的就是同一批融合步。
 
+### 融合 CfC 步——整步一个节点（阶段 18）
+
+阶段 18 把同一配方应用到 CfC（`nn/cfc_fused.go`），有三处值得知道的结构差异。其一，闭式解没有 unfolds，因此内核融合的是*整个*逐步子图——两路驱动、`g`/`a` 装配、`decayRate` 封顶链与 exprel `decayFactor`——而非子循环：`66 + 14·(inDim+units)` 个图节点（`inDim=1, units=8` 时 190 个、`4, 16` 时 346 个）变为**任意维度下 24 个节点**（9 算子 + 15 叶），只有输入仿射、四条 softplus 约束与输出仿射留在图层。其二，**没有 `hvN` 投递节点**：LTC 的稠密 `cmT` 贡献位于展开深处、外部贡献可在该处交错，而 CfC 的三类状态梯度贡献在任一纪录高结合法下相互紧邻，一个原子 VJP 即可。其三，exprel 分支是值选择而非控制流——两分支都求值并按图路径次序掩码相加，不存在需要重放的分支分歧。逐位契约（前向与梯度，链式/堆叠含）与 `mul32` 纪律与 LTC 内核相同；`h` 位于父列表首位，使 CfC 保持无脊柱（spine）类、`UnrollRemat` 保持「两前向一反向」的理想代价。本机实测（`-benchtime=200x`）：`CfCStep` 约 83.5 µs / 1,066 allocs → **约 34 µs / 52**，`UnrollRematCfC` 约 1.86 ms / 22,106 → **约 0.83 ms / 5,000**。随行的两处刻意行为收紧——状态形状入口校验（图路径曾静默广播的可广播错形 `h` 现在 panic，`Cell` 契约本就如此要求）与投递前 panic 位点（recover 后融合内核保持干净；无论如何弃图重建）——均已写入 [cfc.md](cfc.md)。
+
 ### 重实体化 BPTT——`nn.UnrollRemat`（阶段 16）
 
 上文的内存模型使 BPTT 的代价是 O(T × 逐步子图)：整条序列都留在图里直到 `Backward`。`nn.UnrollRemat` 用重算换这份内存——即梯度检查点（gradient checkpointing）——同时保持梯度与 `Unroll` + `loss.Backward()` **逐位相等**。两遍法：第一遍逐步推进序列，把每步的输出与输入状态都 [`Detach`](api.md) 掉（存活图从不超过一步），然后在 detach 后的输出上构建一次损失并反向——得到的恰是全图反向的逐步输出种子。第二遍按 chunk 大小的步单元逆序重算，把保存的种子经边界状态逐单元反向穿线。
@@ -162,7 +166,7 @@ LTC 的 `Step` 正是这个速率兑现的地方：它的 `unfolds` 轮 ODE 迭�
 
 ### 图就是内存模型
 
-每个中间张量都保持存活——被其节点引用——直到 `Backward` 完成。因此内存随每次迭代的算子数量扩展，而不仅仅随参数规模。一次 LTC `Step` 会把 `unfolds` 轮 ODE 迭代展开进图；自阶段 6 的突触向量化起，每轮是 O(units) 个激活块；自阶段 9 的稀疏收缩（sparse contraction）起，突触前轴归约是 `+0` 播种、末端归一化 MatMul 收尾的折叠（fold）（见 [ltc.md](ltc.md)）——从 O(units²) 个逐突触节点降下来，也告别了阶段 9 所消灭的稠密 `[units², units]` 指示矩阵（indicator matrix）（那会在构造期*与*加载期实体化 O(units³) 个 float32；见 [persistence.md](persistence.md)）。阶段 7 的反向深改（见上）把逐节点分配数砍掉一半，阶段 8 的 Sigmoid–Hadamard 融合再进一步，阶段 10 的内嵌形状 backing（embedded backing，见上）把每次张量构造再削去一次分配。当前实测（阶段 16，`-benchtime=200x`）：`LTCStep` **236 allocs/op**、`UnrollBackward` **6,662**——较最初的逐突触循环（7,360 / 120,163）累计 **−97% 与 −94%**，最后一步即上文的融合展开内核（对融合前图路径墙钟约 2.1–2.3×）。阶段 9 这一步是诚实的权衡：allocs 相对阶段 8 数值（2,306 / 31,983）*上升*约 43%/30%（折叠每级的克隆），但 ns/op *下降*约 21%/13%（红队独立复测），因为稠密指示阵 MatMul 对零行的 O(units³) 空转内层循环与反向大分配消失了——**分配次数换走了无用算力，墙钟净受益**。同一改动还消除了*构造期*内存悬崖：`units = 1024` 全接线细胞现在分配约 32 MB（实测：`NewLTC` 36.4 MiB、`NewCfC` 32.4 MiB；红队复测一致），而不再是旧的约 8 GiB 指示阵。图内存仍然随 `units · unfolds · 序列长度` 增长，所以在这个引擎上三者都要保持适度；`CfC` 细胞（[cfc.md](cfc.md)）的闭式步进完全没有 `unfolds` 因子，`nn.UnrollRemat`（见上）则把长序列的峰值图内存封顶在 O(chunk)。
+每个中间张量都保持存活——被其节点引用——直到 `Backward` 完成。因此内存随每次迭代的算子数量扩展，而不仅仅随参数规模。一次 LTC `Step` 会把 `unfolds` 轮 ODE 迭代展开进图；自阶段 6 的突触向量化起，每轮是 O(units) 个激活块；自阶段 9 的稀疏收缩（sparse contraction）起，突触前轴归约是 `+0` 播种、末端归一化 MatMul 收尾的折叠（fold）（见 [ltc.md](ltc.md)）——从 O(units²) 个逐突触节点降下来，也告别了阶段 9 所消灭的稠密 `[units², units]` 指示矩阵（indicator matrix）（那会在构造期*与*加载期实体化 O(units³) 个 float32；见 [persistence.md](persistence.md)）。阶段 7 的反向深改（见上）把逐节点分配数砍掉一半，阶段 8 的 Sigmoid–Hadamard 融合再进一步，阶段 10 的内嵌形状 backing（embedded backing，见上）把每次张量构造再削去一次分配。当前实测（阶段 16，`-benchtime=200x`）：`LTCStep` **236 allocs/op**、`UnrollBackward` **6,662**——较最初的逐突触循环（7,360 / 120,163）累计 **−97% 与 −94%**，最后一步即上文的融合展开内核（对融合前图路径墙钟约 2.1–2.3×）。阶段 9 这一步是诚实的权衡：allocs 相对阶段 8 数值（2,306 / 31,983）*上升*约 43%/30%（折叠每级的克隆），但 ns/op *下降*约 21%/13%（红队独立复测），因为稠密指示阵 MatMul 对零行的 O(units³) 空转内层循环与反向大分配消失了——**分配次数换走了无用算力，墙钟净受益**。同一改动还消除了*构造期*内存悬崖：`units = 1024` 全接线细胞现在分配约 32 MB（实测：`NewLTC` 36.4 MiB、`NewCfC` 32.4 MiB；红队复测一致），而不再是旧的约 8 GiB 指示阵。图内存仍然随 `units · unfolds · 序列长度` 增长，所以在这个引擎上三者都要保持适度；`CfC` 细胞（[cfc.md](cfc.md)）的闭式步进完全没有 `unfolds` 因子——自阶段 18 起也是每步一个融合节点（52 allocs/op）——`nn.UnrollRemat`（见上）则把长序列的峰值图内存封顶在 O(chunk)。
 
 ## float32 是全局约束
 

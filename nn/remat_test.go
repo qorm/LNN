@@ -683,3 +683,35 @@ func TestStepDoesNotMutateInputs(t *testing.T) {
 		}
 	}
 }
+
+// TestRematFusedCfCFoldClasses pins the fused CfC step's fold classes
+// (stage 18b): with h the fused node's FIRST parent, the DFS descent hits
+// the state leaf before any parameter chain, so every trainable leaf
+// stays state-rest except the OUTPUT-class outW/outB — no spine class,
+// hence no σ sweep for the CfC (remat.go's "never for the CfC" survives
+// the fusion). A regression that reorders the fused node's parents would
+// either move a leaf into classSpine or trip the multi-class panic.
+func TestRematFusedCfCFoldClasses(t *testing.T) {
+	rng := rand.New(rand.NewSource(97))
+	cell := NewCfC(3, 4, nil, rng)
+	x := autograd.Var(tensor.Uniform(rng, -1, 1, 2, 3))
+	exempt := map[*autograd.Variable]bool{x: true}
+	swept := append(append([]*autograd.Variable{}, cell.Parameters()...), x)
+	classes, consumed := classifyFoldClasses(cell, x, 0.1, swept, exempt)
+	names := []string{"gleak", "vleak", "cm", "mu", "sigma", "w", "sMu", "sSigma", "sW", "inW", "inB", "outW", "outB"}
+	for i, p := range cell.Parameters() {
+		if !consumed[p] {
+			t.Fatalf("parameter %s has no consumer in the fused step graph", names[i])
+		}
+		want := classStateRest
+		if i >= 11 { // outW, outB live on the output branch
+			want = classOutput
+		}
+		if classes[p] != want {
+			t.Fatalf("parameter %s: fold class %d, want %d (fused CfC must stay spine-free)", names[i], classes[p], want)
+		}
+	}
+	if classes[x] != classStateRest {
+		t.Fatalf("x: fold class %d, want state-rest", classes[x])
+	}
+}

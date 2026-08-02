@@ -28,6 +28,22 @@ func BenchmarkLTCStep(b *testing.B) {
 	}
 }
 
+// BenchmarkCfCStep times a single CfC RNN step: the input affine map, the
+// sensory and recurrent synaptic drives (the sparse fold contraction), the
+// closed-form membrane update (decay rate + exprel decay factor), and the
+// output affine map. in=4, units=16, batch=8 — the BenchmarkLTCStep dims.
+func BenchmarkCfCStep(b *testing.B) {
+	rng := rand.New(rand.NewSource(1))
+	cell := NewCfC(4, 16, nil, rng)
+	x := autograd.Var(tensor.Uniform(rng, -1, 1, 8, 4))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		out, _ := cell.Step(x, nil, 0.1)
+		benchSink = out
+	}
+}
+
 // BenchmarkUnrollBackward replicates the examples/ltc-sequence workload:
 // a 12-step sequence unrolled through an LTC (inDim=1, units=8, unfolds=4,
 // batch=16) feeding a linear readout, an MSE-style loss over all steps, and

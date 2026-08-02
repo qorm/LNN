@@ -1052,8 +1052,8 @@ L1 / MAE   : final loss=12.506966  w=1.9891  b=0.9969   <- robust to outliers
 | | LTC（`nn.NewLTC`） | CfC（`nn.NewCfC`） |
 |---|---|---|
 | 积分器 | 半隐式欧拉（semi-implicit Euler），`unfolds` 个子步 | Lemma 1 闭式解（closed-form solution），单步解析 |
-| 每 RNN 步的图成本 | 随 `unfolds` 增长（每个子步都在图里） | 与时间跨度无关的常量——无子步循环 |
-| 反向内存 | `∝ units × unfolds × seqLen` 个激活块保留到 `Backward` | `∝ units × seqLen`——无 `unfolds` 因子 |
+| 每 RNN 步的图节点数 | 自阶段 16 起为单个融合节点（子步不再录图；内核暂存仍随 `unfolds` 增长） | 自阶段 18 起为单个融合节点——任意维度 24 个节点 |
+| 反向内存 | `∝ units × unfolds × seqLen` 保留到 `Backward`（融合内核的暂存） | `∝ units × seqLen`——无 `unfolds` 因子 |
 | 大 `ts` 行为 | 弛豫向稳态（隐式格式，稳定） | 弛豫向稳态（对冻结激活精确） |
 | 变 `ts` | 支持——逐步（[食谱 5](#5-事件驱动变-ts-序列)） | 支持——同一契约 |
 | 相对 ODE 的精度 | 对 `ts/unfolds` 一阶；增大 `unfolds` 可收紧 | 对 `ts` 一阶（Lemma 1 冻结激活）；`ts → 0` 时两者收敛 |
