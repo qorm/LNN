@@ -64,16 +64,19 @@ v_new = A + (v − A)·e^{−κ·ts},   κ = G/cm
 
 `F ∈ [0, 1]`, so `v_new` is a convex combination of the old state `v`
 and the instantaneous reversal state `A`: the state stays bounded with
-no solver unfolds at all. The code follows the second form
-(`nn/cfc.go`, `Step`, lines 225–268):
+no solver unfolds at all. The code follows the second form — since
+stage 18, inside the fused kernel (`nn/cfc_fused.go`; `Step` itself
+keeps only the input affine, the softplus constraints and the output
+affine, `nn/cfc.go:240-267`, and the graph-path originals of
+`decayRate`/`decayFactor` stay in `cfc.go` as the white-box oracle):
 
-| quantity | code | lines |
+| quantity | code | lines (`nn/cfc_fused.go`) |
 |---|---|---|
-| `G = gleak + Σ actⱼ` | `g := autograd.Add(gleak, autograd.Add(denS, denR))` | 252 |
-| `A = (gleak·vleak + Σ actⱼ·erevⱼ) / (G + eps)` | `a := autograd.Div(…, autograd.Add(g, epsV))` | 254–257 |
-| `B = κ·ts`, overflow/sign-capped | `b := c.decayRate(g, cm, epsV, ts)` | 259 |
-| `F(B) = 1 − e^{−B}`, exprel-stabilized | `f := c.decayFactor(b)` | 261 |
-| `v_new = v + (A − v)·F` | `vNew := autograd.Add(h, autograd.Hadamard(autograd.Sub(a, h), f))` | 264 |
+| `G = gleak + Σ actⱼ` | `g := st.gleakD[j] + denSum` | 289 |
+| `A = (gleak·vleak + Σ actⱼ·erevⱼ) / (G + eps)` | `a := mul32(numA, float32(math.Pow(float64(gEps), -1)))` | 296 |
+| `B = κ·ts`, overflow/sign-capped | `kappa`/`capped`/`bv` — the `decayRate` replay (oracle `nn/cfc.go:350-363`) | 300–302 |
+| `F(B) = 1 − e^{−B}`, exprel-stabilized | mask, BOTH branches, mask-add — the `decayFactor` replay (oracle `nn/cfc.go:387-412`) | 304–321 |
+| `v_new = v + (A − v)·F` | `data[k] = st.h[k] + mul32(sub, fv)` | 323–325 |
 
 One honest code-level deviation from the paper's bare equations: the
 divisors are guarded, `κ = G/(cm + eps)` and `A = …/(G + eps)` with
@@ -87,9 +90,9 @@ invisible; it exists to keep adversarial parameter draws from producing
 The paper's Algorithm 1 compiles an LTC into its closed-form update
 synapse by synapse, allowing arbitrary sparse adjacency. LNN mirrors
 that structure with the same sparse contraction the LTC uses:
-`drive()` (`nn/cfc.go:289-306`) builds one `[batch, units]` activation
+`drive()` (`nn/cfc.go:288-305`) builds one `[batch, units]` activation
 block per presynaptic neuron `i` — the column⊙row outer product gated
-by wiring mask row `i` — and `contract` (`nn/cfc.go:322-338`) reduces
+by wiring mask row `i` — and `contract` (`nn/cfc.go:321-337`) reduces
 the presynaptic axis as a `+0`-seeded ascending fold of the blocks (the
 denominator) and of the blocks scaled by their reversal rows (the
 numerator), each ended by a MatMul against the units×units identity.
@@ -278,7 +281,7 @@ off the code.
 The famous closed-form-CT trap is the raw quotient `(1 − e^{−B})/B` at
 `B → 0`: `1 − e^{−B}` cancels to 0 in finite precision and dividing by
 `B` yields garbage (and a dead gradient). `decayFactor`
-(`nn/cfc.go:388-413`) sidesteps it by computing the whole product
+(`nn/cfc.go:387-412`) sidesteps it by computing the whole product
 `F(B) = B·exprel(B)` with a per-element branch:
 
 | branch | formula | why |
@@ -295,7 +298,7 @@ value and slope at the threshold (red-team scan of 8001 points crossing
 `1e-2`: jump `≤ 2.98e-8`; regression-tested by
 `TestCfCExprelBoundaryContinuity`).
 
-`B` itself is protected upstream in `decayRate` (`nn/cfc.go:351-364`):
+`B` itself is protected upstream in `decayRate` (`nn/cfc.go:350-363`):
 the time scale is computed in `float64` and capped at `1e30` before
 conversion, and the conductance ratio gets the same smooth
 differentiable cap the LTC uses for its capacitance scaling
@@ -305,7 +308,7 @@ a negative decay rate would turn `e^{−B}` into a blow-up.
 ## The time span `ts`
 
 The contract is the LTC's: `ts` must be positive and finite; `NaN`,
-`±Inf`, zero and negative values panic (`nn/cfc.go:228-230`). Behavior
+`±Inf`, zero and negative values panic (`nn/cfc.go:243-245`). Behavior
 at the extremes:
 
 | `ts` | behavior |

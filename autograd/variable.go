@@ -173,6 +173,80 @@ func (v *Variable) addGrad(g *tensor.Tensor) {
 // ZeroGrad clears the accumulated gradient.
 func (v *Variable) ZeroGrad() { v.Grad = nil }
 
+// dfsScratch pools the DFS traversal scratch (visited set + topo buffer)
+// shared by Backward and TopoOrder. Before the pool every Backward rebuilt
+// both from zero — the map plus the topo slice's regrowth topped the
+// traversal's allocation profile (an unrolled graph's Backward runs one DFS
+// per call, and remat runs several per recompute unit). The pool keeps one
+// generation of each container alive across calls so a steady-state
+// Backward allocates no traversal scratch at all.
+//
+// Safety argument, in three parts:
+//
+//  1. Single-threaded by contract — the whole engine (Grad accumulation
+//     included) already assumes it, so the pool adds no new sharing hazard.
+//     The inUse flag nonetheless guards the one reentrancy the contract
+//     does not rule out by construction: a fused backward step (FusedOp's
+//     caller-supplied function, see runBackward's opFused) running another
+//     Backward or TopoOrder while an outer traversal holds the pool. A
+//     nested call observes inUse and falls back to fresh scratch, exactly
+//     the pre-pool behavior, so the outer traversal's state is never
+//     aliased or cleared underneath it.
+//  2. No state leaks across calls: releaseDFS empties both containers
+//     (clear on the map drops every key — the runtime zeroes buckets of
+//     pointer-keyed maps — and clear on the slice zeroes the backing
+//     array's node references), so a panicking Backward whose caller
+//     recovers still returns the pool pristine (the release runs in a
+//     deferred closure), and no graph node is kept alive by the scratch.
+//     What the pool does retain is capacity: the map's buckets and the
+//     topo backing array stay sized for the largest graph ever traversed
+//     (the classic high-water trade — steady for this library's workloads,
+//     where an unroll's graph size is constant across steps).
+//  3. Observable behavior is untouched: the DFS consults visited for
+//     membership only, and the topo order is a pure function of graph
+//     structure and parent order, so the runBackward dispatch sequence —
+//     and with it every float32 rounding — is identical with fresh or
+//     reused scratch. TopoOrder never receives pooled topo storage: its
+//     result escapes to the caller, so it builds a fresh slice as before
+//     and pools only the visited set.
+var dfsScratch struct {
+	inUse   bool
+	visited map[*Variable]bool
+	topo    []*Variable
+}
+
+// acquireDFS checks out the shared traversal scratch, or allocates fresh
+// scratch (the pre-pool behavior) when the pool is already in use by an
+// enclosing traversal. pooled reports which happened; only a pooled
+// acquisition may be handed to releaseDFS.
+func acquireDFS() (visited map[*Variable]bool, topo []*Variable, pooled bool) {
+	if dfsScratch.inUse {
+		return make(map[*Variable]bool), make([]*Variable, 0, 16), false
+	}
+	dfsScratch.inUse = true
+	if dfsScratch.visited == nil {
+		dfsScratch.visited = make(map[*Variable]bool)
+	}
+	if dfsScratch.topo == nil {
+		dfsScratch.topo = make([]*Variable, 0, 16)
+	}
+	return dfsScratch.visited, dfsScratch.topo, true
+}
+
+// releaseDFS returns the scratch to the pool, emptying both containers so
+// no node references outlive the call. topo must be the final (grown)
+// slice, which is why callers release from a deferred closure rather than
+// deferring the call with the initial slice header. A nil topo (TopoOrder,
+// whose result slice escapes to its caller) releases the visited set only.
+func releaseDFS(visited map[*Variable]bool, topo []*Variable) {
+	clear(visited)
+	if topo != nil {
+		clear(topo)
+		dfsScratch.topo = topo[:0]
+	}
+	dfsScratch.inUse = false
+}
+
 // Backward runs reverse-mode differentiation from v. v must be a scalar (the
 // usual case for a loss) unless its Grad has been seeded manually.
 //
@@ -197,8 +271,12 @@ func (v *Variable) Backward() {
 		// corrupt — the caller-visible seed during later accumulation.
 		v.Grad = seed.Clone()
 	}
-	topo := make([]*Variable, 0, 16)
-	visited := make(map[*Variable]bool)
+	visited, topo, pooled := acquireDFS()
+	if pooled {
+		// Deferred closure so the final, grown topo — not the initial
+		// slice header — goes back to the pool (see releaseDFS).
+		defer func() { releaseDFS(visited, topo) }()
+	}
 	var build func(n *Variable)
 	build = func(n *Variable) {
 		if visited[n] {
@@ -243,11 +321,16 @@ func (v *Variable) Value() float32 { return v.Data.Scalar() }
 // deterministic under the engine's single-threaded fixed-op-order
 // contract. The traversal only reads the graph; nothing is mutated. It is
 // exported for graph-introspection tooling — nn.UnrollRemat uses it to
-// classify per-leaf gradient accumulation order — and costs one slice plus
-// one visited set the size of the reachable graph.
+// classify per-leaf gradient accumulation order — and costs one slice the
+// size of the reachable graph (the visited set's storage is reused across
+// calls; see dfsScratch — the result slice itself is always fresh, since it
+// escapes to the caller).
 func TopoOrder(v *Variable) []*Variable {
+	visited, _, pooled := acquireDFS()
+	if pooled {
+		defer func() { releaseDFS(visited, nil) }()
+	}
 	topo := make([]*Variable, 0, 16)
-	visited := make(map[*Variable]bool)
 	var build func(n *Variable)
 	build = func(n *Variable) {
 		if visited[n] {

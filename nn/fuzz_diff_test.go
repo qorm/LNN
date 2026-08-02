@@ -271,8 +271,10 @@ func FuzzLTCFusedDifferential(f *testing.F) {
 					p.Data.Data[i] = -1e30 + 2e30*rng.Float32()
 				}
 			}
-		case 3: // NaN/Inf payloads in the recurrent weights
-			for _, pi := range []int{3, 4, 5} {
+		case 3: // NaN/Inf payloads in the synaptic weights (recurrent and
+			// sensory — the 19a boundary put the sensory blocks in-kernel
+			// too, so the hostile menu covers both drives)
+			for _, pi := range []int{3, 4, 5, 6, 7, 8} {
 				fuzzFillHostile(rng, cell.Parameters()[pi].Data.Data, 1.0/6)
 			}
 		case 4: // NaN/Inf payloads in x and h

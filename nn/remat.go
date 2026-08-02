@@ -248,8 +248,15 @@ func UnrollRemat(cell Cell, params []*autograd.Variable, xs []*autograd.Variable
 	}
 	classes, consumed := classifyFoldClasses(cell, xs[0], ts, swept, singleStep)
 	assertParamsComplete(cell, swept, consumed)
-	pi := visitOrder(loss, ys)
-	assertLossSideOrder(loss, ys, xs, h0, pi, swept, consumed)
+	// The loss graph's topological order feeds both π and the loss-side
+	// consumer-position check: walk it once. TopoOrder is a deterministic
+	// pure read of the graph and nothing mutates the loss graph before its
+	// backward below, so the two consumers observe exactly the order two
+	// separate walks would have produced — one DFS walk and one escaped
+	// result slice fewer per call (the visited set itself is pooled).
+	lossTopo := autograd.TopoOrder(loss)
+	pi := visitOrder(lossTopo, ys)
+	assertLossSideOrder(lossTopo, ys, xs, h0, pi, swept, consumed)
 
 	// The loss sees exactly the values it would see over a full Unroll, so
 	// its backward computes the whole-graph backward's output seeds, bit
@@ -521,15 +528,16 @@ func affinePass(cell Cell, xs, states, ys []*autograd.Variable, ts float64, pi [
 
 // visitOrder returns π, the order in which the loss's DFS first visits
 // the seeded outputs (outputs the loss does not reach never appear), read
-// off the loss graph's own topological order.
-func visitOrder(loss *autograd.Variable, ys []*autograd.Variable) []int {
+// off lossTopo, the loss graph's own topological order (computed once by
+// the caller — see UnrollRemat).
+func visitOrder(lossTopo []*autograd.Variable, ys []*autograd.Variable) []int {
 	index := make(map[*autograd.Variable]int, len(ys))
 	for i, y := range ys {
 		index[y] = i
 	}
 	var pi []int
 	seen := make(map[int]bool)
-	for _, v := range autograd.TopoOrder(loss) {
+	for _, v := range lossTopo {
 		if i, ok := index[v]; ok && !seen[i] {
 			seen[i] = true
 			pi = append(pi, i)
@@ -585,13 +593,15 @@ func assertParamsComplete(cell Cell, swept []*autograd.Variable, consumed map[*a
 // (a gate Hadamard(g, ys[last])) — checking the leaf's own visit
 // position instead rejects that provably-exact shape, a strict
 // over-approximation this rule avoids.
-func assertLossSideOrder(loss *autograd.Variable, ys, xs []*autograd.Variable, h0 *autograd.Variable, pi []int, swept []*autograd.Variable, consumed map[*autograd.Variable]bool) {
+//
+// lossTopo is the loss graph's topological order, computed once by the
+// caller (see UnrollRemat).
+func assertLossSideOrder(lossTopo []*autograd.Variable, ys, xs []*autograd.Variable, h0 *autograd.Variable, pi []int, swept []*autograd.Variable, consumed map[*autograd.Variable]bool) {
 	if len(pi) == 0 {
 		return
 	}
-	topo := autograd.TopoOrder(loss)
-	pos := make(map[*autograd.Variable]int, len(topo))
-	for i, v := range topo {
+	pos := make(map[*autograd.Variable]int, len(lossTopo))
+	for i, v := range lossTopo {
 		pos[v] = i
 	}
 	lastY := pi[0]
@@ -619,7 +629,7 @@ func assertLossSideOrder(loss *autograd.Variable, ys, xs []*autograd.Variable, h
 		if !stepSide(p) {
 			continue
 		}
-		for _, n := range topo {
+		for _, n := range lossTopo {
 			if pos[n] >= posY {
 				continue
 			}
@@ -707,6 +717,29 @@ const (
 // pick keeps the rest sweep's snapshot for them, so an input tapped both
 // by the state subgraph and the output branch (a skip connection) stays
 // legal.
+//
+// # Why the probe result is deliberately NOT cached (stage-19a C9, vetoed)
+//
+// Caching this classification across UnrollRemat calls (keyed by cell and
+// params) was considered and rejected: no sound cache key exists. The
+// probe's output depends on everything Step's graph structure can depend
+// on — the cell's internal parameter-variable identities and wiring, the
+// per-call swept/exempt leaf sets, and ts — and UnrollRemat accepts ANY
+// Cell implementation, whose Step may close over mutable state invisible
+// to this package (a swapped wiring, a reconfigured unfold count, a
+// ts-dependent branch). Detecting such a change would require deep
+// identity snapshots of every value Step reads, which the Cell interface
+// cannot provide; the provided cells expose no generation counter, and
+// adding one is outside this change's scope. A stale hit would not just
+// skip work: it would skip the multi-class panic above for a structure
+// that changed after caching, and it would mis-sort leaves whose class
+// moved — a rounding-order drift that is silent by construction. The
+// probe also feeds assertParamsComplete's consumed set, a per-call
+// completeness audit that must never consult a stale answer. Recomputing
+// per call (one Step, one TopoOrder) is the price of a provably current
+// classification; the loss-graph TopoOrder, in contrast, IS shared
+// between visitOrder and assertLossSideOrder within one call, where
+// determinism makes the two walks provably identical.
 func classifyFoldClasses(cell Cell, x *autograd.Variable, ts float64, swept []*autograd.Variable, exempt map[*autograd.Variable]bool) (map[*autograd.Variable]int, map[*autograd.Variable]bool) {
 	h := autograd.Var(tensor.New(x.Data.Rows(), cell.StateSize()))
 	y, hNew := cell.Step(x, h, ts)

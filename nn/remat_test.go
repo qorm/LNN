@@ -715,3 +715,38 @@ func TestRematFusedCfCFoldClasses(t *testing.T) {
 		t.Fatalf("x: fold class %d, want state-rest", classes[x])
 	}
 }
+
+// TestRematFusedLTCFoldClasses pins the fused LTC step's fold classes
+// after the stage-19a boundary move (sensory path inside the kernel):
+// cm keeps its spine class (cmT is still the fused node's FIRST parent,
+// so the cm chain completes during the DFS descent), outW/outB stay
+// OUTPUT-class on the output branch, and every other trainable leaf —
+// vleak, the sensory parameters and the input affine included — stays
+// state-rest (the RT-S mapping table, unchanged by 19a).
+func TestRematFusedLTCFoldClasses(t *testing.T) {
+	rng := rand.New(rand.NewSource(97))
+	cell := NewLTC(3, 4, nil, 3, rng)
+	x := autograd.Var(tensor.Uniform(rng, -1, 1, 2, 3))
+	exempt := map[*autograd.Variable]bool{x: true}
+	swept := append(append([]*autograd.Variable{}, cell.Parameters()...), x)
+	classes, consumed := classifyFoldClasses(cell, x, 0.1, swept, exempt)
+	names := []string{"gleak", "vleak", "cm", "mu", "sigma", "w", "sMu", "sSigma", "sW", "inW", "inB", "outW", "outB"}
+	for i, p := range cell.Parameters() {
+		if !consumed[p] {
+			t.Fatalf("parameter %s has no consumer in the fused step graph", names[i])
+		}
+		want := classStateRest
+		switch {
+		case i == 2: // cm rides the DFS descent
+			want = classSpine
+		case i >= 11: // outW, outB live on the output branch
+			want = classOutput
+		}
+		if classes[p] != want {
+			t.Fatalf("parameter %s: fold class %d, want %d (the 19a boundary must not change fold classes)", names[i], classes[p], want)
+		}
+	}
+	if classes[x] != classStateRest {
+		t.Fatalf("x: fold class %d, want state-rest", classes[x])
+	}
+}

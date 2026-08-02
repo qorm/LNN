@@ -21,7 +21,7 @@ PGO 是**按 main 包**应用的：画像要么是放在*你的* `package main` 
 
 ## 在本仓库上的实测
 
-环境：`go1.26.5 darwin/arm64`，Apple M4（10 核，16 GB），macOS 26.5.2（Darwin 25.5.0）。方法：从两个 `nn` 基准采集画像（`go test ./nn -run '^$' -bench 'BenchmarkLTCStep|BenchmarkUnrollBackward' -benchtime=2s -cpuprofile=…`），然后完整基准套件在 `-pgo` 开/关下交错 A/B/A/B 运行，每轮 `-count=3`（每格 n = 6），带 `-benchmem`——采集时为 17 个基准；阶段 18 新增 `BenchmarkCfCStep`，其行以*同一*画像、同一方法于事后补测。平均 ns/op（在融合后的树上实测；`tensor`/`autograd` 基线列与本表融合前版本在轮间噪声内一致，两个头条 `nn` 行为融合内核基线）：
+环境：`go1.26.5 darwin/arm64`，Apple M4（10 核，16 GB），macOS 26.5.2（Darwin 25.5.0）。方法：从两个 `nn` 基准采集画像（`go test ./nn -run '^$' -bench 'BenchmarkLTCStep|BenchmarkUnrollBackward' -benchtime=2s -cpuprofile=…`），然后完整基准套件在 `-pgo` 开/关下交错 A/B/A/B 运行，每轮 `-count=3`（每格 n = 6），带 `-benchmem`——采集时为 17 个基准；阶段 18 新增 `BenchmarkCfCStep`，其行以*同一*画像、同一方法于事后补测；阶段 19 又以同一画像、同一方法重测了整个 `nn` 区块（见表后注记）。平均 ns/op（在融合后的树上实测；`tensor`/`autograd` 基线列与本表融合前版本在轮间噪声内一致，两个头条 `nn` 行为融合内核基线）：
 
 | 基准 | 基线 | PGO | Δ ns/op | 分配 |
 |---|---:|---:|---:|---|
@@ -30,12 +30,12 @@ PGO 是**按 main 包**应用的：画像要么是放在*你的* `package main` 
 | autograd/ChainForwardBackward | 401,864 | 319,478 | **−20.5 %** | 不变 |
 | autograd/DivDenLoop | 297,555 | 273,970 | −7.9 % | 不变 |
 | autograd/GatherRowsBackward | 10,590 | 9,765 | −7.8 %（t = 1.1，在基线散布之内） | 不变 |
-| nn/UnrollPeakMemory512 | 69,342,589 | 64,999,033 | −6.3 % | 不变 |
-| nn/UnrollRematCfC | 1,869,180 | 1,755,819 | −6.1 %（t = 1.9，在散布之内） | 不变 |
-| nn/UnrollRemat | 3,447,318 | 3,241,136 | −6.0 % | 不变 |
-| nn/UnrollRematPeakMemory512 | 165,574,634 | 156,075,163 | −5.7 % | 不变 |
-| nn/LTCStep | 90,618 | 87,395 | −3.6 % | 不变 |
-| nn/UnrollBackward | 1,376,367 | 1,327,337 | −3.6 % | 不变 |
+| nn/UnrollPeakMemory512 | 71,538,152 | 72,870,686 | +1.9 %（在散布之内） | 不变 |
+| nn/UnrollRematCfC | 982,446 | 989,578 | +0.7 %（在散布之内） | 不变 |
+| nn/UnrollRemat | 3,756,529 | 3,509,063 | −6.6 % | 不变 |
+| nn/UnrollRematPeakMemory512 | 175,312,373 | 192,700,952 | +9.9 %（在散布之内，PGO 侧有一个离群点） | 不变 |
+| nn/LTCStep | 86,089 | 97,704 | +13.5 %（在散布之内，趋势偏劣——见下） | 不变 |
+| nn/UnrollBackward | 1,437,746 | 1,408,209 | −2.1 %（在散布之内） | 不变 |
 | tensor/MatMul64 | 76,079 | 74,341 | −2.3 % | 不变 |
 | tensor/MatMul128 | 647,442 | 636,798 | −1.6 % | 不变 |
 | tensor/SumCols | 7,378 | 7,313 | −0.9 % | 不变 |
@@ -44,7 +44,9 @@ PGO 是**按 main 包**应用的：画像要么是放在*你的* `package main` 
 | tensor/SumRows | 8,262 | 7,405 | −10.4 %（基线有一个离群点；中位数 7,642 → 7,411） | 不变 |
 | tensor/Transpose | 10,482 | 11,093 | +5.8 %（在轮间散布之内） | 不变 |
 
-五个大幅移动的基准的 Welch t 统计量（n = 6 对 6）：AddBroadcastRow 64.3、Hadamard 73.7、ChainForwardBackward 10.7、UnrollRemat 5.6、DivDenLoop 5.1——全部显著。LTCStep（2.1）与 UnrollBackward（2.9）处于边缘；GatherRowsBackward（1.1）、UnrollRematCfC（1.9）、MatMul 对（约 1.6）以及 SoftmaxRows/SumRows/SumCols/Transpose——外加阶段 18 的 CfCStep（−1.6，符号翻转）——的移动小于自身散布。
+五个大幅移动的基准的 Welch t 统计量（n = 6 对 6）：AddBroadcastRow 64.3、Hadamard 73.7、ChainForwardBackward 10.7、UnrollRemat 5.6、DivDenLoop 5.1——全部显著。在阶段 19 对 `nn` 区块的重测中，UnrollRemat 保持边缘显著的 −6.6%（t = 2.2），其余各项的移动都小于自身散布——包括 LTCStep（t = −1.8，趋势*变慢*）。
+
+**阶段 19 告诫：画像对 `nn` 各行已经陈旧。** 它采集于阶段 16 的树，此后阶段 19 重构了融合内核（感知路径内化、VJP 暂存复用）。这正是 Go FAQ 优雅退化承诺所覆盖的情形：多数 `nn` 行漂到 ≈ 0 而不是被误导——但 LTCStep 的趋势偏劣（在其散布之内），这就是热点代码改变形状后陈旧画像的代价。对想追 `nn` 各行的人，诚实的动作是在当前树上重新采集（`make pgo-profile`）；tensor/autograd 各行不受影响，因为画像所翻转的包装函数代码没有变过。
 
 ### 关键陷阱：一个双态的内联决策
 
@@ -55,7 +57,7 @@ tensor/ops.go:272:24: inlining call to broadcastBinary
 tensor/ops.go:272:24: inlining call to Add.func1
 ```
 
-每元素一次间接调用被消除：128×128 基准上是 16,384 次调用，31.0 µs → 9.4 µs（约 1.9 → 0.57 ns/元素）。热循环由包装函数算术构成的基准按比例受益：`ChainForwardBackward`（16 层 `Add(Hadamard(v, w), x)`）−20.5%、`DivDenLoop` −7.9%。`nn` 细胞基准的收益小于阶段 16 之前实测的 −7%：融合 LTC 内核（`nn/ltc_fused.go`）把 ODE 展开作为一个 `FusedOp` 节点执行，完全不再经过广播包装函数，因此只有步内未融合的残余部分受益（LTCStep/UnrollBackward −3.6%）；而 remat 一对基准——其重算扫描重建的是普通的逐步子图——保留了更大份额（−6%）。融合 CfC 步（阶段 18）把更多的步融进单节点，其 PGO 增量同样 ≈ 0（+1.9%，在散布之内）。
+每元素一次间接调用被消除：128×128 基准上是 16,384 次调用，31.0 µs → 9.4 µs（约 1.9 → 0.57 ns/元素）。热循环由包装函数算术构成的基准按比例受益：`ChainForwardBackward`（16 层 `Add(Hadamard(v, w), x)`）−20.5%、`DivDenLoop` −7.9%。`nn` 细胞基准的收益小于阶段 16 之前实测的 −7%：融合 LTC 内核（`nn/ltc_fused.go`）把 ODE 展开作为一个 `FusedOp` 节点执行，完全不再经过广播包装函数，因此只有步内未融合的残余部分受益（LTCStep/UnrollBackward −3.6%）；而 remat 一对基准——其重算扫描重建的是普通的逐步子图——保留了更大份额（−6%）。融合 CfC 步（阶段 18）把更多的步融进单节点，其 PGO 增量同样 ≈ 0（+1.9%，在散布之内）。阶段 19 把感知路径也内化了，每步余下的包装算术更少——而对阶段 16 采集的画像而言，重构后的内核已匹配不上其指引（LTCStep 在散布内偏慢；请重新采集，见上文告诫）。
 
 但这个决策是双态的。我们用*完全相同*的命令、相隔几分钟采集了三份画像，外加三者的合并（`go tool pprof -proto a b c`）：
 

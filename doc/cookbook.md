@@ -1699,8 +1699,8 @@ differences across machines matter?".
 
 **Scenario:** the sequence grows long enough that "the whole graph stays
 resident until `Backward`" becomes the memory wall — at T = 512 a full
-unroll pins ~11.5 MB of live graph where `UnrollRemat` retains ~0.65 MB
-(~18×; `BenchmarkUnrollPeakMemory512` /
+unroll pins ~8.3 MB of live graph where `UnrollRemat` retains ~0.65 MB
+(~13×; `BenchmarkUnrollPeakMemory512` /
 `BenchmarkUnrollRematPeakMemory512`, chunk 16, units 8, batch 16).
 `nn.UnrollRemat` differentiates `lossFn(ys)` through time with
 **bit-identical gradients** to `Unroll` + `loss.Backward()`, at
@@ -1912,7 +1912,7 @@ violation.
 
 | | `Unroll` + `loss.Backward()` | `UnrollRemat` |
 |---|---|---|
-| peak graph memory | O(T × per-step graph) — T = 512: ~11.5 MB live | O(chunkSize × per-step graph) + O(T) small tensors — T = 512, chunk 16: ~0.65 MB retained |
+| peak graph memory | O(T × per-step graph) — T = 512: ~8.3 MB live | O(chunkSize × per-step graph) + O(T) small tensors — T = 512, chunk 16: ~0.65 MB retained |
 | compute per iteration | 1 forward + 1 backward | CfC: 2 forwards + 1 backward; LTC: 3 forwards + 2 backwards (σ sweep); a non-ascending loss adds one affine pass for either cell |
 | gradients | the reference | bit-identical to the reference (both cells, above) |
 | loss shape | anything | ascending visit order is the fast path; adversarial orders force unit merges (worst case can exceed full unroll) |

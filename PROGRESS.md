@@ -25,7 +25,8 @@
 | 15 | 结构优化空间审计 + 业界算法调研（内外双线，只读分析） | ✅ 完成（综合机会地图已呈库主待决策） |
 | 16 | 机会地图三线落地：remat+Detach / LTC 融合算子 / PGO+SSM 定位（库主拍板全做） | ✅ 完成（v0.5.0 已发布：CI 双绿 + Release 注释化 + 代理解析） |
 | 17 | 后融合时代整体优化空间分析（只读，多路实测取证） | ✅ 完成（机会地图呈库主：CfC 融合居首；MatMul j 分块等四项实证否决） |
-| 18 | 保障先行再优化：差分 fuzz 常驻 + CI 双架构 → CfC 融合 | ✅ 完成（RT-F 有条件放行；CfCStep 2.36×/allocs −95%，逐位全绿） |
+| 18 | 保障先行再优化：差分 fuzz 常驻 + CI 双架构 → CfC 融合 | ✅ 完成（v0.5.2：CfCStep 2.36×/allocs −95%，逐位全绿；CI NaN 断言分级修复） |
+| 19 | 机会地图余项：LTC 感知入核 + VJP scratch 复用 + 引擎卫生批 | ✅ 完成（红队双放行；LTCStep 77 allocs/UnrollBackward 3,750，累计 −99%/−97%） |
 
 **阶段 15 双线调研综合结论（只读分析，待库主决策）**：
 
@@ -470,3 +471,11 @@ Git 历史：`87ccf77` 基线 → `08aba45` 阶段3a → `102af40` 阶段3b → 
 - 2026-08-02：**库主裁决「提交 + v0.5.1」**——提交 `b413797`（57 文件：18a 保障 + 18b 融合 + 18c 备案注 + 18d 文档）+ tag v0.5.1 + 推送
 - 2026-08-02：**CI 双架构首秀即红（v0.5.1，本地全绿）——双架构 matrix 首次接触即立功**：amd64 腿 `TestCfCFusedAdversarialFoldOverflow` 失败（arm64 腿绿）：溢出路径 Inf·0 **新产生** NaN 的符号位随架构/编译上下文（同机 amd64 上 legacy 图路径 0xffc00000 vs 融合核 0x7fc00000；NaN 位置集与全部有限值一致）——测试以 fusedDiffBits 严格断言 NaN 位模式，**超出文档契约（双 NaN 备案角）**，库代码零缺陷。修复照 v0.2.1 平台分级判例：新增 `fusedDiffBitsNaN`（NaN 位置集+有限值逐位严格、双 NaN 位豁免、鉴别力守门保留），两细胞溢出测试 4 调用点切换（LTC 侧同型隐患一并修——v0.5.0 amd64 两次过线纯属符号位侥幸吻合）；pitfalls 残余表行 1 双语补注「新产生 NaN 符号位」机制。**方法论教训（第三次同型）**：逐位断言永远不得超过文档化契约——契约豁免什么，断言就必须豁免什么；双架构 CI 的报名费一次就赚回
 - 2026-08-02：**v0.5.2 发布闭环**——修复提交 `3c7d575`（5 文件 +35/−6）+ tag v0.5.2 + 推送；**CI 双绿**（main 6m51s + tag 6m53s，双架构两腿均 success）；**GitHub Releases**：v0.5.2 注释化（含 v0.2.1→v0.2.2 同型诚实痕迹说明），v0.5.1 补发注释并标注被 v0.5.2 取代（tag 保留可用）；**代理解析**：goproxy.cn 实测 v0.5.2 可解析且 `@latest` 已指向 v0.5.2。阶段 17/18 全部关闭，累计 53 个 agent。项目终态：五包库 + 13 个版本标签（v0.1.0–v0.5.2）+ 两细胞全融合热路径（LTC 2.35×/CfC 2.36×）+ remat 分块 BPTT + 11 个 fuzz 门禁目标 + 双架构 CI + 24 篇双语指南
+- 2026-08-02：**阶段 19 启动**（库主令「继续」——机会地图余项，仍在「保障先行」框架内：18a 常驻差分 fuzz 门禁即天然验收闸）——19a 并行派发：**Agent-K**（resume P2/18b agent：LTC 感知路径并入融合核，84→~42 节点 @in4，LTCStep 残余 14.8% 解释开销为主要目标）+ **Agent-M**（微优化卫生批 C8 Backward DFS 容量复用 / C9 remat 分类缓存（保守评估，语义保全不可证则记档否决）/ C10 广播元数据快路径）；基准终值由主控在静机统一测量（防双 agent 计时互污）；19b（C5 VJP scratch 复用）待 K 落定后同文件续做
+- 2026-08-02：**19a/19b 收口，红队双放行 + 主控终测**：
+  - **19a K 感知入核**：父表 9→12（inputs/vleak/sMu/sSigma/sWm 入核），感知驱动/numConst/denS/denBase 全内化，**节点账 84→34/步**（优于 P2 预估 42；融合前 626）；hvN 槽位整体重推（inputs 子树同槽论证，RT-F 6 类定向拓扑攻击无反例）；remat fold 类不变常驻钉死
+  - **19a M 卫生批**：C10 广播新鲜形状定长数组化（外积/1D 提升臂 3→2 alloc/op，精确地板断言+逃逸链取证）；C8 Backward DFS scratch 池化（重入回退/panic 后 pristine/TopoOrder 结果恒新，五重安全论证）；**C9 分类缓存否决记档**（无健全缓存键，陈旧命中会静默跳过多类 panic——否决亦交付）+ 残余优化 lossTopo 共享
+  - **19b VJP scratch 复用**：18 个复用平面（交付面/复用面分界经 -gcflags=-m 编译器证据分离；copy-adopt 逐位等价含 −0 符号）——UnrollBackward allocs 再 −32.3%
+  - **19c 红队**：RT-F 放行（5000+400+300+1000 种子 0 REAL/0 Z0/0 SHAPE/0 LINES，序列化字节一致，scratch 复用对抗嵌套/panic/双 Backward 无污染面）；RT-S 放行（C8/C9/C10 机制论证全闭环、整树零弱化零 API 扩张、6 examples 逐字一致、纳米注释 2 处主控已修）
+  - **主控终测**（M4, -benchtime=200x, count=3 中位，对 v0.5.2）：**LTCStep 78.8µs/77 allocs（−10%/−67%）、UnrollBackward 1.24ms/3,750（−8%/−44%）、UnrollRemat 3.11ms/9,373（−41%）、UnrollRematCfC 0.81ms/4,829**；对最初循环累计 LTCStep allocs 7,360→77（−99%）、UnrollBackward 120,163→3,750（−97%）
+- 2026-08-02：**19d 文档收口（Agent-Y，双语 14 文件）**：README Numerics 全面刷新（累计 −99%/−97% 口径）；architecture 融合节 19 段 + 卫生批小节；pitfalls roadmap 阶段 19 行 + C9 否决专行；pgo.md 同画像补测 nn 六行（**LTCStep +13.5% 趋势偏劣——画像陈旧化诚实披露并建议重采**，留档为接受残余）；ltc.md 机制表 21 行号回源 + cfc.md 二代漂移连带修正（Lemma 1 重指核内行）；cookbook 内存数字 11.5→8.3MB（全展开 liveMB 因暂存复用再降）；零断链；节点账以 TestLTCFusedNodeAccount19a 为唯一真源

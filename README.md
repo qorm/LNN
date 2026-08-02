@@ -272,24 +272,27 @@ losses, event-driven time steps, and more) are in
   reduction's output shape.
 - **The graph is retained until `Backward`.** Every intermediate tensor is
   kept alive by the computation graph, so memory grows with the number of
-  ops. An LTC step's `unfolds` ODE iterations run as **one fused graph
-  node** (forward and gradients bit-identical to the former per-unfold
-  graph path), preceded by the same sparse presynaptic contraction — a
+  ops. An LTC step — sensory synapses and `unfolds` ODE iterations alike —
+  runs as **one fused graph node** (34 nodes per step at any dimensions;
+  forward and gradients bit-identical to the former graph path), built on
+  the same sparse presynaptic contraction — a
   `+0`-seeded fold ended by normalizing MatMuls, with no dense
   `[units², units]` indicator matrices anywhere (construction of a
   fully-wired `units = 1024` cell costs ~32 MB, not the ~8 GiB the
   earlier dense-indicator design required). Successive backward,
   allocation and fusion overhauls have brought the measured counts down
-  to `LTCStep` **236 allocs/op** (~87 µs) and `UnrollBackward`
-  **6,662** (~1.33 ms) on this machine (`-benchtime=200x`) — about
-  97%/94% below the original per-synapse loop, and ~2.1–2.3× faster
-  than the pre-fusion graph path. Keep `units`, `unfolds` and
+  to `LTCStep` **77 allocs/op** (~78 µs, 23 KB) and `UnrollBackward`
+  **3,750** (~1.29 ms, 558 KB) on this machine (`-benchtime=200x`) —
+  about 99%/97% below the original per-synapse loop, and −67%/−44%
+  allocations against v0.5.2 (stage 19 moved the sensory path into the
+  fused kernel, reuses the VJP's scratch planes, pools `Backward`'s DFS
+  scratch, and fixed-array broadcast shapes). Keep `units`, `unfolds` and
   sequence length modest on this engine; the `CfC` cell
   ([doc/cfc.md](doc/cfc.md)) has no `unfolds` factor at all and fuses
   its whole step into one node as well (52 allocs/op, ~34 µs), and for
   genuinely long sequences `nn.UnrollRemat` differentiates through time
   at O(chunk) peak graph memory instead of O(sequence) — T = 512
-  measured ~0.65 MB retained vs ~11.5 MB live for a full unroll
+  measured ~0.65 MB retained vs ~8.3 MB live for a full unroll
   (memory semantics and the worst case:
   [doc/architecture.md](doc/architecture.md),
   [doc/pitfalls.md](doc/pitfalls.md); a full recipe:
@@ -319,7 +322,7 @@ Honest maturity assessment as of this commit (coverage measured with
 |---|---|
 | `tensor` | Core is stable and well tested (~99.7% line coverage). The single residual uncovered statement is a double-constant fill-loop body in `broadcastBinary` that is argued unreachable (its column count is always `1` on that path, so the loop never executes, and the `[1,1]×[1,1]` case is intercepted by the same-shape fast path first); it is documented rather than padded with a contrived test. The transpose-aware MatMul kernels are exercised through the `autograd` package's tests. The v0.4.0 embedded shape backing removed one heap allocation per tensor construction (benchmark allocations −18~−26%, wall-clock neutral within noise). |
 | `autograd` | Stable and well tested (100% line coverage); gradients pass finite-difference and bitwise-differential checks across the covered paths, including the legacy-composition fallback branches for irregular manually seeded gradients and the Sigmoid–Hadamard fusion's regular and fallback paths. |
-| `nn` | Functional and well tested (~99.9% line coverage — the sole uncovered statement is a constructively unreachable nil-root firewall guard in `UnrollRemat`'s unit sweep, annotated in `nn/remat.go`; same disclosure discipline as the optimizer row): the LTC and CfC forward/backward paths are regression-tested, including closed-form degenerate-case checks, tiny/NaN `ts` guards, wiring validation, and Save/Load round-trips (a legitimate `units = 2048` stream round-trips at the load limit). Reversal potentials are fixed ±1 constants in both cells, carried by row-view constants over the sparse contraction — not trainable, and with no dead gradient (structurally impossible). The sparse contraction is regression-tested bitwise against the former indicator-matrix implementation, with a large-cell memory gate. Both cells' hot paths run as fused `FusedOp` nodes (the LTC's ODE unfolds; the CfC's whole closed-form step since stage 18), each regression-tested bitwise against its pre-fusion graph path across cell shapes, loss shapes, chained/stacked topologies and adversarial non-finite inputs, and gated by three bitwise differential fuzz targets (11 native fuzz targets total, CI gated on amd64 and arm64); `UnrollRemat`'s chunked BPTT is regression-tested bit-for-bit against whole-graph backward over a configuration × loss-shape differential matrix. CfC is the newer cell, and its API may still evolve. |
+| `nn` | Functional and well tested (~99.9% line coverage — the sole uncovered statement is a constructively unreachable nil-root firewall guard in `UnrollRemat`'s unit sweep, annotated in `nn/remat.go`; same disclosure discipline as the optimizer row): the LTC and CfC forward/backward paths are regression-tested, including closed-form degenerate-case checks, tiny/NaN `ts` guards, wiring validation, and Save/Load round-trips (a legitimate `units = 2048` stream round-trips at the load limit). Reversal potentials are fixed ±1 constants in both cells, carried by row-view constants over the sparse contraction — not trainable, and with no dead gradient (structurally impossible). The sparse contraction is regression-tested bitwise against the former indicator-matrix implementation, with a large-cell memory gate. Both cells' hot paths run as fused `FusedOp` nodes (the LTC's sensory drive and ODE unfolds — 34 nodes per step at any dimensions since stage 19a, with the VJP's scratch planes allocated once per backward; the CfC's whole closed-form step since stage 18), each regression-tested bitwise against its pre-fusion graph path across cell shapes, loss shapes, chained/stacked topologies and adversarial non-finite inputs, and gated by three bitwise differential fuzz targets (11 native fuzz targets total, CI gated on amd64 and arm64); `UnrollRemat`'s chunked BPTT is regression-tested bit-for-bit against whole-graph backward over a configuration × loss-shape differential matrix. CfC is the newer cell, and its API may still evolve. |
 | `optimizer` | Stable, ~99.6% line coverage (the sole uncovered statement is a physically unreachable parameter-count guard): the three update rules are verified against independent reference implementations (SGD bit-for-bit, Adam ~1.6e-6 vs a float64 reference), the pointer-keyed state semantics are regression-tested, and state persistence (`SaveState`/`LoadState`, `"LNO1"` streams) is pinned by bit-exact resume tests (50+50 vs 100 steps, all three optimizers) and hostile-stream tests (validate-all-then-apply with zero side effects, byte-budget gates). |
 | `serialize` | Stable, 97.8% line coverage: round-trip bit-exactness (NaN and −0 included) is regression-tested and byte-pinned by committed golden vectors; the hostile-stream contract — fixed limits validated before allocation (including the load-path `units`/`inDim` cap of 2048, sized for the sparse contraction's O(units²) load-time memory), progressive allocation on unknown-length readers — is pinned by allocation-count and byte-budget tests; and mutation fuzzing produced zero panics across thousands of mutants, plus a further round after the resource-exhaustion hardening. The resource bounds are documented in [doc/persistence.md](doc/persistence.md). |
 

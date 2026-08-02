@@ -1655,8 +1655,8 @@ vector）一节——跨平台的细微之处：格式布局在任何平台都�
 ## 13. 长序列训练：UnrollRemat 分块 BPTT
 
 **场景：** 序列长到「整图驻留至 `Backward`」成为内存之墙——T = 512 时
-全展开要钉住约 11.5 MB 的存活图，而 `UnrollRemat` 只保留约 0.65 MB
-（约 18×；`BenchmarkUnrollPeakMemory512` /
+全展开要钉住约 8.3 MB 的存活图，而 `UnrollRemat` 只保留约 0.65 MB
+（约 13×；`BenchmarkUnrollPeakMemory512` /
 `BenchmarkUnrollRematPeakMemory512`，chunk 16、units 8、batch 16 实测）。
 `nn.UnrollRemat` 对 `lossFn(ys)` 做贯穿时间的求导，梯度与
 `Unroll` + `loss.Backward()` **逐位一致**，峰值图内存为
@@ -1860,7 +1860,7 @@ bug）。闭合引用参数的正则项是合法的（损失只调用一次）�
 
 | | `Unroll` + `loss.Backward()` | `UnrollRemat` |
 |---|---|---|
-| 峰值图内存 | O(T × 逐步子图)——T = 512：驻留约 11.5 MB | O(chunkSize × 逐步子图) + O(T) 小张量——T = 512、chunk 16：保留约 0.65 MB |
+| 峰值图内存 | O(T × 逐步子图)——T = 512：驻留约 8.3 MB | O(chunkSize × 逐步子图) + O(T) 小张量——T = 512、chunk 16：保留约 0.65 MB |
 | 每次迭代算力 | 1 次前向 + 1 次反向 | CfC：2 前向 + 1 反向；LTC：3 前向 + 2 反向（σ 扫描）；非升序损失对两种细胞都再加一趟仿射补扫 |
 | 梯度 | 参照基准 | 与参照逐位一致（两种细胞，见上） |
 | 损失形状 | 任意 | 升序访问是快路径；对抗性访问序迫使单元合并（最坏可超全展开） |

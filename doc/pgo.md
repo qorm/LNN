@@ -57,7 +57,9 @@ benchmarks (`go test ./nn -run '^$' -bench 'BenchmarkLTCStep|BenchmarkUnrollBack
 with `-pgo` on and off, interleaved A/B/A/B, `-count=3` per pass (n = 6
 per cell), `-benchmem` — 17 benchmarks at collection time; stage 18
 added `BenchmarkCfCStep`, whose row was measured later against the
-*same* profile with the identical method. Mean ns/op (measured on the
+*same* profile with the identical method, and the whole `nn` block was
+re-measured again at stage 19 (same profile, same method; see the note
+below the table). Mean ns/op (measured on the
 post-fusion tree; the `tensor`/`autograd` baseline column agrees with
 this table's pre-fusion edition within run-to-run noise, and the two
 headline `nn` rows are the fused-kernel baselines):
@@ -69,12 +71,12 @@ headline `nn` rows are the fused-kernel baselines):
 | autograd/ChainForwardBackward | 401,864 | 319,478 | **−20.5 %** | unchanged |
 | autograd/DivDenLoop | 297,555 | 273,970 | −7.9 % | unchanged |
 | autograd/GatherRowsBackward | 10,590 | 9,765 | −7.8 % (t = 1.1, within baseline spread) | unchanged |
-| nn/UnrollPeakMemory512 | 69,342,589 | 64,999,033 | −6.3 % | unchanged |
-| nn/UnrollRematCfC | 1,869,180 | 1,755,819 | −6.1 % (t = 1.9, within spread) | unchanged |
-| nn/UnrollRemat | 3,447,318 | 3,241,136 | −6.0 % | unchanged |
-| nn/UnrollRematPeakMemory512 | 165,574,634 | 156,075,163 | −5.7 % | unchanged |
-| nn/LTCStep | 90,618 | 87,395 | −3.6 % | unchanged |
-| nn/UnrollBackward | 1,376,367 | 1,327,337 | −3.6 % | unchanged |
+| nn/UnrollPeakMemory512 | 71,538,152 | 72,870,686 | +1.9 % (within spread) | unchanged |
+| nn/UnrollRematCfC | 982,446 | 989,578 | +0.7 % (within spread) | unchanged |
+| nn/UnrollRemat | 3,756,529 | 3,509,063 | −6.6 % | unchanged |
+| nn/UnrollRematPeakMemory512 | 175,312,373 | 192,700,952 | +9.9 % (within spread, one PGO-side outlier) | unchanged |
+| nn/LTCStep | 86,089 | 97,704 | +13.5 % (within spread, trend adverse — see below) | unchanged |
+| nn/UnrollBackward | 1,437,746 | 1,408,209 | −2.1 % (within spread) | unchanged |
 | tensor/MatMul64 | 76,079 | 74,341 | −2.3 % | unchanged |
 | tensor/MatMul128 | 647,442 | 636,798 | −1.6 % | unchanged |
 | tensor/SumCols | 7,378 | 7,313 | −0.9 % | unchanged |
@@ -85,11 +87,21 @@ headline `nn` rows are the fused-kernel baselines):
 
 Welch t-statistics (n = 6 vs 6) for the five big movers:
 AddBroadcastRow 64.3, Hadamard 73.7, ChainForwardBackward 10.7,
-UnrollRemat 5.6, DivDenLoop 5.1 — all clearly significant. LTCStep
-(2.1) and UnrollBackward (2.9) are marginal; GatherRowsBackward (1.1),
-UnrollRematCfC (1.9), the MatMul pair (~1.6) and
-SoftmaxRows/SumRows/SumCols/Transpose — plus the stage-18 CfCStep
-(−1.6, sign-flipped) — move less than their own spread.
+UnrollRemat 5.6, DivDenLoop 5.1 — all clearly significant. In the
+stage-19 re-measurement of the `nn` block, UnrollRemat keeps a marginal
+−6.6 % (t = 2.2) and everything else moves less than its own spread —
+including LTCStep (t = −1.8, trending *slower*).
+
+**The stage-19 caveat: the profile is now stale for the `nn` rows.**
+It was collected on the stage-16 tree, before stage 19 restructured the
+fused kernel (sensory path internalized, VJP scratch reuse). That is
+exactly the situation the Go FAQ's graceful-degradation promise covers:
+most `nn` rows drift to ≈ 0 rather than misfiring — but LTCStep's
+trend is adverse (within its spread), which is what a stale profile
+costs when the hot code changes shape. The honest action for anyone
+chasing the `nn` rows is re-collection on the current tree
+(`make pgo-profile`); the tensor/autograd rows are unaffected, since
+the wrapper code the profile flips has not changed.
 
 ### The catch: one bistable inlining decision
 
@@ -118,7 +130,11 @@ of the step benefits (LTCStep/UnrollBackward −3.6 %), while the remat
 pair — whose recompute sweeps rebuild ordinary per-step graphs — keeps
 a larger share (−6 %). The fused CfC step (stage 18) fuses even more
 of the step into its single node, and its PGO delta is likewise ≈ 0
-(+1.9 %, within spread).
+(+1.9 %, within spread). Stage 19 internalized the sensory path too,
+leaving even less wrapper arithmetic per step — and against the
+stage-16-vintage profile the restructured kernel no longer matches the
+guidance (LTCStep trends slower within spread; re-collect, see the
+caveat above).
 
 But the decision is bistable. Three profiles were collected with the
 *identical* command minutes apart, plus a merge of all three

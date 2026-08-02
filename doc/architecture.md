@@ -356,6 +356,31 @@ allocation counts down ~89%/76%. The remat benchmarks shrink along
 (`UnrollRemat` ~3.3–3.6 ms, `UnrollRematCfC` ~1.9–2.2 ms), because
 their recompute sweeps run the same fused steps.
 
+Stage 19 moved the boundary outward twice. **19a internalized the
+sensory drive** and the `numConst`/`denBase` assemblies (~`10·inDim+2`
+further nodes per step, the largest remaining interpreter share): the
+parent list grows 9 → 12 (`inputs`, `vleak`, `sMu`, `sSigma`, `sWm`
+enter the kernel), the `hvN` delivery slot is *re-derived* rather than
+assumed — everything that used to append during `numConst`'s subtree
+expansion now appends during the `inputs` parent's expansion, at the
+same post-`hvN` position, so the three documented interleavings carry
+over mechanically — and a Step now records **34 nodes at any
+dimensions** (15 op nodes + 19 leaves; 84 before, 626 pre-fusion;
+pinned by `TestLTCFusedNodeAccount19a`). **19b allocates the VJP's
+scratch planes once per backward** and reuses them across unfolds and
+presynaptic rows (18 planes), with the delivery/reuse boundary stated
+explicitly: reused scratch is never handed to `addGrad`, while every
+delivered gradient buffer stays freshly allocated — `addGrad`'s
+first-contribution ownership transfer is part of the bitwise contract
+(the latest unfold's accumulator row is copy-adopted, −0 signs
+included). The remat fold classes are untouched (pinned by
+`TestRematFusedLTCFoldClasses`). Measured (`-benchtime=200x`):
+`LTCStep` ~87 µs / 236 → **~78 µs / 77 allocs / 23 KB**,
+`UnrollBackward` ~1.33 ms / 6,662 → **~1.29 ms / 3,750 / 558 KB**,
+`UnrollRemat` ~3.45 ms / 16,000 → **~3.4 ms / 9,373**,
+`UnrollRematCfC` ~0.83 ms / 5,000 → **~0.84 ms / 4,829** (the CfC was
+not touched this round — its numbers stand from stage 18).
+
 ### The fused CfC step — the whole step as one node (stage 18)
 
 Stage 18 applies the same recipe to the CfC (`nn/cfc_fused.go`), with
@@ -418,8 +443,8 @@ merely close. The full argument and the sweep structure are in
 
 Memory semantics: peak graph memory drops to O(chunkSize × per-step
 graph) plus O(T) small detached tensors (one `[batch, StateSize()]`
-tensor per step) — measured at T = 512: **~0.65 MB retained vs ~11.5 MB
-live** for the full unroll (~18×). The worst case is honest: a loss
+tensor per step) — measured at T = 512: **~0.65 MB retained vs ~8.3 MB
+live** for the full unroll (~13×). The worst case is honest: a loss
 visiting the outputs in an adversarial order (a descending visit with a
 small chunkSize is the extreme) forces recompute units to merge up to
 O(T) long, so peak memory returns to the full-unroll figure — paid on
@@ -434,7 +459,10 @@ value-dependent branch is the one case the probe cannot see and drifts
 ~1–2 ULP, archived in [pitfalls.md](pitfalls.md); and a loss closing
 over a step-consumed leaf must visit every loss-side consumer of it
 after the seeded outputs (spell penalties data-first:
-`Add(data, penalty)`). A runnable recipe with chunk-size guidance is
+`Add(data, penalty)`). A classification cache was considered and
+deliberately vetoed — no sound cache key exists, and a stale hit would
+silently skip a multi-class panic (the two loss-graph walks do share
+one `TopoOrder` computation). A runnable recipe with chunk-size guidance is
 [cookbook.md](cookbook.md#13-long-sequence-training-chunked-bptt-with-unrollremat).
 
 ### Non-leaf gradients are set to nil after each traversal — and why
@@ -448,6 +476,31 @@ graph give N times the single-pass leaf gradient. The supported pattern is
 still one `Backward` per freshly built graph; the linear rerun behavior is
 a defined safety net, not a feature to build on
 ([pitfalls.md](pitfalls.md)).
+
+### Stage-19 hygiene: pooled traversal scratch and fixed-array broadcast shapes
+
+Two internal allocation cuts landed alongside 19a/19b, both invisible to
+behavior (zero API or numeric change, gated by the differential suites):
+
+- **`Backward`'s DFS scratch is pooled.** The topological traversal's
+  visited set and topo buffer used to be allocated per call — and remat
+  runs several traversals per recompute unit. One shared pair is now
+  pooled between `Backward` and `TopoOrder`, so a plain `Backward`
+  allocates no traversal scratch at all (`UnrollBackward` B/op −5.1%
+  from this alone). The safety contract is stated in the code: a
+  *nested* `Backward`/`TopoOrder` during an outer traversal observes the
+  in-use flag and falls back to fresh scratch (the pre-pool behavior);
+  the release runs deferred, so a panicked traversal returns the pool
+  pristine; no graph node is kept alive by the scratch — only capacity
+  is retained. And `TopoOrder` never hands pooled storage to its
+  caller: its result slice is always freshly allocated.
+- **Broadcast shapes for the two fresh-shape arms are fixed arrays.**
+  `broadcastShapeFresh`'s outer-product and 1D-lift arms used to
+  allocate their result shape as a slice; they now return a value-type
+  `[2]int` that never reaches the heap — 3 → 2 allocs/op on those arms,
+  with exact floor assertions in `tensor/broadcast_shape_test.go`. The
+  shapes were already fresh copies on those arms, so nothing observable
+  moved.
 
 ### The graph is the memory model
 
@@ -465,11 +518,12 @@ see [persistence.md](persistence.md)). The phase-7 backward overhaul
 (above) halved the per-node allocation count, and the phase-8
 Sigmoid–Hadamard fusion took it further still, and the phase-10
 embedded shape backing (above) removed one more allocation per tensor
-construction. Measured now (stage 16, `-benchtime=200x`): `LTCStep`
-**236 allocs/op** and `UnrollBackward` **6,662** — cumulative **−97% and
-−94%** from the original per-synapse loop (7,360 / 120,163), the last
-step being the fused unfold kernel above (~2.1–2.3× wall clock against
-the pre-fusion graph path). The phase-9 step is an honest trade: allocs went
+construction. Measured now (stage 19, `-benchtime=200x`): `LTCStep`
+**77 allocs/op** and `UnrollBackward` **3,750** — cumulative **−99% and
+−97%** from the original per-synapse loop (7,360 / 120,163); the
+stage-16 fused unfold kernel was the big step (~2.1–2.3× wall clock
+against the pre-fusion graph path), stage 19 moved the sensory path
+into the kernel and cut allocations a further 67%/44%. The phase-9 step is an honest trade: allocs went
 *up* ~43%/~30% over the phase-8 values (2,306 / 31,983; the fold's
 per-stage cloning) but ns/op went *down* ~21%/~13% (independent
 red-team rerun), because the dense indicator MatMuls' O(units³) idle

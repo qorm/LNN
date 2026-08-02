@@ -41,42 +41,40 @@ paper's alternative form `dv/dt = −(1/tau + f(v, I))·v + f(v, I)·A`.
 | Paper concept | Code | Lines |
 |---|---|---|
 | ODE statement + integration scheme (doc) | `LTC` type comment | 15–29 |
-| Constructor, validation | `NewLTC` | 99–167 |
-| Parameter init ranges | `NewLTC` literal | 132–160 |
-| `eps` (denominator guard) = `1e-8` | `ltcEps` const; `eps` field init | 12–13; 133 |
-| Construction-time graph constants (folded masks, identity, +0 seed, reversal row views, synapse plans) | struct comments; `NewLTC` literal; `identityMat`; `erevRowViews`; `synapsePlan` | 50–86; 152–159; 184–190; 199–206; 208–264 |
-| Trainable parameter set (13 tensors) | `Parameters()` | 271–278 |
-| One RNN step | `Step` | 284–333 |
-| `ts` contract check (positive & finite) | `Step` guard | 289–291 |
-| Affine input map `inputs = x⊙inW + inB` | `Step` | 298 |
-| Softplus constraints on `cm, w, sW` (+`gleak`); mask folded into the weights once per Step | `Step` | 303–306 |
-| Sensory synaptic currents (once per step) | `synapses(inputs, sMu, sSigma, sWm, erevRowsS)` | 309 |
-| Step-invariant recurrent parameter rows, sliced once | `rows(c.mu/c.sigma/wM)` (helper `rows` at 369–375) | 313–315 |
-| Step-constant membrane terms (`eps` hoisted into `denBase`) | `numConst`, `denBase` | 320–321 |
-| ODE unfold loop (`unfolds` substeps) | `for t := 0; t < c.unfolds; t++` | 324–329 |
-| Recurrent currents (recomputed per substep) | `synapsesRows(v, muRs, sigRs, wmRs, erevRowsR)` | 325 |
-| `num = cm_t⊙v + gleak⊙vleak + Σ actⱼ·erevⱼ` | `num := …` | 327 |
-| `den = cm_t + gleak + Σ actⱼ (+ eps)` | `denBase` + `denR` | 321, 328 |
-| `v ← num / (den + eps)` | `v = autograd.Div(num, Add(denBase, denR))` | 328 |
-| Affine output map `out = v⊙outW + outB` | `Step` | 331 |
-| `cm_t = softplus(cm)·unfolds/ts` with overflow-safe scaling | `scaledCapacitance` | 349–362 |
-| Per-presynaptic activation block + sparse contraction | `synapses` / `synapsesRows` / `contract` | 394–407 / 412–426 / 490–509 |
+| Constructor, validation | `NewLTC` | 104–173 |
+| Parameter init ranges | `NewLTC` literal | 139–151 |
+| `eps` (denominator guard) = `1e-8` | `ltcEps` const; `eps` field init | 12–13; 138 |
+| Construction-time graph constants (folded masks, identity, +0 seed, reversal row views, synapse plans) | struct comments; `NewLTC` literal; `identityMat`; `erevRowViews`; `synapsePlan` | 41–89; 155–171; 189–202; 204–227; 229–270 |
+| Trainable parameter set (13 tensors) | `Parameters()` | 282–289 |
+| One RNN step | `Step` | 299–337 |
+| `ts` contract check (positive & finite) | `Step` guard | 304–306 |
+| Affine input map `inputs = x⊙inW + inB` | `Step` | 313 |
+| Softplus constraints on `cm, w, sW` (+`gleak`); mask folded into the weights once per Step | `Step` | 318–321 |
+| Sensory drive, `numConst`/`denBase` assemblies, recurrent currents and the ODE unfold loop (`num`/`den` update per substep) | **one fused node**: `fusedUnfolds` (`nn/ltc_fused.go`; forward + hand-written VJP, bit-identical) | 333 (call) |
+| Affine output map `out = v⊙outW + outB` | `Step` | 335 |
+| `cm_t = softplus(cm)·unfolds/ts` with overflow-safe scaling | `scaledCapacitance` | 353–366 |
+| Per-presynaptic activation block + sparse contraction — the **oracle**: the pre-fusion graph path, kept verbatim for the differential gates | `synapses` / `synapsesRows` / `contract` | 388–401 / 406–420 / 484–503 |
 
 ### Sparse contraction
 
-`synapses`/`synapsesRows` (`nn/ltc.go:394-426`) compute the currents per
+`synapses`/`synapsesRows` (`nn/ltc.go:388-420`) compute the currents per
 presynaptic neuron as one vector block each, instead of a per-synapse-pair
-loop. Row `i` of each parameter matrix still parameterizes the synapses
+loop. Since stage 16 these methods are the **oracle**, not the hot path:
+the production `Step` runs the fused kernel (`nn/ltc_fused.go`), and the
+graph path they build is kept verbatim for the differential gates that
+pin the kernel's bit-identity (`legacyLTCStep` in
+`nn/ltc_fused_diff_test.go`). Row `i` of each parameter matrix still
+parameterizes the synapses
 *from* neuron `i`:
 
 ```go
 // One [batch, units] activation block per presynaptic neuron i
-// (synapsesRows, nn/ltc.go:417-424):
+// (synapsesRows, nn/ltc.go:413-417):
 preCol := Col(pre, i)                              // [batch, 1]
 z := Hadamard(sigRs[i], Sub(preCol, muRs[i]))      // σᵢⱼ·(v_pre,i − μᵢⱼ)
 blocks[i] = SigmoidHadamard(z, wmRs[i])            // sigmoid(z) ⊙ wᵢⱼ·maskᵢⱼ, one fused node
 
-// contract (nn/ltc.go:490-509) reduces the presynaptic axis as a
+// contract (nn/ltc.go:484-503) reduces the presynaptic axis as a
 // +0-seeded fold, ended by a MatMul against the units×units identity
 // `ident` (a value-preserving copy forward, a normalizing zero-skip
 // backward):
@@ -88,12 +86,17 @@ num = MatMul(fold(+0; b₀⊙erev₀, b₁⊙erev₁, …), ident)
 Two structural changes relative to the original per-synapse loop date
 from phase 6 and remain: **mask out of the hot path** — the wiring masks
 fold into the positivity-constrained weights with one matrix Hadamard
-per Step, `wm = softplus(w)⊙mask` (`nn/ltc.go:305-306`), instead of one
-masked multiply per synapse per substep; and **recurrent rows sliced
-once per Step** — `mu`, `sigma` and the masked weight matrix are
-Step-invariant, and `rows` (`nn/ltc.go:369-375`) slices them once for
-the unfold loop to reuse, keeping `units·(unfolds−1)` `SliceRow` nodes
-per matrix out of the graph.
+per Step, `wm = softplus(w)⊙mask` (`nn/ltc.go:320-321`), instead of one
+masked multiply per synapse per substep; and **no per-Step row slicing
+at all** — the phase-6 `rows` helper that sliced the Step-invariant
+recurrent rows once for the unfold loop is gone, because the fused
+kernel freezes the parameter matrices in its stash once per Step
+(`mu`/`sigma`/`sMu`/`sSigma` copies), eliminating the `SliceRow` nodes
+entirely. The per-Step node account tells the story: **626** graph
+nodes pre-fusion (at `inDim=4, units=16, unfolds=4`), **84** with the
+stage-16 fused unfold kernel, **34 at any dimensions** since stage 19a
+internalized the sensory path (15 op nodes + 19 leaves; pinned by
+`TestLTCFusedNodeAccount19a`).
 
 The third change — the one this section is named for — is phase 9's.
 The presynaptic-axis reduction used to run as MatMuls against dense
@@ -117,7 +120,7 @@ metadata in all, O(units²) total — and **no Step ever materializes a
 (red-team re-verification agrees: 36.4/32.4 MiB; the gate is pinned by
 `TestLTCSparseContractionLargeCellMemoryGate`).
 
-**Term-table semantics.** `synapsePlan` (`nn/ltc.go:208-264`) records,
+**Term-table semantics.** `synapsePlan` (`nn/ltc.go:229-270`) records,
 per postsynaptic neuron `j`, the ascending presynaptic indices `i` with
 `mask[i, j] == 1` — exactly the (i, coefficient) term list the
 contraction sums (the numerator's coefficient of term (i, j) is
@@ -134,7 +137,7 @@ wired terms, bit for bit.
 **Bit-equivalence: four constraints.** The reduction is bit-identical
 to the indicator MatMul it replaces — forward AND backward — because it
 replicates that MatMul's four defining behaviors exactly (`contract`'s
-doc comment, `nn/ltc.go:428-509`, carries the full proof; the red team
+doc comment, `nn/ltc.go:422-503`, carries the full proof; the red team
 verified the four constraints are true in code, not only in comments):
 
 1. **Ascending presynaptic order.** MatMul column `j` accumulates its
@@ -168,7 +171,7 @@ spans and states, plus 12 backward zero-skip adversarial corners) ran
 with **zero differences**, and an independent red-team rerun (522
 deliberately heterogeneously distributed configurations: forward + all
 13 parameters + leaf gradients bitwise identical) corroborates. The
-CfC's contract is line-for-line isomorphic (`nn/cfc.go:307-323`).
+CfC's contract is line-for-line isomorphic (`nn/cfc.go:321-337`).
 
 **Equivalence is ULP-level at the Step level — not bitwise.** In
 isolation, the sparse drive is bit-for-bit identical to the original
@@ -218,14 +221,16 @@ randomized configurations — measures a maximum difference of
 ULP-level, benign, but not "bitwise".
 
 **Measured cost.** Current values (this machine, `-benchtime=200x`,
-re-verified): `LTCStep` **236 allocs/op** and `UnrollBackward`
-**6,662 allocs/op** — cumulative **−97%/−94%** from the original
+re-verified): `LTCStep` **77 allocs/op** and `UnrollBackward`
+**3,750 allocs/op** — cumulative **−99%/−97%** from the original
 per-synapse loop (7,360 / 120,163; the phase-6 vectorization took it
 to 3,440 / 68,688, the phase-7 backward overhaul to 33,963 on the
 backward, the phase-8 Sigmoid–Hadamard fusion to 2,306 / 31,983, the
 phase-10 embedded shape backing to 2,707 / 31,994 — a further
-−18%/−23% of allocations with wall-clock flat — and the stage-16
-fused unfold kernel to the current values,
+−18%/−23% of allocations with wall-clock flat — the stage-16
+fused unfold kernel to 236 / 6,662, and stage 19 (sensory path into
+the kernel, VJP scratch reuse, pooled DFS scratch, fixed-array
+broadcast shapes) to the current values,
 [architecture.md](architecture.md)). One honest disclosure for the
 phase-9 step: the sparse contraction **raised** allocs ~43%/~30% over
 phase 8 (the per-stage fold cloning) — the expectation "neutral or
@@ -261,7 +266,7 @@ v_{k+1}  =  ──────────────────────�
 ```
 
 and the code computes `v ← num / (den + eps)` elementwise
-(`nn/ltc.go:327-328`), with `cm/dt = softplus(cm)·unfolds/ts` built by
+(inside the fused kernel, `nn/ltc_fused.go`), with `cm/dt = softplus(cm)·unfolds/ts` built by
 `scaledCapacitance`. All quantities are per-unit vectors, so every
 operation is elementwise or a broadcast; the degenerate case (all wiring
 masks zero) reduces exactly to a leaky integrator
@@ -297,7 +302,7 @@ optimizer-side clipping.
 | `sErev` | `[inDim, units]` | random ±1 | **fixed — not trainable** | sensory reversal potentials |
 
 `Parameters()` returns the 13 trainable tensors; `erev`/`sErev` are
-deliberately absent (`nn/ltc.go:271-278`). Learning the reversal potentials
+deliberately absent (`nn/ltc.go:282-289`). Learning the reversal potentials
 would let synapses flip between excitatory and inhibitory polarity,
 degrading the LTC into an ordinary plastic network — the ±1 sign pattern
 is structural, drawn once at construction.
@@ -316,7 +321,7 @@ small `ts` barely advances the membranes, large `ts` relaxes them toward
 steady state. It corresponds to ncps's `elapsed_time`.
 
 **Contract: `ts` must be positive and finite.** `NaN`, `+Inf`, `-Inf`,
-zero and negative values panic (`nn/ltc.go:289-291`):
+zero and negative values panic (`nn/ltc.go:304-306`):
 
 ```go
 _, _ = cell.Step(x, nil, 0.01)  // fine: fast dynamics
@@ -326,7 +331,7 @@ cell.Step(x, nil, math.NaN())   // panics
 ```
 
 Finiteness domains of the implementation (`scaledCapacitance`,
-`nn/ltc.go:349-362`):
+`nn/ltc.go:353-366`):
 
 | `ts` range | behavior |
 |---|---|
@@ -375,7 +380,7 @@ ys, hN := nn.Unroll(cell, []*autograd.Variable{x, x, x}, nil, 0.1)
 | ncps concept | LNN counterpart |
 |---|---|
 | LTC layer with `units`, `unfolds` (default 6) | `NewLTC(inDim, units, wiring, unfolds, rng)` |
-| ODE solver: semi-implicit Euler over `unfolds` substeps | identical scheme (`Step` loop, `nn/ltc.go:324-329`) |
+| ODE solver: semi-implicit Euler over `unfolds` substeps | identical scheme (fused into one graph node, `nn/ltc_fused.go`) |
 | `implicit_param_constraints` (softplus positivity) | softplus on `cm`, `gleak`, `w`, `sW` |
 | parameter init ranges | adopted verbatim (table above) |
 | fixed ±1 reversal potentials from wiring | `erev`/`sErev`, not in `Parameters()` |

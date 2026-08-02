@@ -927,3 +927,247 @@ func TestLTCFusedAdversarialFoldOverflow(t *testing.T) {
 	want := fusedLeafGrads(cell, extra)
 	fusedCmpGrads(t, got, want)
 }
+
+// fusedCmpGradsNaNExempt compares two gradient snapshots with the
+// documented double-NaN payload corner exempted (both NaN passes; the
+// NaN position set and every finite value must agree exactly) — the
+// 19a sensory-hostile cases need it where the fusedCmpGrads strictness
+// would over-assert on created-NaN payloads (see v0.5.2's tiering).
+func fusedCmpGradsNaNExempt(t *testing.T, a, b map[string][]uint32) {
+	t.Helper()
+	if len(a) != len(b) {
+		t.Fatalf("gradient key count %d vs %d", len(a), len(b))
+	}
+	for name, ga := range a {
+		gb, ok := b[name]
+		if !ok {
+			t.Fatalf("missing gradient %q", name)
+		}
+		if (ga == nil) != (gb == nil) {
+			t.Fatalf("%s: nil-ness differs (%v vs %v)", name, ga == nil, gb == nil)
+		}
+		fuzzCmpBitsNaN(t, "grad "+name, ga, gb)
+	}
+}
+
+// TestLTCFusedSensoryAdversarialNonFinite drives the sensory side of the
+// 19a boundary through hostile payloads: NaN/Inf entries in the sensory
+// parameters (sMu/sSigma/sW) and in x, with finite and hostile seeds.
+// Forward and every leaf gradient must match the legacy graph path bit
+// for bit, modulo the documented double-NaN payload corner.
+func TestLTCFusedSensoryAdversarialNonFinite(t *testing.T) {
+	rng := rand.New(rand.NewSource(2600))
+	cell := NewLTC(3, 4, RandomSparse(3, 4, 0.8, 0.8, rng), 3, rng)
+	x := autograd.Var(tensor.Uniform(rng, -1, 1, 2, 3))
+	h := autograd.Var(tensor.Uniform(rng, -1, 1, 2, 4))
+	extra := map[string]*autograd.Variable{"x": x, "h": h}
+
+	// Hostile-lace the sensory parameters and the input (both paths see
+	// identical values; the rewrite happens before any Step).
+	params := cell.Parameters()
+	fuzzFillHostile(rng, params[6].Data.Data, 1.0/4) // sMu
+	fuzzFillHostile(rng, params[7].Data.Data, 1.0/4) // sSigma
+	fuzzFillHostile(rng, params[8].Data.Data, 1.0/4) // sW
+	fuzzFillHostile(rng, x.Data.Data, 1.0/4)
+
+	so := tensor.Uniform(rng, -1, 1, 2, 4)
+	sv := tensor.Uniform(rng, -1, 1, 2, 4)
+	fuzzFillHostile(rng, sv.Data, 0.2)
+	run := func(step func(x, h *autograd.Variable, ts float64) (out, v *autograd.Variable)) (map[string][]uint32, []uint32, []uint32) {
+		fusedZeroAll(cell, extra)
+		out, v := step(x, h, 0.1)
+		autograd.Add(
+			autograd.SumAll(autograd.Hadamard(out, autograd.Const(so))),
+			autograd.SumAll(autograd.Hadamard(v, autograd.Const(sv)))).Backward()
+		return fusedLeafGrads(cell, extra), dataBits(out.Data), dataBits(v.Data)
+	}
+	gradsF, outF, hF := run(cell.Step)
+	gradsL, outL, hL := run(boundLegacy(cell))
+	fuzzCmpBitsNaN(t, "fwd out", outF, outL)
+	fuzzCmpBitsNaN(t, "fwd state", hF, hL)
+	fusedCmpGradsNaNExempt(t, gradsF, gradsL)
+}
+
+// TestLTCFusedSensoryFoldOverflow loads absurd sensory weights so the
+// sensory activation blocks overflow the fold to +Inf: the normalizing
+// identity MatMul's av*0 terms then spread NaN across the row (Inf*0),
+// in BOTH the legacy graph path and the fused kernel's literal MatMul
+// fallback (normFoldIdentity's non-finite arm, now on the internalized
+// sensory folds). The forward comparison uses the tiered comparator
+// (created-NaN signs are compile-context dependent — v0.5.2); gradients
+// compare with the double-NaN exemption.
+func TestLTCFusedSensoryFoldOverflow(t *testing.T) {
+	rng := rand.New(rand.NewSource(2620))
+	cell := NewLTC(2, 3, nil, 2, rng)
+	for i := range cell.sSigma.Data.Data {
+		cell.sSigma.Data.Data[i] = 1e37 // saturate: sigmoid hits exactly 1
+	}
+	for i := range cell.sMu.Data.Data {
+		cell.sMu.Data.Data[i] = -1e37 // ... for every sensory synapse
+	}
+	for i := range cell.sW.Data.Data {
+		cell.sW.Data.Data[i] = 2e38 // softplus(x) = x for x > 20; two terms overflow the fold
+	}
+	x := autograd.Var(tensor.Uniform(rng, -1, 1, 2, 2))
+	h := autograd.Var(tensor.Uniform(rng, -1, 1, 2, 3))
+	extra := map[string]*autograd.Variable{"x": x, "h": h}
+
+	outF, hF := cell.Step(x, h, 0.1)
+	outL, hL := legacyLTCStep(cell, x, h, 0.1)
+	fusedDiffBitsNaN(t, "sensory-overflow out", outF.Data, outL.Data)
+	fusedDiffBitsNaN(t, "sensory-overflow state", hF.Data, hL.Data)
+	anyNaN := false
+	for _, val := range hF.Data.Data {
+		if math.IsNaN(float64(val)) {
+			anyNaN = true
+		}
+	}
+	if !anyNaN {
+		t.Fatalf("expected the overflowed sensory fold to NaN the state, got %v", hF.Data.Data)
+	}
+
+	run := func(step func(x, h *autograd.Variable, ts float64) (out, v *autograd.Variable)) {
+		fusedZeroAll(cell, extra)
+		out, v := step(x, h, 0.1)
+		autograd.Add(autograd.SumAll(out), autograd.SumAll(v)).Backward()
+	}
+	run(cell.Step)
+	got := fusedLeafGrads(cell, extra)
+	run(boundLegacy(cell))
+	want := fusedLeafGrads(cell, extra)
+	fusedCmpGradsNaNExempt(t, got, want)
+}
+
+// TestLTCFusedMidFlightSensoryMutation mutates parameters and the input
+// between the forward and the backward: sMu (frozen by the graph's
+// SliceRow nodes, and by the kernel's forward copies) and x (already
+// consumed by the graph-level input affine at forward) must keep the
+// forward-time values in BOTH paths, while vleak (read live by the
+// graph's Hadamard backward, and by the kernel's numConst replay) must
+// show the mutated value in BOTH paths.
+func TestLTCFusedMidFlightSensoryMutation(t *testing.T) {
+	rng := rand.New(rand.NewSource(2630))
+	cell := NewLTC(3, 4, nil, 3, rng)
+	x := autograd.Var(tensor.Uniform(rng, -1, 1, 2, 3))
+	h := autograd.Var(tensor.Uniform(rng, -1, 1, 2, 4))
+	extra := map[string]*autograd.Variable{"x": x, "h": h}
+	so := tensor.Uniform(rng, -1, 1, 2, 4)
+
+	run := func(step func(x, h *autograd.Variable, ts float64) (out, v *autograd.Variable), mutate func()) map[string][]uint32 {
+		fusedZeroAll(cell, extra)
+		out, v := step(x, h, 0.1)
+		mutate()
+		autograd.Add(
+			autograd.SumAll(autograd.Hadamard(out, autograd.Const(so))),
+			autograd.SumAll(autograd.Hadamard(v, autograd.Const(so)))).Backward()
+		return fusedLeafGrads(cell, extra)
+	}
+	noop := func() {}
+	mutSMu := func() {
+		for i := range cell.sMu.Data.Data {
+			cell.sMu.Data.Data[i] = 50 + float32(i)
+		}
+	}
+	mutX := func() {
+		for i := range x.Data.Data {
+			x.Data.Data[i] = -25 - float32(i)
+		}
+	}
+	mutVleak := func() {
+		for i := range cell.vleak.Data.Data {
+			cell.vleak.Data.Data[i] = -7 - float32(i)
+		}
+	}
+	sMuSave := append([]float32(nil), cell.sMu.Data.Data...)
+	xSave := append([]float32(nil), x.Data.Data...)
+	vleakSave := append([]float32(nil), cell.vleak.Data.Data...)
+	restore := func() {
+		copy(cell.sMu.Data.Data, sMuSave)
+		copy(x.Data.Data, xSave)
+		copy(cell.vleak.Data.Data, vleakSave)
+	}
+
+	baseF := run(cell.Step, noop)
+	baseL := run(boundLegacy(cell), noop)
+	fusedCmpGrads(t, baseF, baseL)
+
+	// Frozen leaves: the mid-flight sMu mutation changes nothing in
+	// either path (the graph froze sMu in per-Step SliceRow nodes; the
+	// kernel froze its forward copies).
+	mutF := run(cell.Step, mutSMu)
+	restore()
+	mutL := run(boundLegacy(cell), mutSMu)
+	restore()
+	fusedCmpGrads(t, mutF, mutL)
+	fusedCmpGrads(t, mutF, baseF)
+
+	// Live reads: x is read live by the graph-level input affine's
+	// Hadamard backward (inW's gradient is g⊙x — the sensory drive's
+	// own values stay frozen in the forward-computed inputs), and vleak
+	// is read live by the graph's glvHad backward and the kernel's
+	// numConst replay. Both must move the affected leaf's gradient
+	// IDENTICALLY in both paths.
+	mutF = run(cell.Step, mutX)
+	restore()
+	mutL = run(boundLegacy(cell), mutX)
+	restore()
+	fusedCmpGrads(t, mutF, mutL)
+	if fmt.Sprint(mutF["inW"]) == fmt.Sprint(baseF["inW"]) {
+		t.Fatal("the mid-flight x mutation moved no inW gradient: the affine's live-read contract is not exercised")
+	}
+
+	liveF := run(cell.Step, mutVleak)
+	restore()
+	liveL := run(boundLegacy(cell), mutVleak)
+	restore()
+	fusedCmpGrads(t, liveF, liveL)
+	if fmt.Sprint(liveF["gleak"]) == fmt.Sprint(baseF["gleak"]) {
+		t.Fatal("the mid-flight vleak mutation moved no gleak gradient: the live-read contract is not exercised")
+	}
+}
+
+// TestLTCFusedNodeAccount19a pins the stage-19a structural win: with the
+// sensory path inside the kernel, a fused LTC Step records 15 op nodes +
+// 19 leaves = 34 graph nodes at any dims (against 84 at inDim=4/units=16
+// before 19a, and 626 pre-fusion), with cmT the fused node's FIRST
+// parent (the spine-class invariant) and hvN the SECOND (the delivery
+// slot).
+func TestLTCFusedNodeAccount19a(t *testing.T) {
+	for _, dims := range [][3]int{{4, 16, 4}, {1, 8, 4}, {2, 3, 2}, {1, 1, 1}, {3, 1, 4}, {2, 32, 6}} {
+		inDim, units, unfolds := dims[0], dims[1], dims[2]
+		rng := rand.New(rand.NewSource(3))
+		cell := NewLTC(inDim, units, nil, unfolds, rng)
+		x := autograd.Var(tensor.Uniform(rng, -1, 1, 5, inDim))
+		h := autograd.Var(tensor.Uniform(rng, -1, 1, 5, units))
+		out, v := cell.Step(x, h, 0.1)
+		seen := make(map[*autograd.Variable]bool)
+		ops, leaves := 0, 0
+		for _, root := range []*autograd.Variable{out, v} {
+			for _, node := range autograd.TopoOrder(root) {
+				if seen[node] {
+					continue
+				}
+				seen[node] = true
+				if len(node.Parents()) == 0 {
+					leaves++
+				} else {
+					ops++
+				}
+			}
+		}
+		if ops != 15 || leaves != 19 {
+			t.Fatalf("in=%d u=%d uf=%d: fused step graph = %d ops + %d leaves, want 15 + 19", inDim, units, unfolds, ops, leaves)
+		}
+		fused := v
+		if len(fused.Parents()) != 12 {
+			t.Fatalf("in=%d u=%d: fused node has %d parents, want 12", inDim, units, len(fused.Parents()))
+		}
+		cmT := fused.Parents()[0]
+		if fused.Parents()[1] != h {
+			t.Fatalf("in=%d u=%d: fused node's second parent is not h", inDim, units)
+		}
+		if len(cmT.Parents()) == 0 {
+			t.Fatalf("in=%d u=%d: first parent is a leaf, expected the cmT chain", inDim, units)
+		}
+	}
+}

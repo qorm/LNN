@@ -320,20 +320,17 @@ func (c *LTC) Step(x, h *autograd.Variable, ts float64) (out, hNew *autograd.Var
 	sWm := autograd.Hadamard(autograd.Softplus(c.sW), c.maskS) // [inDim, units]
 	wM := autograd.Hadamard(autograd.Softplus(c.w), c.maskR)   // [units, units]
 
-	// Sensory (input) synapses are loop-invariant over the ODE unfolds.
-	numS, denS := c.synapses(inputs, c.sMu, c.sSigma, sWm, c.erevRowsS)
-
-	// Membrane-update numerator terms that stay constant across the unfolds.
-	numConst := autograd.Add(autograd.Hadamard(gleak, c.vleak), numS)
-
-	// The ODE unfolds run as one fused kernel (nn/ltc_fused.go): a single
-	// graph node whose forward replays the per-unfold synapse blocks,
-	// contraction folds and membrane update (the denBase chain
-	// ((cmT + gleak) + denS) + eps included) with identical rounding
-	// boundaries, and whose hand-written VJP replays the former subgraph's
-	// backward accumulation order contribution for contribution. The
-	// node count per Step drops from O(unfolds × units) to O(1).
-	v := c.fusedUnfolds(cmT, h, numConst, gleak, denS, wM)
+	// The sensory synapses and the ODE unfolds run as one fused kernel
+	// (nn/ltc_fused.go): a single graph node whose forward replays the
+	// sensory drive, the numConst/denBase assemblies, the per-unfold
+	// synapse blocks, contraction folds and membrane update with identical
+	// rounding boundaries, and whose hand-written VJP replays the former
+	// subgraph's backward accumulation order contribution for
+	// contribution. The node count per Step drops from O(unfolds × units
+	// + inDim) to O(1). synapses/synapsesRows/contract below remain as
+	// the fused kernel's white-box oracle (the pre-fusion graph path,
+	// reassembled verbatim by legacyLTCStep in nn/ltc_fused_diff_test.go).
+	v := c.fusedUnfolds(cmT, h, inputs, gleak, sWm, wM)
 
 	out = autograd.Add(autograd.Hadamard(v, c.outW), c.outB)
 	return out, v
@@ -381,9 +378,12 @@ func (c *LTC) scaledCapacitance(ts float64) *autograd.Variable {
 //	den[:, j] = Σ_i block_i[:, j]
 //	num[:, j] = Σ_i block_i[:, j] · erev[i, j]
 //
-// with erevRows carrying the (fixed) reversal rows. The sensory path is
-// its only caller (the recurrent path runs inside the fused unfold kernel,
-// nn/ltc_fused.go); synapsesRows factors the per-presynaptic block build
+// with erevRows carrying the (fixed) reversal rows. Since stage 19a the
+// whole sensory path runs inside the fused kernel (nn/ltc_fused.go) and
+// this method's only remaining callers are test oracles (legacyLTCStep
+// in nn/ltc_fused_diff_test.go, legacySynapses' counterpart in
+// nn/ltc_fused_test.go, and the contraction oracle tests in
+// nn/ltc_test.go); synapsesRows factors the per-presynaptic block build
 // out of the row slicing.
 func (c *LTC) synapses(
 	pre, mu, sigma, wm *autograd.Variable, erevRows []*autograd.Variable,
@@ -402,7 +402,7 @@ func (c *LTC) synapses(
 
 // synapsesRows builds one activation block per presynaptic neuron from the
 // pre-sliced parameter rows, then the sparse contraction of contract. It
-// serves the sensory path (the recurrent blocks live in the fused kernel).
+// It serves the oracle paths only (both drives live in the fused kernel).
 func (c *LTC) synapsesRows(
 	pre *autograd.Variable,
 	muRs, sigRs, wmRs []*autograd.Variable,
