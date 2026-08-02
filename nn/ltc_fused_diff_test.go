@@ -78,6 +78,33 @@ func fusedDiffBits(t *testing.T, name string, got, want *tensor.Tensor) {
 	}
 }
 
+// fusedDiffBitsNaN is fusedDiffBits with the documented NaN acceptance
+// level: a position where both sides are NaN passes with any payload or
+// sign (NaNs CREATED by the overflow paths — Inf*0 — carry an
+// architecture- and compile-context-dependent sign, and the double-NaN
+// payload corner is documented in nn/ltc_fused.go). The NaN position set
+// and every finite value must still agree bit for bit.
+func fusedDiffBitsNaN(t *testing.T, name string, got, want *tensor.Tensor) {
+	t.Helper()
+	if got == nil || want == nil {
+		t.Fatalf("%s: nil tensor (got %v, want %v)", name, got == nil, want == nil)
+	}
+	if !tensor.SameShape(got, want) {
+		t.Fatalf("%s: shape drift: got %v, want %v", name, got.Shape, want.Shape)
+	}
+	for k := range got.Data {
+		gb, wb := math.Float32bits(got.Data[k]), math.Float32bits(want.Data[k])
+		if gb == wb {
+			continue
+		}
+		if fuzzIsNaNBits(gb) && fuzzIsNaNBits(wb) {
+			continue
+		}
+		t.Fatalf("%s: element %d: got %v (bits %#x), want %v (bits %#x)",
+			name, k, got.Data[k], gb, want.Data[k], wb)
+	}
+}
+
 // ltcDiffCase is one fused-vs-legacy configuration.
 type ltcDiffCase struct {
 	name           string
@@ -877,8 +904,8 @@ func TestLTCFusedAdversarialFoldOverflow(t *testing.T) {
 
 	outF, hF := cell.Step(x, h, 0.1)
 	outL, hL := legacyLTCStep(cell, x, h, 0.1)
-	fusedDiffBits(t, "overflow out", outF.Data, outL.Data)
-	fusedDiffBits(t, "overflow state", hF.Data, hL.Data)
+	fusedDiffBitsNaN(t, "overflow out", outF.Data, outL.Data)
+	fusedDiffBitsNaN(t, "overflow state", hF.Data, hL.Data)
 	anyNaN := false
 	for _, val := range hF.Data.Data {
 		if math.IsNaN(float64(val)) {

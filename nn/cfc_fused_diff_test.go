@@ -528,8 +528,8 @@ func TestCfCFusedAdversarialFoldOverflow(t *testing.T) {
 
 	outF, hF := cell.Step(x, h, 0.1)
 	outL, hL := legacyCfCStep(cell, x, h, 0.1)
-	fusedDiffBits(t, "overflow out", outF.Data, outL.Data)
-	fusedDiffBits(t, "overflow state", hF.Data, hL.Data)
+	fusedDiffBitsNaN(t, "overflow out", outF.Data, outL.Data)
+	fusedDiffBitsNaN(t, "overflow state", hF.Data, hL.Data)
 	anyNaN := false
 	for _, val := range hF.Data.Data {
 		if math.IsNaN(float64(val)) {
