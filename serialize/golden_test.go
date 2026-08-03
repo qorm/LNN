@@ -1,16 +1,27 @@
-// Golden-vector regression for the frozen v1 wire format (see "Format
+// Golden-vector regression for the frozen wire formats (see "Format
 // versioning" in the package doc of serialize.go).
 //
 // This file lives in the external test package (serialize_test) on purpose:
 // the golden streams are nn model streams, so pinning them requires nn's
 // Save/Load — which serialize itself must never import. testdata/ holds the
-// committed artifacts:
+// committed artifacts, in two independent families:
 //
-//	golden_v1_ltc.lnns            SaveLTC output
-//	golden_v1_cfc.lnns            SaveCfC output
-//	golden_v1_linear.lnns         SaveLinear output
-//	golden_v1_<kind>.expected.txt the exact Step/Forward outputs each loaded
-//	                              cell must reproduce, as float32 bit patterns
+//	golden_v1_ltc.lnns            SaveLTC output, v1 (no checksum)
+//	golden_v1_cfc.lnns            SaveCfC output, v1
+//	golden_v1_linear.lnns         SaveLinear output, v1
+//	golden_v2_ltc.lnns            SaveLTC output, v2 (checksummed)
+//	golden_v2_cfc.lnns            SaveCfC output, v2
+//	golden_v2_linear.lnns         SaveLinear output, v2
+//	golden_<v1|v2>_<kind>.expected.txt the exact Step/Forward outputs each
+//	                              loaded cell must reproduce, as float32 bit
+//	                              patterns (identical for both families:
+//	                              both encode the same cell)
+//
+// The two families never feed each other. The v1 streams are historical:
+// this build's writer emits v2, so nothing regenerates them — their role is
+// to prove the reader still decodes legacy checkpoints byte for byte. The v2
+// streams are what the current writer emits, and -write-golden regenerates
+// ONLY them.
 //
 // The golden cells are built with these exact, fixed parameters — changing
 // any of them invalidates the artifacts (regenerate deliberately with
@@ -248,12 +259,21 @@ func goldenCases(t *testing.T) []goldenCase {
 	}
 }
 
-func goldenStreamPath(name string) string { return "testdata/golden_v1_" + name + ".lnns" }
-func goldenExpectPath(name string) string { return "testdata/golden_v1_" + name + ".expected.txt" }
+// goldenFamilies is the ordered set of golden stream families. "v1" freezes
+// the historical no-checksum layout (read-only; never regenerated), "v2" the
+// current checksummed layout the writer emits.
+var goldenFamilies = []string{"v1", "v2"}
 
-func readGoldenStream(t *testing.T, name string) []byte {
+func goldenStreamPath(family, name string) string {
+	return "testdata/golden_" + family + "_" + name + ".lnns"
+}
+func goldenExpectPath(family, name string) string {
+	return "testdata/golden_" + family + "_" + name + ".expected.txt"
+}
+
+func readGoldenStream(t *testing.T, family, name string) []byte {
 	t.Helper()
-	raw, err := os.ReadFile(goldenStreamPath(name))
+	raw, err := os.ReadFile(goldenStreamPath(family, name))
 	if err != nil {
 		t.Fatalf("golden stream missing (regenerate with -write-golden): %v", err)
 	}
@@ -401,6 +421,7 @@ func structuredStreamError(name string, golden, fresh []byte, tolerance uint32) 
 		return fmt.Errorf("%s: magic differs: golden %q, fresh %q", name, golden[off:off+4], fresh[off:off+4])
 	}
 	off += 4
+	version := golden[off]
 	if golden[off] != fresh[off] {
 		return fmt.Errorf("%s: format version differs: golden %d, fresh %d", name, golden[off], fresh[off])
 	}
@@ -450,7 +471,19 @@ func structuredStreamError(name string, golden, fresh []byte, tolerance uint32) 
 		}
 		off += 4 * int(elems)
 	}
-	if off != len(golden) {
+	if version == 2 {
+		// v2 streams end with a 4-byte CRC-32C over the payload. The checksum
+		// bytes are derived from the float payloads, which may legitimately
+		// differ by a few ULPs off the generating architecture, so they are
+		// NOT byte-compared here — their presence and the global length match
+		// (asserted at the top of this function) are what the skeleton
+		// demands. On the strict architecture TestGoldenWriterStability
+		// compares the whole stream, checksum included, with bytes.Equal.
+		if len(golden)-off != 4 {
+			return fmt.Errorf("%s: v2 stream has %d byte(s) after the last tensor payload, want exactly 4 (the checksum)",
+				name, len(golden)-off)
+		}
+	} else if off != len(golden) {
 		return fmt.Errorf("%s: %d trailing byte(s) after the last tensor payload", name, len(golden)-off)
 	}
 	return nil
@@ -555,47 +588,56 @@ type noLenGolden struct{ r io.Reader }
 func (n noLenGolden) Read(p []byte) (int, error) { return n.r.Read(p) }
 
 // TestGoldenStreamsLoadBitExact is the behavioral freeze: each committed
-// stream must load and reproduce the committed expectation, and — the
-// loaded-cell acceptance — the loaded cell must step identically to a
-// freshly built same-seed original. Graded by platform (see the file
+// stream — v1 and v2 alike — must load and reproduce the committed
+// expectation, and — the loaded-cell acceptance — the loaded cell must step
+// identically to a freshly built same-seed original. The v1 family proves
+// legacy checkpoints still decode byte-for-byte; the v2 family proves the
+// current checksummed layout round-trips. Graded by platform (see the file
 // comment): bit for bit on the generating architecture, within
 // goldenULPTolerance ULPs elsewhere. The vs-original comparison is graded
 // too because the original is rebuilt by local construction code, which
 // may itself contract differently off the generating architecture.
 func TestGoldenStreamsLoadBitExact(t *testing.T) {
 	for _, tc := range goldenCases(t) {
-		t.Run(tc.name, func(t *testing.T) {
-			raw := readGoldenStream(t, tc.name)
-			got := tc.run(t, bytes.NewReader(raw))
-			want := readExpectation(t, goldenExpectPath(tc.name))
-			if goldenStrictArch {
-				sameGoldenBits(t, "loaded vs expectation", got, want)
-				sameGoldenBits(t, "loaded vs same-seed original", got, tc.step())
-				return
-			}
-			sameGoldenWithinULP(t, "loaded vs expectation", got, want, goldenULPTolerance)
-			sameGoldenWithinULP(t, "loaded vs same-seed original", got, tc.step(), goldenULPTolerance)
-		})
+		for _, family := range goldenFamilies {
+			t.Run(tc.name+"/"+family, func(t *testing.T) {
+				raw := readGoldenStream(t, family, tc.name)
+				got := tc.run(t, bytes.NewReader(raw))
+				want := readExpectation(t, goldenExpectPath(family, tc.name))
+				if goldenStrictArch {
+					sameGoldenBits(t, "loaded vs expectation", got, want)
+					sameGoldenBits(t, "loaded vs same-seed original", got, tc.step())
+					return
+				}
+				sameGoldenWithinULP(t, "loaded vs expectation", got, want, goldenULPTolerance)
+				sameGoldenWithinULP(t, "loaded vs same-seed original", got, tc.step(), goldenULPTolerance)
+			})
+		}
 	}
 }
 
-// TestGoldenWriterStability is the byte-level freeze: rebuilding each cell
-// from its documented seed and saving must re-emit the committed golden
-// stream. Any drift in the writer, the tensor order, the header or
-// same-seed construction fails here. Graded by platform (see the file
-// comment): byte for byte on the generating architecture; elsewhere the
-// skeleton — envelope, magic, version, count, ranks, shapes — is still
-// byte-frozen and only the float32 payloads are compared within
-// goldenULPTolerance ULPs. (Named with the Golden prefix so `-run Golden`
-// selects the whole freeze trio — red-team F-RT3.)
+// TestGoldenWriterStability is the byte-level freeze of the v2 layout this
+// build writes: rebuilding each cell from its documented seed and saving
+// must re-emit the committed golden_v2 stream, checksum included. Any drift
+// in the writer, the tensor order, the header, the checksum or same-seed
+// construction fails here. Graded by platform (see the file comment): byte
+// for byte on the generating architecture; elsewhere the skeleton —
+// envelope, magic, version, count, ranks, shapes and the 4-byte checksum
+// field's presence — is still byte-frozen and only the float32 payloads (and
+// therefore the checksum value, which derives from them) are compared within
+// goldenULPTolerance ULPs. The v1 family has no writer-stability leg: this
+// build's writer no longer emits v1, so the committed v1 streams are
+// historical artifacts pinned by TestGoldenStreamsLoadBitExact alone.
+// (Named with the Golden prefix so `-run Golden` selects the whole freeze —
+// red-team F-RT3.)
 func TestGoldenWriterStability(t *testing.T) {
 	for _, tc := range goldenCases(t) {
 		t.Run(tc.name, func(t *testing.T) {
-			golden := readGoldenStream(t, tc.name)
+			golden := readGoldenStream(t, "v2", tc.name)
 			fresh := tc.save(t)
 			if goldenStrictArch {
 				if !bytes.Equal(fresh, golden) {
-					t.Fatalf("re-written stream differs from the committed golden bytes (%d vs %d bytes): the v1 writer or same-seed construction drifted",
+					t.Fatalf("re-written v2 stream differs from the committed golden bytes (%d vs %d bytes): the v2 writer, checksum or same-seed construction drifted",
 						len(fresh), len(golden))
 				}
 				return
@@ -661,30 +703,36 @@ func TestGoldenULPToleranceDiscriminates(t *testing.T) {
 // it is a self-check, not a golden-payload comparison.
 func TestGoldenStreamsLoadOnBothReaderClasses(t *testing.T) {
 	for _, tc := range goldenCases(t) {
-		t.Run(tc.name, func(t *testing.T) {
-			raw := readGoldenStream(t, tc.name)
-			known := tc.run(t, bytes.NewReader(raw))
-			unknown := tc.run(t, noLenGolden{bytes.NewReader(raw)})
-			sameGoldenBits(t, "known-length vs unknown-length reader", known, unknown)
-		})
+		for _, family := range goldenFamilies {
+			t.Run(tc.name+"/"+family, func(t *testing.T) {
+				raw := readGoldenStream(t, family, tc.name)
+				known := tc.run(t, bytes.NewReader(raw))
+				unknown := tc.run(t, noLenGolden{bytes.NewReader(raw)})
+				sameGoldenBits(t, "known-length vs unknown-length reader", known, unknown)
+			})
+		}
 	}
 }
 
 // TestWriteGoldenFiles is the only sanctioned way to change the golden
 // artifacts: a deliberate, reviewed run of `go test ./serialize
-// -write-golden`. It rebuilds every stream and records the loaded cells'
-// outputs as the new expectations. Skipped without the flag.
+// -write-golden`. It rebuilds every v2 stream (the layout the current writer
+// emits) and records the loaded cells' outputs as the new expectations. The
+// v1 streams are historical and deliberately NOT touched: this build cannot
+// emit v1, so their regeneration is not even expressible. Skipped without
+// the flag.
 func TestWriteGoldenFiles(t *testing.T) {
 	if !*writeGolden {
 		t.Skip("golden regeneration is deliberate: go test ./serialize -write-golden")
 	}
 	for _, tc := range goldenCases(t) {
 		raw := tc.save(t)
-		if err := os.WriteFile(goldenStreamPath(tc.name), raw, 0o644); err != nil {
+		path := goldenStreamPath("v2", tc.name)
+		if err := os.WriteFile(path, raw, 0o644); err != nil {
 			t.Fatalf("writing golden stream: %v", err)
 		}
 		got := tc.run(t, bytes.NewReader(raw))
-		writeExpectation(t, goldenExpectPath(tc.name), tc.doc, got)
-		t.Logf("regenerated %s (%d bytes) and %s", goldenStreamPath(tc.name), len(raw), goldenExpectPath(tc.name))
+		writeExpectation(t, goldenExpectPath("v2", tc.name), tc.doc, got)
+		t.Logf("regenerated %s (%d bytes) and %s", path, len(raw), goldenExpectPath("v2", tc.name))
 	}
 }

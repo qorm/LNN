@@ -21,7 +21,7 @@ LNN 小而显式。它宁可牺牲覆盖面，也要保证内核可读、可审�
 | `github.com/qorm/LNN/autograd` | 动态计算图（computation graph）引擎。每个算子给其输出 `Variable` 打上算子种类（op kind）标签；`Backward` 按逆拓扑序遍历计算图，派发每个节点的梯度传播，将梯度累加（gradient accumulation）到叶节点（leaf）。 |
 | `github.com/qorm/LNN/nn` | 神经网络构件：`Linear` 层、`Wiring` 突触（synapse）拓扑、`LTC` 液态细胞及其闭式（closed-form）兄弟细胞 `CfC`，以及在序列上驱动循环细胞的 `Cell`/`Unroll` 抽象。 |
 | `github.com/qorm/LNN/optimizer` | 作用于 `autograd` 的显式参数更新规则：SGD、经典重球动量（momentum）Momentum、Adam（Kingma & Ba，含偏差校正（bias correction））、AdEMAMix（ICLR 2025，双梯度 EMA）、Schedule-Free AdamW（NeurIPS 2024，以迭代平均取代衰减调度，附 Train/Eval 转换契约）。一次 `Step(params)` 调用替换手写更新循环。状态持久化（`SaveState`/`LoadState`，`"LNO1"` 状态流）使续训（resume）与不间断训练逐位一致。 |
-| `github.com/qorm/LNN/serialize` | 带版本的二进制持久化：紧凑的小端序张量流（`"LNNS"`，version 1），其加载路径把输入视为不可信——一切失败都是 error（绝不 panic），尺寸声明先校验后分配，未知长度读端渐进分配。它是 `nn` 六个 Save/Load 函数背后的存储层。 |
+| `github.com/qorm/LNN/serialize` | 带版本的二进制持久化：紧凑的小端序张量流（`"LNNS"`，version 2——写 v2 并带 CRC-32C 校验和，仍可读 v1），其加载路径把输入视为不可信——一切失败都是 error（绝不 panic），尺寸声明先校验后分配，未知长度读端渐进分配。它是 `nn` 六个 Save/Load 函数背后的存储层。 |
 
 ## 文档
 

@@ -133,7 +133,7 @@ fmt.Println(m.Grad.Data) // [1 0 0 1] —— 依然正确
 - **`serialize.LoadParameters` 保留陈旧 `Grad`：** 它原位覆写 `Data`（变量身份、从而图边得以存活），且刻意不动 `Grad`。在新图中复用加载后的变量之前先调用 `ZeroGrad`——与任何训练步之前完全一样。
 - **`optimizer.SaveState`/`LoadState` 遵循同一纪律：** `"LNO1"` 状态流（state stream）先全验后应用（失败的加载让优化器逐位保持原样），只有 error 绝不 panic，恶意尺寸声明保持在实测的字节预算之内。保存状态后，续训（resume）与不间断训练逐位一致——见 [persistence.md](persistence.md) 优化器状态一节。
 
-格式规格、API 指南与完整契约——包括版本规则（只读 version 1；未知版本报错而非误解析）——见 [persistence.md](persistence.md)。
+格式规格、API 指南与完整契约——包括版本规则（读 v1 与 v2、只写 v2；未知版本报错而非误解析）——见 [persistence.md](persistence.md)。
 
 ## 残余留档（阶段 16 与 18）
 

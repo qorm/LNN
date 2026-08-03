@@ -274,7 +274,7 @@ iter   0  loss=0.620651
 iter  20  loss=0.184146
 iter  40  loss=0.158232
 iter  59  loss=0.078601
-saved cfc.model (1859 bytes) + readout.params (71 bytes)
+saved cfc.model (1863 bytes) + readout.params (75 bytes)
 == phase 2: load into fresh models (different seed) ==
 LoadCfC + LoadParameters: ok
 bit-identical Step output after load: true
@@ -285,8 +285,8 @@ iter 100  loss=0.041556
 iter 119  loss=0.031060
 == hostile streams are errors, never panics ==
 LTC loader on a CfC stream -> nn: stream holds model kind 1 (CfC), not LTC (kind 0)
-truncated stream           -> serialize: tensor 6: truncated stream: claims 256 data bytes but only 176 remain: unexpected EOF
-unknown format version     -> serialize: unsupported format version 99 (this build reads version 1)
+truncated stream           -> serialize: tensor 6: truncated stream: claims 256 data bytes but only 178 remain: unexpected EOF
+unknown format version     -> serialize: unsupported format version 99 (this build reads version 2)
 ```
 
 续训恰好从训练停下的地方继续：由于 `SGD` 无状态，且产生数据的 RNG 流未被打断，续训轨迹与不间断训练**逐位一致**——`iter 100` 的损失 `0.041556` 与 `examples/cfc-sequence` 完整 250 轮运行同一迭代的打印值精确吻合。对有状态优化器，仅有模型检查点是不够的——见下一节：`SaveState`/`LoadState` 让 `Momentum` 与 `Adam` 的续训轨迹同样逐位一致。
@@ -450,8 +450,8 @@ func must(err error) {
 实际输出（Go 1.26，确定性）：
 
 ```
-checkpoint at step 50: model 1859 bytes, readout 71 bytes, Adam state 2732 bytes
-SGD state stream over the same 15 params: 19 bytes (stateless)
+checkpoint at step 50: model 1863 bytes, readout 75 bytes, Adam state 2736 bytes
+SGD state stream over the same 15 params: 23 bytes (stateless)
 steps 0..99 loss bits identical to uninterrupted run: true
 final parameters bit-identical: true
 loss: iter 49 = 0.024681, iter 99 = 0.011424
@@ -471,15 +471,15 @@ Adam stream into Momentum -> optimizer: state stream kind 2 (Adam) does not matc
 | kind | `uint8` | `0` = SGD、`1` = Momentum、`2` = Adam、`3` = AdEMAMix、`4` = ScheduleFreeAdamW；加载进错误的优化器类型是精确的指名错误（见上） |
 | 数量 | `uint32` | 参数记录数——每参数一条，按 `SaveState` 所收 `params` 切片的次序 |
 | 记录段，重复 `count` 次（SGD 为空） | `present` `uint8` | `0` = 该参数无状态，`1` = 状态随后；**Adam 与 AdEMAMix** 且 present 时：`t` `uint32`（更新计数）、`pow1`/`pow2` `float32`（`Beta1^t`/`Beta2^t`，逐位保存）；**ScheduleFreeAdamW** 且 present 时——22 字节：`k` `uint32`（更新计数）、`pow2` `float32`（`Beta2^k`，逐位）、`lrMax` `float32`（见过的最大调度 lr）、`wsum` `float64`（平均权重累加器，唯一的宽字段）、`mode` `uint8`（该参数的模式位：`1` = train——其 Data 持有 `y`，`0` = eval——持有 `x`） |
-| blob | — | 单条 `serialize` 张量流，按参数次序：每个 present 的 Momentum 参数一个 velocity 张量，每个 present 的 Adam 参数 `m` 后跟 `v`，每个 present 的 AdEMAMix 参数 `m1`、`m2` 后跟 `v`，每个 present 的 ScheduleFreeAdamW 参数 `z` 后跟 `v`，SGD **零**个张量——自定界，拒绝尾字节 |
+| blob | — | 单条 `serialize` 张量流（v2：带 CRC-32C 校验和），按参数次序：每个 present 的 Momentum 参数一个 velocity 张量，每个 present 的 Adam 参数 `m` 后跟 `v`，每个 present 的 AdEMAMix 参数 `m1`、`m2` 后跟 `v`，每个 present 的 ScheduleFreeAdamW 参数 `z` 后跟 `v`，SGD **零**个张量——自定界，拒绝尾字节 |
 
-五种优化器的记录布局：**SGD** 恒为 **19 字节**自洽空流（10 字节头部加 9 字节空张量 blob——与参数个数无关；保存是恒等操作，但流仍然写出，使每种 kind 都经同一统一格式 round-trip）；**Momentum** 每个 present 参数携带一个 velocity 张量；**Adam** 每个 present 参数携带 `m` 与 `v`，外加记录段中的 `t`/`pow1`/`pow2` 计数器；**AdEMAMix** 逐字沿用 Adam 的记录布局，blob 中携带 `m1`、`m2` 与 `v`；**ScheduleFreeAdamW** blob 中携带 `z` 与 `v`，外加 22 字节记录（`k`/`pow2`/`lrMax`/`wsum`/`mode`）。超参（`LR`、`Mu`、`Beta1`/`Beta2`/`Eps`、`Alpha`/`Beta3`/`Warmup`、`WeightDecay`/`WarmupSteps`）**刻意不入流**——它们是导出字段，由调用方在目标优化器上设置，与构造时完全一样；流内 `pow1`/`pow2`（Adam、AdEMAMix）与 `pow2`（ScheduleFreeAdamW）必须与目标优化器自身的 `Beta1^t`/`Beta2^t`/`Beta2^k` 逐位相等，因此在不同 beta 下保存的流按损坏失败（pow 位翻转一石二鸟地兼作 β 超参错配探测器：`TestLoadStateRejectsInconsistentAdamCounters` 及其阶段 20 的 kind 3/4 镜像）。该校验的推论自始即有文档：pow 字段是**滚动乘积**——训练中改写 `Beta*` 字段*之后*再保存，流将不可加载：`betaPow` 只能重放单一 beta 的乘积，无法重放优化器实际积累的分段乘积。跨 beta 改写的续训因此被刻意拒绝，与损坏不可区分；只在你不打算续训的检查点之间改 beta。两条 ScheduleFree 专有守卫：`lrMax` 与 `wsum` 作为累加器，`Step` 只可能产出有限值（LR > 0），因此非有限值一律按损坏拒绝，不给它毒化续训后首次更新的机会（`TestLoadStateRejectsNonFiniteScheduleFreeCounters`）；`mode` 字节校验 ∈ {0, 1}（`TestLoadStateRejectsBadModeByte`）。
+五种优化器的记录布局：**SGD** 恒为 **23 字节**自洽空流（10 字节头部加 13 字节 v2 空张量 blob——magic、version、count 与 CRC-32C 校验和——与参数个数无关；保存是恒等操作，但流仍然写出，使每种 kind 都经同一统一格式 round-trip）；**Momentum** 每个 present 参数携带一个 velocity 张量；**Adam** 每个 present 参数携带 `m` 与 `v`，外加记录段中的 `t`/`pow1`/`pow2` 计数器；**AdEMAMix** 逐字沿用 Adam 的记录布局，blob 中携带 `m1`、`m2` 与 `v`；**ScheduleFreeAdamW** blob 中携带 `z` 与 `v`，外加 22 字节记录（`k`/`pow2`/`lrMax`/`wsum`/`mode`）。超参（`LR`、`Mu`、`Beta1`/`Beta2`/`Eps`、`Alpha`/`Beta3`/`Warmup`、`WeightDecay`/`WarmupSteps`）**刻意不入流**——它们是导出字段，由调用方在目标优化器上设置，与构造时完全一样；流内 `pow1`/`pow2`（Adam、AdEMAMix）与 `pow2`（ScheduleFreeAdamW）必须与目标优化器自身的 `Beta1^t`/`Beta2^t`/`Beta2^k` 逐位相等，因此在不同 beta 下保存的流按损坏失败（pow 位翻转一石二鸟地兼作 β 超参错配探测器：`TestLoadStateRejectsInconsistentAdamCounters` 及其阶段 20 的 kind 3/4 镜像）。该校验的推论自始即有文档：pow 字段是**滚动乘积**——训练中改写 `Beta*` 字段*之后*再保存，流将不可加载：`betaPow` 只能重放单一 beta 的乘积，无法重放优化器实际积累的分段乘积。跨 beta 改写的续训因此被刻意拒绝，与损坏不可区分；只在你不打算续训的检查点之间改 beta。两条 ScheduleFree 专有守卫：`lrMax` 与 `wsum` 作为累加器，`Step` 只可能产出有限值（LR > 0），因此非有限值一律按损坏拒绝，不给它毒化续训后首次更新的机会（`TestLoadStateRejectsNonFiniteScheduleFreeCounters`）；`mode` 字节校验 ∈ {0, 1}（`TestLoadStateRejectsBadModeByte`）。
 
 **正是 mode 字节让 eval 模式检查点可以跨实例续训。** eval 模式下保存的 ScheduleFreeAdamW 流会把每个参数的 eval 模式一并恢复：下一次 `Step` 按编号指名 panic（[training.md](training.md) 的 train/eval 守卫），`Train` 完成 `x → y` 转换后续训——与同实例 Eval → Train → 续训路径逐位一致（`y→x→y` 往返本身有舍入，因此续训相对从未转换的轨迹差几个 ULP）。只有*优化器级*模式标志——对无状态参数的闸门——是瞬态且不入流的：新建的优化器永远在 train 模式。
 
 ### 不可信流纪律
 
-与模型流同一纪律：**validate-all-then-apply（先全验后应用）**——一切记录、张量与计数器在任何状态写入之前完成解析与校验，因此失败的加载让目标优化器**逐位保持原样**（velocity/m/v/t/pow 分毫不动，parameter 0 不受 parameter 1 失败的牵连；`TestLoadStateRejectsShapeMismatchWithoutSideEffects`）；**只有 error，绝不 panic**——各类对抗流全部 error（五种 kind 的跨 kind 互载全 20 对、未知 kind、坏魔数、version 0/99 按方向分流、count 双向不符、存在性标志 `2`、形状失配三条路径及新 kind 路径、三种带计数器 kind 的 pow 位翻转、非有限 `lrMax`/`wsum`、非法 mode 字节、`t`/`k` 超限在 blob 解析之前拒绝、每个记录边界截断 → `io.ErrUnexpectedEOF`、尾字节、blob 张量数、I/O 透传；`TestLoadStateRejects*` 族，外加红队 500 个变异体 0 panic——其中 76 个加载成功者重存幂等、0 失配，66 个严格前缀截断全部拒绝）；**字节预算双门禁**——29 字节恶意流仅分配 352 B、10 字节巨 count 流仅 276 B（`TestLoadStateHostileClaimsStayWithinByteBudget`）；**`maxT = 2²⁴` 仅加载侧限额**（Adam 与 AdEMAMix 的 `t`、ScheduleFreeAdamW 的 `k`）——pow 一致性校验把 `Beta^t` 重算为 `t` 次顺序乘法，因此一条 13 字节、声称 `t = 2³²−1` 的记录不得记上四十亿次乘法的账（与下面 `maxUnfolds`/`maxUnits` 相同的加载侧不对称论证：`Adam.Step` 的运行时契约不变，因为那里的步数是调用方自己的训练史，而加载的输入是不可信流，对自己的资源预算没有表决权）。
+与模型流同一纪律：**validate-all-then-apply（先全验后应用）**——一切记录、张量与计数器在任何状态写入之前完成解析与校验，因此失败的加载让目标优化器**逐位保持原样**（velocity/m/v/t/pow 分毫不动，parameter 0 不受 parameter 1 失败的牵连；`TestLoadStateRejectsShapeMismatchWithoutSideEffects`）；**只有 error，绝不 panic**——各类对抗流全部 error（五种 kind 的跨 kind 互载全 20 对、未知 kind、坏魔数、version 0/99 按方向分流、count 双向不符、存在性标志 `2`、形状失配三条路径及新 kind 路径、三种带计数器 kind 的 pow 位翻转、非有限 `lrMax`/`wsum`、非法 mode 字节、`t`/`k` 超限在 blob 解析之前拒绝、每个记录边界截断 → `io.ErrUnexpectedEOF`、尾字节、blob 张量数、v2 blob 校验和失配、I/O 透传；`TestLoadStateRejects*` 族，外加红队 500 个变异体 0 panic——其中 76 个加载成功者重存幂等、0 失配，66 个严格前缀截断全部拒绝）；**字节预算双门禁**——29 字节恶意流仅分配 352 B、10 字节巨 count 流仅 276 B（`TestLoadStateHostileClaimsStayWithinByteBudget`）；**`maxT = 2²⁴` 仅加载侧限额**（Adam 与 AdEMAMix 的 `t`、ScheduleFreeAdamW 的 `k`）——pow 一致性校验把 `Beta^t` 重算为 `t` 次顺序乘法，因此一条 13 字节、声称 `t = 2³²−1` 的记录不得记上四十亿次乘法的账（与下面 `maxUnfolds`/`maxUnits` 相同的加载侧不对称论证：`Adam.Step` 的运行时契约不变，因为那里的步数是调用方自己的训练史，而加载的输入是不可信流，对自己的资源预算没有表决权）。
 
 ### 索引键控与陈旧键
 
@@ -494,11 +494,12 @@ Adam stream into Momentum -> optimizer: state stream kind 2 (Adam) does not matc
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | 魔数 | `[4]byte` | 恰为 `L N N S`；其他值报 "not an LNN tensor stream" |
-| 版本 | `uint8` | `1`（导出常量 `serialize.Version`）；其他值被拒绝 |
-| 数量 | `uint32` | 张量数；流中*恰好*编码这么多个——最后一个载荷之后的尾字节按损坏拒绝 |
+| 版本 | `uint8` | `2`（导出常量 `serialize.Version`）；其他值被拒绝 |
+| 数量 | `uint32` | 张量数；流中*恰好*编码这么多个——最后一个载荷之后（v1）或校验和之后（v2）的尾字节按损坏拒绝 |
 | 随后重复 count 次：秩 | `uint8` | `0 ≤ rank ≤ 8` |
 | 形状 | `[rank]int64` | 每个维度 `≥ 0` |
 | 数据 | `[size]float32` | `size` = 形状各维之积；行主序，小端序 |
+| 校验和 | `[4]byte` | **仅 v2：** CRC-32C（Castagnoli），覆盖其前全部字节——magic、version、count 及每个张量的 rank、shape 与 data；无校验和的 v1 流仍可读 |
 
 ### 模型流
 
@@ -508,9 +509,11 @@ Adam stream into Momentum -> optimizer: state stream kind 2 (Adam) does not matc
 |---|---|---|
 | kind | `uint8` | `0` = LTC，`1` = CfC，`2` = Linear；用错的加载函数会得到精确的错误，而不是误解析 |
 | 头部 | 若干 `int32` | LTC：`inDim, units, unfolds`；CfC：`inDim, units`；Linear：无 |
-| blob | — | 上述张量流（`"LNNS"`、版本、数量、数据） |
+| blob | — | 上述张量流（`"LNNS"`、版本、数量、数据——**v2** 另含覆盖全部内容的尾部 CRC-32C 校验和）；无校验和的 v1 blob 仍可读 |
 
 头部数值在写入端必须装得进 `int32`，在读取端必须 `≥ 1`；`unfolds` 在读取端另受上限 `1024`、`units`/`inDim` 各受上限 `2048` 约束（均见下）。
+
+模型封装头（kind 字节 + 头部）位于 blob 校验和**之外**，其完整性由模型级校验承担：kind 字节精确匹配，头部维度既与限额比对、又与流内掩码形状交叉验证（侥幸逃过限额的翻转维度会在掩码形状检查处失败）。
 
 ### 模型 blob 内的张量次序
 
@@ -528,7 +531,7 @@ Linear 承载两个张量：`W` `[in, out]` 与 `B` `[out]`（层的维度就在
 
 ## 不可信流的安全契约
 
-本库其余部分以 panic 报告误用：它的输入来自程序自身，坏形状就是调用方的 bug。序列化是刻意的例外。加载路径消费的是来自程序*之外*的字节——文件、网络、来自其他版本的检查点——它们可能损坏、截断，乃至彻头彻尾的恶意。**读路径上的一切失败都作为 error 返回，绝不 panic**；且恶意流的分配量只与它实际送达的字节数成正比：
+本库其余部分以 panic 报告误用：它的输入来自程序自身，坏形状就是调用方的 bug。序列化是刻意的例外。加载路径消费的是来自程序*之外*的字节——文件、网络、来自其他版本的检查点——它们可能损坏、截断，乃至彻头彻尾的恶意。**读路径上的一切失败都作为 error 返回，绝不 panic**——v2 的 CRC-32C 校验和失配也在此列：被翻转的字节几乎必然改变重算值，加载按损坏拒绝——且恶意流的分配量只与它实际送达的字节数成正比：
 
 **固定限额，先校验后分配。** 声明的秩、维度与数量先受检查，元素计数用溢出安全乘法（`math/bits.Mul64`，与 `tensor.Size` 同一纪律）：
 
@@ -561,6 +564,11 @@ Linear 承载两个张量：`W` `[in, out]` 与 `B` `[out]`（层的维度就在
 
 **模型级校验，按序执行。** 加载函数在构造任何细胞之前检查：kind 字节（精确匹配——跨 kind 互载是一个指名道姓的错误）；头部维度 `≥ 1`、`unfolds` 落在 `[1, 1024]`、`units`/`inDim` 落在 `[1, 2048]`（即上面的仅加载侧上限）；张量数量（细胞恰为 17，Linear 为 2）；掩码形状与头部一致且每个掩码表项恰为 `0` 或 `1`；以及反转电位——每个 `erev`/`sErev` 表项必须**恰为 `+1` 或 `−1`**（按位比较，因此 `NaN`、`±Inf`、`0` 和 `2.5` 之类的小数全部被拒）。构造器固定这些符号，训练又把电位排除在 `Parameters()` 之外，因此承载其他值的流描述的是 `NewLTC`/`NewCfC` 永远不可能产生的细胞，一律拒绝。对已有模型的形状不符（`LoadParameters`、`copyFields`）在**任何值被拷贝之前**完成校验，因此失败的加载让目标保持原样。（头部检查消息点名当前上限：`nn: LTC header has units=4096, exceeding the load limit 2048`。）
 
+**完整性：校验和覆盖什么、不覆盖什么。** v2 校验和是**损坏探测器，而非安全边界**。v2 流中单字节翻转几乎必然改变重算值、加载被拒，因此偶然损坏——位翻转、文件截断、位腐坏——被可靠地显形。但它不是密码学认证器：能写流的任意一方总能重算校验和，因此它对付恶意写者毫无分量——对抗恶意流的是资源耗尽防线（上面的固定限额与先验后分配的纪律），而非校验和。它也不定位损坏发生在何处：加载路径是全有或全无（先全验后应用），因此格式只需一条全流校验和。两扇窗是有意留下、如实披露而非遮掩的：
+
+- **模型封装头位于校验和之外**（见上面的模型流表）：kind 字节与头部由模型级检查覆盖，但 LTC 的 `unfolds`——只受其 `[1, 1024]` 加载限额约束，对流内张量无交叉校验——可能携带一个落在该范围内的单比特翻转，并被静默加载为另一个合法但不同的细胞（ODE 子步数比预期多或少的检查点）。这是把封装头置于校验和之外的固有代价：校验和看不见它不覆盖的字节。要侦测它，需要一条连头部一并覆盖的全流校验和。
+- **`"LNO1"` 记录段位于其内嵌 blob 的校验和之外**：状态流的头部（magic、version、kind、count）与存在性记录字段——包括 ScheduleFreeAdamW 的 `lrMax`/`wsum` 与逐参数 `mode` 字节——不在内嵌张量 blob 的 CRC 覆盖内，因此那里的位翻转会被静默接受为另一份合法但不同的状态（这是 v1 时代 LNO1 布局的既有属性，并非 v2 回归）。这些字段自身的语义守卫（`lrMax`/`wsum` 必须有限、`mode` ∈ {0, 1}）能拦下部分翻转；未来的 LNO1 版本可以携带自己的全流校验和。
+
 **已模糊测试。** 变异模糊（mutation fuzz）钉住了契约：`TestMutatedTensorStreamsNeverPanic` 与 `TestMutatedModelStreamsNeverPanic`（位翻转、删除、插入、块交换）。红队对初版实现跑了 7,500 个变异体（0 panic、0 静默错乱），资源耗尽加固之后又跑了 1,200 个变异体 × 双读端类别（依然 0 panic）。
 
 ## 逐位精确性
@@ -571,11 +579,11 @@ Linear 承载两个张量：`W` `[in, out]` 与 `B` `[out]`（层的维度就在
 
 ## 版本演进：对未来诚实
 
-`version = 1` 是本构建唯一读取的布局。带有其他版本字节的流会以 `unsupported format version N (this build reads version 1)` 失败——未来版本会**报错而非误解析**未知布局。如果线上格式有任何变更，版本号递增，`ReadTensors` 增加对旧布局的显式支持；不存在悄无声息的尽力解码。格式版本导出为 `serialize.Version`，正是为了调用方做这类检查。
+本构建同时读取 **v1 与 v2**，且只写 **v2**（导出常量 `serialize.Version`）。带有其他版本字节的流会以 `unsupported format version N (this build reads version 2)` 失败——未来版本会**报错而非误解析**未知布局。如果线上格式有任何变更，版本号递增，`ReadTensors` 增加对旧布局的显式支持；不存在悄无声息的尽力解码。v2 是唯一写布局，v1 仍可读以兼容遗留检查点。格式版本导出为 `serialize.Version`，正是为了调用方做这类检查。
 
 ## 黄金向量：被字节钉死的冻结格式
 
-v1 冻结是被强制执行的，而不只是被文档声明。`serialize/testdata/` 保存着提交的黄金字节流——`golden_v1_ltc.lnns`、`golden_v1_cfc.lnns`、`golden_v1_linear.lnns`（1607、1603、120 字节）——各由一个固定的、全文档化的细胞构建（`nn.NewLTC(4, 6, nil, 6, …101)`、`nn.NewCfC(4, 6, nil, …202)`、`nn.NewLinear(6, 3, …303)`）；配套的 `golden_v1_<kind>.expected.txt` 则以 `%08x` 的 float32 位模式记录加载后的细胞必须复现的精确 `Step`/`Forward` 输出，人可以逐字节审计。三个测试扮演三种不同角色，而它们执行的冻结是**按平台分级**的：
+冻结是被强制执行的，而不只是被文档声明——如今它守卫**两条族系**。`serialize/testdata/` 保存着提交的黄金字节流：`golden_v1_{ltc,cfc,linear}.lnns`（1607、1603、120 字节）把历史 v1 布局逐字节冻结——只读，是遗留检查点仍被精确解码的证明，永不再生成；`golden_v2_{ltc,cfc,linear}.lnns`（1611、1607、124 字节）冻结本构建写端发射的 v2 布局。两条族系都由同一组固定、全文档化的细胞构建（`nn.NewLTC(4, 6, nil, 6, …101)`、`nn.NewCfC(4, 6, nil, …202)`、`nn.NewLinear(6, 3, …303)`）；配套的 `golden_v1_<kind>.expected.txt` / `golden_v2_<kind>.expected.txt` 以 `%08x` 的 float32 位模式记录加载后的细胞必须复现的精确 `Step`/`Forward` 输出，人可以逐字节审计。两条族系互不喂食。三个测试扮演三种不同角色，而它们执行的冻结是**按平台分级**的：
 
 - **格式布局**——magic、version、张量计数、张量序、rank、shape 以及小端 float32 编码——在**一切平台上逐字节冻结**。写端在任何平台上对相同数值发射相同字节。
 - **浮点载荷的逐位复现**是**平台与工具链内部**的保证，跨架构则不然——这是 Go 语言的行为，而非本库的缺陷：语言规范允许实现"将多个浮点运算合并为单次舍入的融合运算"（FMA 缩合），即把逐步舍入的非融合路径压成一次舍入。因此 arm64 构建与 amd64 构建之间可以合法地相差每次缩合 ≤ 1 ULP（CI 实测恰为 1 ULP：`0xbe8aa433` 对 `0xbe8aa430`），而缩合链会逐级累积——CfC 的构造参数经 Box-Muller 初始化依次执行 log/sqrt/sin/cos，CI 实测最大漂移达 6 ULP。黄金向量在 arm64（Apple Silicon）上生成，故在 `GOARCH=arm64` 上以下断言保持严格——逐位、逐字节——而在其他任何架构上，骨架仍逐字节冻结，每个载荷元素的断言窗口为 **16 ULP**（约为实测最大值的 2.7 倍；仍紧到足以拒绝真实损坏——`TestGoldenULPToleranceDiscriminates` 钉死了它的鉴别力：32 ULP 必败，形状与计数不符必败）。
@@ -584,7 +592,7 @@ v1 冻结是被强制执行的，而不只是被文档声明。`serialize/testda
 - **`TestGoldenWriterStability`——字节级冻结。** 从文档化 seed 重建每个细胞再重新保存，在生成平台上得到的流与提交版本逐字节相同（`bytes.Equal`）；在其他平台上，封装头与线上骨架（magic、version、count、rank、shape）仍逐字节比对，仅浮点载荷按 ULP 窗口比对。
 - **`TestGoldenStreamsLoadOnBothReaderClasses`——读端一致。** 已知长度快路径与渐进流式路径加载同一条黄金流，得到逐位相同的细胞——这是同一二进制内的自洽对照，因此在一切平台上保持逐位严格。
 
-再生成是门禁式的：`TestWriteGoldenFiles` **默认跳过**，除非运行显式传入 `-write-golden`（`go test ./serialize -write-golden`），因此黄金向量只能通过一次刻意的、可见的测试运行来变更——绝不偶然发生，也绝不作为某个无关改动的副作用。CfC 黄金流反映的是阶段 8 `erev` 焙入*之后*的细胞：其加载后的 `Step` 输出与原细胞逐位相同，而这恰是那次焙入被要求保持的等价性。
+再生成是门禁式的：`TestWriteGoldenFiles` **默认跳过**，除非运行显式传入 `-write-golden`（`go test ./serialize -write-golden`），且它只重建 **v2** 族系——v1 文件是冻结的历史，绝不被重写，因为本构建甚至无法发射 v1——因此黄金向量只能通过一次刻意的、可见的测试运行来变更，绝不偶然发生，也绝不作为某个无关改动的副作用。CfC 黄金流反映的是阶段 8 `erev` 焙入*之后*的细胞：其加载后的 `Step` 输出与原细胞逐位相同，而这恰是那次焙入被要求保持的等价性。
 
 ---
 

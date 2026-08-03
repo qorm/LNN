@@ -1,0 +1,10 @@
+# Golden expectation for golden_v2_cfc.lnns — the exact outputs the loaded cell must produce.
+# float32 bit patterns in hex, row-major, one token per element.
+# cell: nn.NewCfC(4, 6, nil, rand.New(rand.NewSource(202)))
+# input x [2 4]: [0.25 -0.5 0.75 -1 0.1 0.2 -0.3 0.4]
+# input h [2 6]: [0.1 -0.2 0.3 -0.4 0.5 -0.6 -0.1 0.2 -0.3 0.4 -0.5 0.6]
+# ts: 0.25
+out 2 6
+bca83018 3d79c9a4 3ed84cdb bdeae19c bd7164f0 be034ee4 be34b494 bdcba7b2 be966f94 3edc3b03 be1d5b0c 3ee04392
+hnew 2 6
+bca83018 3d79c9a4 3ed84cdb bdeae19c bd7164f0 be034ee4 be34b494 bdcba7b2 be966f94 3edc3b03 be1d5b0c 3ee04392

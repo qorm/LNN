@@ -302,7 +302,7 @@ iter   0  loss=0.620651
 iter  20  loss=0.184146
 iter  40  loss=0.158232
 iter  59  loss=0.078601
-saved cfc.model (1859 bytes) + readout.params (71 bytes)
+saved cfc.model (1863 bytes) + readout.params (75 bytes)
 == phase 2: load into fresh models (different seed) ==
 LoadCfC + LoadParameters: ok
 bit-identical Step output after load: true
@@ -313,8 +313,8 @@ iter 100  loss=0.041556
 iter 119  loss=0.031060
 == hostile streams are errors, never panics ==
 LTC loader on a CfC stream -> nn: stream holds model kind 1 (CfC), not LTC (kind 0)
-truncated stream           -> serialize: tensor 6: truncated stream: claims 256 data bytes but only 176 remain: unexpected EOF
-unknown format version     -> serialize: unsupported format version 99 (this build reads version 1)
+truncated stream           -> serialize: tensor 6: truncated stream: claims 256 data bytes but only 178 remain: unexpected EOF
+unknown format version     -> serialize: unsupported format version 99 (this build reads version 2)
 ```
 
 The resumed run continues exactly where training left off: because `SGD`
@@ -495,8 +495,8 @@ func must(err error) {
 Actual output (Go 1.26, deterministic):
 
 ```
-checkpoint at step 50: model 1859 bytes, readout 71 bytes, Adam state 2732 bytes
-SGD state stream over the same 15 params: 19 bytes (stateless)
+checkpoint at step 50: model 1863 bytes, readout 75 bytes, Adam state 2736 bytes
+SGD state stream over the same 15 params: 23 bytes (stateless)
 steps 0..99 loss bits identical to uninterrupted run: true
 final parameters bit-identical: true
 loss: iter 49 = 0.024681, iter 99 = 0.011424
@@ -534,13 +534,14 @@ in the `"LNNS"` format:
 | kind | `uint8` | `0` = SGD, `1` = Momentum, `2` = Adam, `3` = AdEMAMix, `4` = ScheduleFreeAdamW; loading into the wrong optimizer type is a precise named error (above) |
 | count | `uint32` | number of parameter records — one per parameter, in the order of the `params` slice given to `SaveState` |
 | record section, repeated `count` times (empty for SGD) | `present` `uint8` | `0` = no state for this parameter, `1` = state follows; **Adam and AdEMAMix**, when present: `t` `uint32` (update count), `pow1`/`pow2` `float32` (`Beta1^t`/`Beta2^t`, saved bit for bit); **ScheduleFreeAdamW**, when present — 22 bytes: `k` `uint32` (update count), `pow2` `float32` (`Beta2^k`, bit for bit), `lrMax` `float32` (largest scheduled lr seen), `wsum` `float64` (average-weight accumulator, the one wide field), `mode` `uint8` (the parameter's mode bit: `1` = train — its Data holds `y`, `0` = eval — holds `x`) |
-| blob | — | a single `serialize` tensor stream, in parameter order: one velocity tensor per present Momentum parameter, `m` then `v` per present Adam parameter, `m1`, `m2` then `v` per present AdEMAMix parameter, `z` then `v` per present ScheduleFreeAdamW parameter, **zero** tensors for SGD — self-framing, trailing bytes rejected |
+| blob | — | a single `serialize` tensor stream (v2: CRC-32C checksummed), in parameter order: one velocity tensor per present Momentum parameter, `m` then `v` per present Adam parameter, `m1`, `m2` then `v` per present AdEMAMix parameter, `z` then `v` per present ScheduleFreeAdamW parameter, **zero** tensors for SGD — self-framing, trailing bytes rejected |
 
-Per-optimizer record layout: **SGD** is always a **19-byte**
-self-contained empty stream (a 10-byte header plus the 9-byte empty
-tensor blob — independent of the parameter count; the save is an
-identity, but the stream is still written so every kind round-trips
-through one uniform format); **Momentum** carries one velocity tensor
+Per-optimizer record layout: **SGD** is always a **23-byte**
+self-contained empty stream (a 10-byte header plus the 13-byte empty
+v2 tensor blob — magic, version, count and the CRC-32C checksum —
+independent of the parameter count; the save is an identity, but the
+stream is still written so every kind round-trips through one uniform
+format); **Momentum** carries one velocity tensor
 per present parameter; **Adam** carries `m` and `v` per present
 parameter plus the `t`/`pow1`/`pow2` counters in the record section;
 **AdEMAMix** reuses Adam's record layout verbatim and carries `m1`,
@@ -595,8 +596,9 @@ mismatch on all three tensor paths and on the new-kind paths, pow bit
 flips on all three counter-carrying kinds, non-finite `lrMax`/`wsum`,
 bad mode byte, `t`/`k` over the limit
 rejected before the blob is parsed, truncation at every record boundary →
-`io.ErrUnexpectedEOF`, trailing bytes, blob tensor count, I/O
-passthrough; the `TestLoadStateRejects*` family, plus 500 red-team
+`io.ErrUnexpectedEOF`, trailing bytes, blob tensor count, a v2 blob
+checksum mismatch, I/O passthrough; the `TestLoadStateRejects*` family,
+plus 500 red-team
 mutants with 0 panics — the 76 that load successfully re-save
 idempotently with 0 mismatches, and all 66 strict prefix truncations
 are refused); a **byte budget** with two gates — a 29-byte hostile
@@ -639,11 +641,12 @@ are IEEE-754 `float32`, little-endian.
 | field | type | notes |
 |---|---|---|
 | magic | `[4]byte` | exactly `L N N S`; anything else is "not an LNN tensor stream" |
-| version | `uint8` | `1` (the exported `serialize.Version`); other values are rejected |
-| count | `uint32` | number of tensors; the stream encodes *exactly* this many — trailing bytes after the last payload are rejected as corruption |
+| version | `uint8` | `2` (the exported `serialize.Version`); other values are rejected |
+| count | `uint32` | number of tensors; the stream encodes *exactly* this many — trailing bytes after the last payload (v1) or after the checksum (v2) are rejected as corruption |
 | then, `count` times: rank | `uint8` | `0 ≤ rank ≤ 8` |
 | shape | `[rank]int64` | each dimension `≥ 0` |
 | data | `[size]float32` | `size` = product of shape; row-major, little-endian |
+| checksum | `[4]byte` | **v2 only:** CRC-32C (Castagnoli) over every byte above — magic, version, count, and each tensor's rank, shape and data; v1 streams (no checksum) still load |
 
 ### Model stream
 
@@ -654,11 +657,17 @@ stream blob:
 |---|---|---|
 | kind | `uint8` | `0` = LTC, `1` = CfC, `2` = Linear; loading with the wrong function is a precise error, not a misparse |
 | header | `int32`s | LTC: `inDim, units, unfolds`; CfC: `inDim, units`; Linear: none |
-| blob | — | the tensor stream above (`"LNNS"`, version, count, data) |
+| blob | — | the tensor stream above (`"LNNS"`, version, count, data — and, **v2**, a trailing CRC-32C checksum over all of it); v1 blobs without the checksum still load |
 
 Header values must fit `int32` on the write side and be `≥ 1` on the read
 side; `unfolds` is additionally bounded by the load limit `1024`, and
 `units`/`inDim` by the load limit `2048` each (both below).
+
+The model envelope (kind byte + header) sits **outside** the blob's
+checksum, so its integrity is enforced by the model-level validation
+instead: the kind byte is matched exactly, and the header dims are
+checked against the limits and against the streamed mask shapes (a
+flipped dim that survives the limits fails the mask-shape check).
 
 ### Tensor order inside a model blob
 
@@ -685,8 +694,10 @@ the program itself, so a bad shape is a bug in the caller. Serialization
 is the deliberate exception. A load path consumes bytes from *outside*
 the program — files, networks, checkpoints from other versions — which
 may be corrupt, truncated, or outright hostile. **Every failure on the
-read path is returned as an error, never a panic**, and a hostile stream
-can allocate only in proportion to the bytes it actually delivers:
+read path is returned as an error, never a panic** — including, in v2, a
+CRC-32C checksum mismatch: a flipped byte almost always changes the
+recomputed checksum and the load is refused as corruption — and a hostile
+stream can allocate only in proportion to the bytes it actually delivers:
 
 **Fixed limits, validated before any allocation.** Claimed ranks,
 dimensions and counts are checked first, with overflow-safe
@@ -795,6 +806,39 @@ load leaves the destination exactly as it was. (The header check
 messages name the limit in force: `nn: LTC header has units=4096,
 exceeding the load limit 2048`.)
 
+**Integrity: what the checksum does and does not cover.** The v2 checksum
+is a **damage detector, not a security boundary**. A single-byte flip in
+a v2 stream almost certainly changes the recomputed value and the load is
+refused, so accidental corruption — a flipped bit, a truncated file, bit
+rot — is reliably observable. But it is not a cryptographic authenticator:
+a party that can write the stream can always recompute the checksum, so it
+carries no weight against a malicious writer — the resource-exhaustion
+defenses (the fixed limits and validate-before-allocate discipline above)
+are what stand against hostile streams, not the checksum. It also does not
+localize where the damage is: the load path is all-or-nothing (validate
+everything, then apply), so a single whole-stream checksum is all the
+format needs. Two windows stay open by design and are disclosed rather
+than hidden:
+
+- **The model envelope sits outside the checksum** (see the model-stream
+  table above): the kind byte and header are covered by the model-level
+  checks, but the LTC's `unfolds` — bounded only to its `[1, 1024]` load
+  limit, with no cross-check against the streamed tensors — can carry a
+  single-bit flip that lands inside that range and silently loads as a
+  different-but-valid cell (a checkpoint with more or fewer ODE sub-steps
+  than intended). This is inherent to keeping the envelope outside the
+  checksum: the checksum cannot see bytes it does not cover. Detecting it
+  would need a whole-stream checksum covering the header too.
+- **The `"LNO1"` record section sits outside its embedded blob's
+  checksum**: a state stream's header (magic, version, kind, count) and
+  presence-record fields — including ScheduleFreeAdamW's `lrMax`/`wsum`
+  and the per-parameter `mode` byte — are not covered by the CRC of the
+  embedded tensor blob, so a bit flip there is silently accepted as a
+  different-but-valid state (a pre-existing property of the v1-era LNO1
+  layout, not a v2 regression). The fields' own semantic guards
+  (`lrMax`/`wsum` must be finite, `mode` ∈ {0, 1}) catch some flips; a
+  future LNO1 version could carry its own whole-stream checksum.
+
 **Fuzzed.** Mutation fuzzing pins the contract: `TestMutatedTensorStreamsNeverPanic`
 and `TestMutatedModelStreamsNeverPanic` (bit flips, deletions, inserts,
 block swaps). The red team ran 7,500 mutants against the original
@@ -829,24 +873,31 @@ report I/O failures uniformly.
 
 ## Versioning: honest about the future
 
-`version = 1` is the only layout this build reads. A stream with any
-other version byte fails with `unsupported format version N (this build
-reads version 1)` — future versions will **error out rather than
-mis-parse** an unknown layout. If the wire format ever changes, the
-version bumps and `ReadTensors` grows explicit old-layout support; there
-is no silent best-effort decoding. The format version is exported as
-`serialize.Version` for exactly this kind of check on the caller side.
+This build reads both **v1 and v2** and writes only **v2** (the exported
+`serialize.Version`). A stream with any other version byte fails with
+`unsupported format version N (this build reads version 2)` — future
+versions will **error out rather than mis-parse** an unknown layout. If
+the wire format ever changes, the version bumps and `ReadTensors` grows
+explicit old-layout support; there is no silent best-effort decoding.
+v2 is the only write layout; v1 remains readable for legacy checkpoints.
+The format version is exported as `serialize.Version` for exactly this
+kind of check on the caller side.
 
 ## Golden vectors: the frozen format, byte-pinned
 
-The v1 freeze is enforced, not merely documented. `serialize/testdata/`
-holds committed golden byte streams — `golden_v1_ltc.lnns`,
-`golden_v1_cfc.lnns`, `golden_v1_linear.lnns` (1607, 1603 and 120 bytes) —
-each built from a fixed, documented cell (`nn.NewLTC(4, 6, nil, 6, …101)`,
+The freeze is enforced, not merely documented — and it now guards **two
+families**. `serialize/testdata/` holds committed golden byte streams:
+`golden_v1_{ltc,cfc,linear}.lnns` (1607, 1603 and 120 bytes) freeze the
+historical v1 layout byte for byte — read-only, the proof that legacy
+checkpoints still decode exactly, and never regenerated; and
+`golden_v2_{ltc,cfc,linear}.lnns` (1611, 1607 and 124 bytes) freeze the
+v2 layout this build's writer emits. Each family is built from the same
+fixed, documented cell (`nn.NewLTC(4, 6, nil, 6, …101)`,
 `nn.NewCfC(4, 6, nil, …202)`, `nn.NewLinear(6, 3, …303)`), alongside a
-`golden_v1_<kind>.expected.txt` recording the exact `Step`/`Forward`
-outputs the loaded cell must reproduce, as `%08x` float32 bit patterns
-that a human can audit byte by byte. Three tests play three distinct
+`golden_v1_<kind>.expected.txt` / `golden_v2_<kind>.expected.txt`
+recording the exact `Step`/`Forward` outputs the loaded cell must
+reproduce, as `%08x` float32 bit patterns that a human can audit byte by
+byte. Neither family feeds the other. Three tests play three distinct
 roles, and the freeze they enforce is **graded by platform**:
 
 - The **format layout** — magic, version, tensor count, tensor order,
@@ -888,10 +939,12 @@ roles, and the freeze they enforce is **graded by platform**:
   stays bit-exact on every platform.
 
 Regeneration is gated: `TestWriteGoldenFiles` **skips unless** the run
-passes `-write-golden` (`go test ./serialize -write-golden`), so the
-golden vectors can change only through a deliberate, visible test run —
-never by accident, and never as a side effect of an unrelated change. The
-CfC golden stream reflects the cell *after* the phase-8 `erev` bake: its
+passes `-write-golden` (`go test ./serialize -write-golden`), and it
+rebuilds only the **v2** family — the v1 files are frozen history and are
+never rewritten, because this build cannot even emit v1 — so the golden
+vectors can change only through a deliberate, visible test run, never by
+accident, and never as a side effect of an unrelated change. The CfC
+golden stream reflects the cell *after* the phase-8 `erev` bake: its
 loaded `Step` output is bit-identical to the original cell's, which is
 exactly the equivalence that bake was required to preserve.
 

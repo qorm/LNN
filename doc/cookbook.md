@@ -601,7 +601,7 @@ func must(err error) {
 Measured output (deterministic):
 
 ```
-checkpoint at step 50: model 1859 B, readout 71 B, Adam state 2732 B
+checkpoint at step 50: model 1863 B, readout 75 B, Adam state 2736 B
 steps 0..99 loss bits identical to uninterrupted run: true
 final parameters bit-identical: true
 loss: iter 49 = 0.024681, iter 99 = 0.011424
@@ -1451,7 +1451,7 @@ empty file                   -> truncated stream (interrupted write / bad copy) 
 truncated at half            -> truncated stream (interrupted write / bad copy) — safe to retry (serialize: tensor 7: truncated stream: claims 64 data bytes but only 11 remain: unexpected EOF)
 LTC loader on CfC file       -> wrong loader for this file (kind mismatch) — use the matching LoadXxx (nn: stream holds model kind 1 (CfC), not LTC (kind 0))
 Linear loader on CfC file    -> wrong loader for this file (kind mismatch) — use the matching LoadXxx (nn: stream holds model kind 1 (CfC), not Linear (kind 2))
-corrupt version byte         -> format version skew — newer writer or corruption; update the library (serialize: unsupported format version 99 (this build reads version 1): the stream was written by a newer version of the library; update this build to read it)
+corrupt version byte         -> format version skew — newer writer or corruption; update the library (serialize: unsupported format version 99 (this build reads version 2): the stream was written by a newer version of the library; update this build to read it)
 units=4096 header            -> model exceeds the load-path caps — hostile or oversized header (nn: LTC header has units=4096, exceeding the load limit 2048)
 unfolds=4096 header          -> model exceeds the load-path caps — hostile or oversized header (nn: LTC header has unfolds=4096, exceeding the load limit 1024)
 legit CfC stream             -> ok                           (<nil>)
@@ -1474,9 +1474,9 @@ legit CfC stream             -> ok                           (<nil>)
 - A failing load has **zero side effects**: on a destination model,
   every shape is validated before any value is copied, so the model
   you already have stays exactly as it was. Version skew refuses
-  rather than guesses (`version 1` is the only layout this build
-  reads; higher versions say "update this build", lower say
-  "corrupt or forged").
+  rather than guesses (`version 1` stays frozen as a legacy
+  read-only layout, `version 2` is what this build writes; higher
+  versions say "update this build", lower say "corrupt or forged").
 
 **See also:** [persistence.md](persistence.md#the-untrusted-stream-safety-contract)
 for the full safety contract (limits table, both reader classes,

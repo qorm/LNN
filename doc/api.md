@@ -229,21 +229,23 @@ fields.
 
 | symbol | signature | semantics | fails |
 |---|---|---|---|
-| [`SaveState`](https://pkg.go.dev/github.com/qorm/LNN/optimizer#SaveState) | `SaveState(w, o Optimizer, params) error` | per-parameter state **keyed by index** — same order required at Load; hyperparameters NOT saved; SGD → 19-byte identity stream; deterministic bytes; kinds 0–4 = SGD/Momentum/Adam/AdEMAMix/ScheduleFreeAdamW (kind 4 also carries each parameter's train/eval mode bit) | error: unsupported optimizer, nil param, I/O |
+| [`SaveState`](https://pkg.go.dev/github.com/qorm/LNN/optimizer#SaveState) | `SaveState(w, o Optimizer, params) error` | per-parameter state **keyed by index** — same order required at Load; hyperparameters NOT saved; SGD → 23-byte identity stream; deterministic bytes; kinds 0–4 = SGD/Momentum/Adam/AdEMAMix/ScheduleFreeAdamW (kind 4 also carries each parameter's train/eval mode bit) | error: unsupported optimizer, nil param, I/O |
 | [`LoadState`](https://pkg.go.dev/github.com/qorm/LNN/optimizer#LoadState) | `LoadState(r, o Optimizer, params) error` | validate-all-then-apply: a failing load leaves `o` untouched; present record replaces, absent deletes, stale keys survive; resumed run bit-identical (an eval-mode ScheduleFree stream restores eval mode — `Step` then guards with a panic until `Train`) | error: bad magic/version/kind, count mismatch, shape mismatch, pow inconsistency (Adam/AdEMAMix/ScheduleFree), `t`/`k` > 2²⁴, non-finite `lrMax`/`wsum`, bad mode byte, truncation (`io.ErrUnexpectedEOF`) |
 
 ## serialize — [godoc](https://pkg.go.dev/github.com/qorm/LNN/serialize) · [persistence](persistence.md)
 
-The `"LNNS"` wire format: magic, version, count, then per tensor rank +
-shape + little-endian float32 payload. The exception domain: loads treat
-input as an untrusted byte stream — every failure is an error, never a
-panic, and a hostile stream allocates only in proportion to delivered bytes.
+The `"LNNS"` wire format: magic, version, count, per tensor rank + shape +
+little-endian float32 payload, and — in v2 — a trailing CRC-32C checksum
+over all of it (v1 without the checksum is still read; v2 is the only
+layout written). The exception domain: loads treat input as an untrusted
+byte stream — every failure is an error, never a panic, and a hostile
+stream allocates only in proportion to delivered bytes.
 
 | symbol | signature | semantics | fails |
 |---|---|---|---|
-| [`Version`](https://pkg.go.dev/github.com/qorm/LNN/serialize#Version) | `const Version uint8 = 1` | frozen format version; unknown versions rejected, never guessed | — |
-| [`WriteTensors`](https://pkg.go.dev/github.com/qorm/LNN/serialize#WriteTensors) | `WriteTensors(w, ts []*tensor.Tensor) error` | encode a tensor slice | error: nil tensor, rank > 8, count > 2²⁰, negative dim, shape/Data disagreement, overflow, I/O |
-| [`ReadTensors`](https://pkg.go.dev/github.com/qorm/LNN/serialize#ReadTensors) | `ReadTensors(r) ([]*tensor.Tensor, error)` | decode; fixed limits before allocation; known-length readers checked up front, unknown-length grow progressively | error: bad magic, version skew (directional), limits, truncation (`io.ErrUnexpectedEOF`), trailing bytes |
+| [`Version`](https://pkg.go.dev/github.com/qorm/LNN/serialize#Version) | `const Version uint8 = 2` | the format version this build writes (v2, CRC-32C checksummed); v1 is still read for legacy checkpoints; unknown versions rejected, never guessed | — |
+| [`WriteTensors`](https://pkg.go.dev/github.com/qorm/LNN/serialize#WriteTensors) | `WriteTensors(w, ts []*tensor.Tensor) error` | encode a tensor slice (v2: appends the CRC-32C checksum) | error: nil tensor, rank > 8, count > 2²⁰, negative dim, shape/Data disagreement, overflow, I/O |
+| [`ReadTensors`](https://pkg.go.dev/github.com/qorm/LNN/serialize#ReadTensors) | `ReadTensors(r) ([]*tensor.Tensor, error)` | decode (v1 and v2 both read; v2 verifies the checksum); fixed limits before allocation; known-length readers checked up front, unknown-length grow progressively | error: bad magic, version skew (directional), limits, truncation (`io.ErrUnexpectedEOF`), trailing bytes, v2 checksum mismatch |
 | [`WriteParameters`](https://pkg.go.dev/github.com/qorm/LNN/serialize#WriteParameters) | `WriteParameters(w, params []*autograd.Variable) error` | `WriteTensors` over `p.Data`, in order (order = load key) | error: nil param/Data, WriteTensors errors |
 | [`LoadParameters`](https://pkg.go.dev/github.com/qorm/LNN/serialize#LoadParameters) | `LoadParameters(r, params []*autograd.Variable) error` | copy values back **in place** (pointer identity preserved); all shapes validated first; **stale `Grad` deliberately kept** — `ZeroGrad` before reuse | error: nil param, count/shape mismatch, ReadTensors errors |
 

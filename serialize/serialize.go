@@ -7,16 +7,48 @@
 //
 // All integers are little-endian (encoding/binary.LittleEndian):
 //
-//	magic   [4]byte   "LNNS"
-//	version uint8     1
-//	count   uint32    number of tensors
+//	magic     [4]byte   "LNNS"
+//	version   uint8     2 (v1 and v2 are both read; see "Format versioning")
+//	count     uint32    number of tensors
 //	repeated count times:
 //	  rank  uint8
 //	  shape [rank]int64   (each dimension >= 0)
 //	  data  [size]float32 (IEEE-754, size = product of shape)
+//	checksum  [4]byte   v2 only: CRC-32C (Castagnoli) of every byte above —
+//	                    magic, version, count, and each tensor's rank, shape
+//	                    and data
 //
-// A stream encodes exactly count tensors: trailing bytes after the last
-// tensor's data are rejected as corruption.
+// A stream encodes exactly count tensors followed, in v2, by the 4-byte
+// checksum: trailing bytes after the last tensor's data (v1) or after the
+// checksum (v2) are rejected as corruption.
+//
+// # Integrity checksum (v2)
+//
+// v2 appends a CRC-32C (Castagnoli polynomial, the same code safetensors
+// uses, hardware-accelerated on modern CPUs) computed over the entire stream.
+// It is a damage-detection mechanism, not a cryptographic authenticator: any
+// single-byte flip in a v2 stream almost certainly changes the recomputed
+// value and the load is refused with a checksum-mismatch error, which makes
+// accidental corruption — a flipped bit, a truncated file, bit rot — reliably
+// observable. A party that can write the stream can always recompute the
+// checksum, so it carries no security weight against a malicious writer; the
+// resource-exhaustion defenses (the fixed limits and the
+// validate-before-allocate discipline below) are what stand against hostile
+// streams, not the checksum. It also does not localize where the damage is:
+// the load path is all-or-nothing (validate everything, then apply), so a
+// single whole-stream checksum is all the format needs — per-tensor checksums
+// would localize the damage for no consumer, at the cost of 4 bytes per tensor
+// and a second code path.
+//
+// The checksum is computed and verified incrementally: the writer hashes each
+// byte as it writes it and appends the digest at the end; the reader hashes
+// each byte as it parses it and compares against the stored value after the
+// last tensor. Neither side ever buffers the whole stream, so the
+// unknown-length reader discipline below is untouched. The checksum
+// deliberately sits at the tail, AFTER every structural validation: hostile
+// size claims (rank/shape/count above the limits) are still refused in the
+// header, before any allocation, without waiting for the end of the stream —
+// the checksum is a corruption detector, not the allocation gate.
 //
 // # Error contract (the exception domain)
 //
@@ -34,7 +66,9 @@
 //     discipline as tensor.Size). The limits: maxElems = 1<<30 float32s per
 //     tensor (4 GiB of payload), maxCount = 1<<20 tensors per stream and
 //     maxRank = 8 axes. A stream claiming a 1<<62-wide dimension is rejected
-//     with an error, not serviced with a petabyte-sized make().
+//     with an error, not serviced with a petabyte-sized make(). In v2 a
+//     checksum mismatch is reported as an error after the stream is parsed,
+//     so corrupted data is refused too.
 //   - When the reader reports its remaining length (the Len() method of
 //     bytes.Buffer, bytes.Reader, strings.Reader), every payload claim is
 //     additionally checked against those bytes, so an oversized or truncated
@@ -53,13 +87,16 @@
 //
 // # Format versioning
 //
-// Version 1 — the layout documented above — is frozen. The meaning, position
-// and encoding of every byte this build writes will not change: same magic,
-// same header fields, same tensor order inside the nn model blobs, same
-// little-endian float32 payloads. Two sanctioned paths exist for future
-// formats:
+// Two layouts exist. Version 1 — the layout documented above minus the
+// checksum — is frozen, and the reader still understands it, so legacy
+// checkpoints load unchanged. Version 2 adds the trailing CRC-32C checksum
+// and is the only layout this build writes: every new stream carries
+// integrity protection. The meaning, position and encoding of every byte
+// this build writes will not change: same magic, same header fields, same
+// tensor order inside the nn model blobs, same little-endian float32
+// payloads. Two sanctioned paths exist for future formats:
 //
-//   - Append-only extension within v1: new data may be added only as extra
+//   - Append-only extension within v2: new data may be added only as extra
 //     tensors at the tail of a stream — counted in the header like any other
 //     tensor (bytes after the counted payloads remain corruption), never
 //     interleaved with existing ones, and only where the consuming model
@@ -68,13 +105,13 @@
 //     model-level kind registry (nn/save.go: 0 = LTC, 1 = CfC, 2 = Linear)
 //     grows the same way: new kinds are appended with fresh tags; existing
 //     tags are never reused or redefined.
-//   - A whole-format upgrade: bump Version (to 2) and teach ReadTensors the
-//     old layout explicitly. One version byte governs the entire stream, so
+//   - A whole-format upgrade: bump Version (to 3) and teach ReadTensors the
+//     v2 layout explicitly. One version byte governs the entire stream, so
 //     mixed-version streams cannot exist.
 //
 // Unknown versions are rejected, never guessed: a version byte above Version
 // fails with an error stating the stream was written by a newer version of
-// the library — update this build to read it — and a byte below Version as
+// the library — update this build to read it — and a byte below v1 as
 // corrupt, since no layout older than v1 was ever released. Guessing a
 // layout would silently mis-decode checkpoints, the exact failure mode this
 // package's error contract exists to prevent.
@@ -83,7 +120,11 @@
 // committed Save* byte streams of a documented LTC, CfC and Linear cell
 // (fixed seeds and construction parameters, listed in golden_test.go)
 // together with the exact Step outputs each loaded cell must reproduce.
-// Three tests stand guard, graded by platform because the Go specification
+// Two families coexist: golden_v1_* freezes the historical v1 layout byte
+// for byte (proof the reader still decodes legacy checkpoints exactly), and
+// golden_v2_* freezes the v2 layout this build's writer emits (rebuilt and
+// compared by TestGoldenWriterStability). Neither family feeds the other.
+// Four tests stand guard, graded by platform because the Go specification
 // permits an implementation to fuse multiple floating-point operations into
 // a single rounded operation (FMA contraction), so the same source can
 // legitimately round differently across architectures. On the architecture
@@ -107,6 +148,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash"
+	"hash/crc32"
 	"io"
 	"math"
 	"math/bits"
@@ -115,11 +158,26 @@ import (
 	"github.com/qorm/LNN/tensor"
 )
 
-// Version is the format version this build writes and reads. Bump it (and
-// teach ReadTensors the old layout) if the wire format ever changes.
-const Version uint8 = 1
+// Version is the format version this build writes and reads: 2, the v2
+// layout with the trailing CRC-32C checksum. Version 1 (no checksum) is
+// still read for legacy checkpoints; the reader learns old layouts
+// explicitly, and a whole-format upgrade means bumping Version and teaching
+// ReadTensors the previous layout, exactly as this build was taught v1.
+const Version uint8 = 2
+
+// magicV1 is the version byte of the historical v1 layout (no checksum).
+const magicV1 uint8 = 1
 
 var magic = [4]byte{'L', 'N', 'N', 'S'}
+
+// crc32cTable is the Castagnoli polynomial table (CRC-32C) used for the v2
+// stream checksum: the same algorithm safetensors uses, hardware-accelerated
+// on modern CPUs. It is an integrity (damage-detection) checksum, not a
+// cryptographic MAC — see "Integrity checksum (v2)" in the package doc.
+var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
+
+// newCRC32C returns a fresh incremental CRC-32C hasher.
+func newCRC32C() hash.Hash32 { return crc32.New(crc32cTable) }
 
 // Read-path limits. They exist to turn hostile size claims into errors before
 // an allocation happens; no sane model comes anywhere near them. maxElems
@@ -143,6 +201,7 @@ const chunk = 4096
 type writer struct {
 	w   io.Writer
 	err error
+	sum hash.Hash32 // non-nil for v2: every byte written through write() feeds it
 }
 
 func (bw *writer) write(b []byte) {
@@ -150,6 +209,25 @@ func (bw *writer) write(b []byte) {
 		return
 	}
 	_, bw.err = bw.w.Write(b)
+	if bw.err == nil && bw.sum != nil {
+		bw.sum.Write(b)
+	}
+}
+
+// checksum appends the 4-byte CRC-32C of everything written so far and
+// reports any write failure of that final field. It must be called once, at
+// the end of a v2 stream, after the last tensor payload and only after
+// WriteTensors has confirmed the body wrote without error (bw.err is nil);
+// the checksum bytes themselves are not part of the checksum.
+func (bw *writer) checksum() error {
+	var cb [4]byte
+	binary.LittleEndian.PutUint32(cb[:], bw.sum.Sum32())
+	bw.sum = nil // the checksum field is not covered by the checksum
+	bw.write(cb[:])
+	if bw.err != nil {
+		return fmt.Errorf("serialize: writing stream checksum: %w", bw.err)
+	}
+	return nil
 }
 
 func (bw *writer) u8(v uint8) {
@@ -178,6 +256,7 @@ type reader struct {
 	r        io.Reader
 	total    int64 // stream length, or -1 if the reader does not report one
 	consumed int64
+	sum      hash.Hash32 // non-nil for v2: every byte read through full() feeds it
 }
 
 func newReader(r io.Reader) *reader {
@@ -203,6 +282,9 @@ func (rd *reader) full(b []byte) error {
 	n, err := io.ReadFull(rd.r, b)
 	rd.consumed += int64(n)
 	if err == nil {
+		if rd.sum != nil {
+			rd.sum.Write(b)
+		}
 		return nil
 	}
 	if err == io.EOF || err == io.ErrUnexpectedEOF {
@@ -293,7 +375,7 @@ func WriteTensors(w io.Writer, ts []*tensor.Tensor) error {
 	if uint64(len(ts)) > maxCount {
 		return fmt.Errorf("serialize: %d tensors exceed the stream count limit %d", len(ts), maxCount)
 	}
-	bw := &writer{w: w}
+	bw := &writer{w: w, sum: newCRC32C()}
 	bw.write(magic[:])
 	bw.u8(Version)
 	bw.u32(uint32(len(ts)))
@@ -308,7 +390,7 @@ func WriteTensors(w io.Writer, ts []*tensor.Tensor) error {
 	if bw.err != nil {
 		return fmt.Errorf("serialize: writing stream: %w", bw.err)
 	}
-	return nil
+	return bw.checksum()
 }
 
 // tensor encodes one tensor, rank then shape then float32 payload, after
@@ -352,9 +434,9 @@ func (bw *writer) tensor(t *tensor.Tensor, idx int) error {
 	return bw.err
 }
 
-// ReadTensors reads a stream written by WriteTensors and returns its
-// tensors, each in a freshly allocated buffer that aliases nothing of
-// the reader's bytes.
+// ReadTensors reads a stream written by WriteTensors (v2, checksummed) or by
+// an older build (v1, no checksum) and returns its tensors, each in a freshly
+// allocated buffer that aliases nothing of the reader's bytes.
 //
 // Errors (never panics — the stream is untrusted input): a bad magic,
 // an unknown version byte (directional: "newer version… update this
@@ -362,11 +444,14 @@ func (bw *writer) tensor(t *tensor.Tensor, idx int) error {
 // above maxCount (2^20), a rank above maxRank (8), negative dimensions,
 // a payload above maxElems (2^30 float32s) or overflowing int64, any
 // truncation (surfaced as io.ErrUnexpectedEOF), trailing bytes after
-// the last counted tensor, and underlying I/O errors. Memory use is
-// bounded as described in the package doc: fixed limits validated
-// first, a remaining-bytes check on known-length readers, and growth
-// proportional to the bytes actually delivered on unknown-length
-// readers.
+// the last counted tensor (v1) or after the checksum (v2), a v2
+// checksum mismatch (the stream is corrupt or has been tampered with),
+// and underlying I/O errors. Memory use is bounded as described in the
+// package doc: fixed limits validated first, a remaining-bytes check on
+// known-length readers, and growth proportional to the bytes actually
+// delivered on unknown-length readers. The checksum is computed
+// incrementally as the stream is parsed and verified after the last
+// tensor, so it never requires buffering the stream.
 func ReadTensors(r io.Reader) ([]*tensor.Tensor, error) {
 	rd := newReader(r)
 	var m [4]byte
@@ -380,7 +465,19 @@ func ReadTensors(r io.Reader) ([]*tensor.Tensor, error) {
 	if err := rd.full(vb[:]); err != nil {
 		return nil, fmt.Errorf("serialize: reading format version: %w", err)
 	}
-	if vb[0] != Version {
+	switch vb[0] {
+	case magicV1:
+		// Legacy layout: no checksum. Parsed exactly as v1 always was, so a
+		// checkpoint saved by an older build loads byte-for-byte unchanged.
+		return readV1(rd)
+	case Version:
+		// v2: every byte from the magic on is fed to the CRC as it is read,
+		// and the stored checksum is verified after the last tensor.
+		rd.sum = newCRC32C()
+		rd.sum.Write(m[:])
+		rd.sum.Write(vb[:])
+		return readV2(rd)
+	default:
 		// Rejected, never guessed (see "Format versioning" in the package
 		// doc): the message tells the caller which way the skew goes, so a
 		// checkpoint from the future reads as an actionable "update this
@@ -390,6 +487,12 @@ func ReadTensors(r io.Reader) ([]*tensor.Tensor, error) {
 		}
 		return nil, fmt.Errorf("serialize: unsupported format version %d (this build reads version %d): no earlier layout exists, the stream is corrupt or forged", vb[0], Version)
 	}
+}
+
+// readTensorsBody parses the count field and the count tensors, shared by
+// both layouts. For v2 the reader's sum is already live, so every byte read
+// here is fed to the checksum.
+func readTensorsBody(rd *reader) ([]*tensor.Tensor, error) {
 	var cb [4]byte
 	if err := rd.full(cb[:]); err != nil {
 		return nil, fmt.Errorf("serialize: reading tensor count: %w", err)
@@ -416,11 +519,46 @@ func ReadTensors(r io.Reader) ([]*tensor.Tensor, error) {
 		}
 		ts = append(ts, t)
 	}
-	// The format is self-framing (an explicit count), so anything after the
-	// last tensor's payload is corruption rather than "another message".
+	return ts, nil
+}
+
+// readV1 finishes a version-1 stream: no checksum, and anything after the
+// last tensor's payload is corruption rather than "another message".
+func readV1(rd *reader) ([]*tensor.Tensor, error) {
+	ts, err := readTensorsBody(rd)
+	if err != nil {
+		return nil, err
+	}
 	var probe [1]byte
 	if err := rd.full(probe[:]); err == nil {
-		return nil, fmt.Errorf("serialize: unexpected trailing byte(s) after tensor %d", count-1)
+		return nil, fmt.Errorf("serialize: unexpected trailing byte(s) after tensor %d", len(ts)-1)
+	} else if !errors.Is(err, io.ErrUnexpectedEOF) {
+		return nil, fmt.Errorf("serialize: checking for trailing data: %w", err)
+	}
+	return ts, nil
+}
+
+// readV2 finishes a version-2 stream: it reads the stored CRC-32C (which is
+// itself excluded from the checksum), compares it against the value computed
+// over magic, version, count and every tensor, and rejects a mismatch as
+// corruption. Trailing bytes after the checksum are corruption too.
+func readV2(rd *reader) ([]*tensor.Tensor, error) {
+	ts, err := readTensorsBody(rd)
+	if err != nil {
+		return nil, err
+	}
+	want := rd.sum.Sum32()
+	rd.sum = nil // the stored checksum bytes are not part of the checksum
+	var cb [4]byte
+	if err := rd.full(cb[:]); err != nil {
+		return nil, fmt.Errorf("serialize: reading stream checksum: %w", err)
+	}
+	if got := binary.LittleEndian.Uint32(cb[:]); got != want {
+		return nil, fmt.Errorf("serialize: checksum mismatch: stored %08x, computed %08x: the stream is corrupt or has been tampered with", got, want)
+	}
+	var probe [1]byte
+	if err := rd.full(probe[:]); err == nil {
+		return nil, fmt.Errorf("serialize: unexpected trailing byte(s) after the stream checksum")
 	} else if !errors.Is(err, io.ErrUnexpectedEOF) {
 		return nil, fmt.Errorf("serialize: checking for trailing data: %w", err)
 	}

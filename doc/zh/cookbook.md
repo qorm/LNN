@@ -586,7 +586,7 @@ func must(err error) {
 实测输出（确定性）：
 
 ```
-checkpoint at step 50: model 1859 B, readout 71 B, Adam state 2732 B
+checkpoint at step 50: model 1863 B, readout 75 B, Adam state 2736 B
 steps 0..99 loss bits identical to uninterrupted run: true
 final parameters bit-identical: true
 loss: iter 49 = 0.024681, iter 99 = 0.011424
@@ -1419,7 +1419,7 @@ empty file                   -> truncated stream (interrupted write / bad copy) 
 truncated at half            -> truncated stream (interrupted write / bad copy) — safe to retry (serialize: tensor 7: truncated stream: claims 64 data bytes but only 11 remain: unexpected EOF)
 LTC loader on CfC file       -> wrong loader for this file (kind mismatch) — use the matching LoadXxx (nn: stream holds model kind 1 (CfC), not LTC (kind 0))
 Linear loader on CfC file    -> wrong loader for this file (kind mismatch) — use the matching LoadXxx (nn: stream holds model kind 1 (CfC), not Linear (kind 2))
-corrupt version byte         -> format version skew — newer writer or corruption; update the library (serialize: unsupported format version 99 (this build reads version 1): the stream was written by a newer version of the library; update this build to read it)
+corrupt version byte         -> format version skew — newer writer or corruption; update the library (serialize: unsupported format version 99 (this build reads version 2): the stream was written by a newer version of the library; update this build to read it)
 units=4096 header            -> model exceeds the load-path caps — hostile or oversized header (nn: LTC header has units=4096, exceeding the load limit 2048)
 unfolds=4096 header          -> model exceeds the load-path caps — hostile or oversized header (nn: LTC header has unfolds=4096, exceeding the load limit 1024)
 legit CfC stream             -> ok                           (<nil>)
@@ -1439,8 +1439,9 @@ legit CfC stream             -> ok                           (<nil>)
   ——那是你自己的分配决策）。
 - 失败的加载**零副作用**：对目标模型，所有形状在任何数值拷贝
   之前完成校验，你已有的模型保持原样。版本偏差宁可拒绝也不
-  猜测（`version 1` 是本构建读取的唯一布局；更高版本说"update
-  this build"，更低说"corrupt or forged"）。
+  猜测（`version 1` 仍冻结为遗留只读布局，`version 2` 是本构建
+  写入的布局；更高版本说"update this build"，更低说"corrupt or
+  forged"）。
 
 **延伸阅读：** [persistence.md](persistence.md) 的不可信流安全契约
 一节（限额表、两类读取器、fuzz 证据）与 [pitfalls.md](pitfalls.md)

@@ -20,7 +20,22 @@ import (
 //
 //	kind    uint8      0 = LTC, 1 = CfC, 2 = Linear
 //	header  int32s     LTC: inDim, units, unfolds; CfC: inDim, units; Linear: none
-//	blob    tensors    the serialize wire format ("LNNS", version, count, data)
+//	blob    tensors    the serialize wire format ("LNNS", version, count,
+//	                  data, and — v2 — a trailing CRC-32C checksum over the
+//	                  whole blob; v1 blobs without the checksum still load)
+//
+// The model envelope (kind byte + header) sits OUTSIDE the blob's checksum,
+// so its integrity is enforced by the model-level validation instead: the
+// kind byte is matched exactly, and the header dims are checked against the
+// limits and against the streamed mask shapes (a flipped dim that survives
+// the limits fails the mask-shape check). One residual window stays open:
+// `unfolds` is checked against its [1, 1024] load limit but has no cross-
+// check against the streamed tensors, so a single-bit flip that lands inside
+// that range silently loads as a different-but-valid cell (a checkpoint with
+// more or fewer ODE sub-steps than intended). This is inherent to keeping
+// the envelope outside the checksum — integrity, not authenticity, and the
+// checksum cannot see bytes it does not cover. Detecting it would need a
+// whole-stream checksum covering the header too; see doc/persistence.md.
 //
 // Tensor order inside the blob is fixed and hand-written per model type —
 // deliberately not reflection over struct fields, so the format is auditable
@@ -349,11 +364,11 @@ func SaveLTC(w io.Writer, c *LTC) error {
 // units or inDim above maxUnits / maxInDim (2048 each, load-only
 // limits), every serialize.ReadTensors failure (bad magic, unknown
 // version, truncation — surfaced as io.ErrUnexpectedEOF — hostile size
-// claims), a wrong tensor count, mask shapes or non-binary mask entries,
-// and reversal potentials that are not exactly +1 or -1. All header
-// limits are checked before the blob is parsed, so a hostile header
-// bills no parsing work; see doc/persistence.md for the byte-level
-// contract.
+// claims, and a v2 checksum mismatch), a wrong tensor count, mask shapes
+// or non-binary mask entries, and reversal potentials that are not exactly
+// +1 or -1. All header limits are checked before the blob is parsed, so a
+// hostile header bills no parsing work; see doc/persistence.md for the
+// byte-level contract.
 func LoadLTC(r io.Reader) (*LTC, error) {
 	hr := &headerReader{r: r}
 	if err := readKind(hr, kindLTC); err != nil {
@@ -463,9 +478,10 @@ func SaveCfC(w io.Writer, c *CfC) error {
 // byte, truncated or corrupt header, dims below 1, units or inDim above
 // maxUnits / maxInDim (2048 each, load-only limits), every
 // serialize.ReadTensors failure (bad magic, unknown version,
-// truncation as io.ErrUnexpectedEOF, hostile size claims), a wrong
-// tensor count, bad wiring masks, and reversal potentials that are not
-// exactly +1 or -1. As in LoadLTC, the numerator coefficients are row
+// truncation as io.ErrUnexpectedEOF, hostile size claims, and a v2
+// checksum mismatch), a wrong tensor count, bad wiring masks, and
+// reversal potentials that are not exactly +1 or -1. As in LoadLTC, the
+// numerator coefficients are row
 // views of the erev/sErev storage, so overwriting the streamed
 // polarities updates them in place. See doc/persistence.md.
 func LoadCfC(r io.Reader) (*CfC, error) {
@@ -544,11 +560,12 @@ func SaveLinear(w io.Writer, l *Linear) error {
 //
 // Errors (never panics — the stream is untrusted input): a wrong kind
 // byte, every serialize.ReadTensors failure (bad magic, unknown
-// version, truncation as io.ErrUnexpectedEOF, hostile size claims), a
-// tensor count other than 2, a weight that is not 2D, and a bias shape
-// that does not match the weight's column count. Unlike the cell
-// loaders it has no header dims to bound: the layer's size is whatever
-// W's streamed shape says, subject to serialize's per-tensor limits.
+// version, truncation as io.ErrUnexpectedEOF, hostile size claims, and
+// a v2 checksum mismatch), a tensor count other than 2, a weight that is
+// not 2D, and a bias shape that does not match the weight's column
+// count. Unlike the cell loaders it has no header dims to bound: the
+// layer's size is whatever W's streamed shape says, subject to
+// serialize's per-tensor limits.
 func LoadLinear(r io.Reader) (*Linear, error) {
 	hr := &headerReader{r: r}
 	if err := readKind(hr, kindLinear); err != nil {

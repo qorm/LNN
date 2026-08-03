@@ -332,10 +332,12 @@ func TestRoundTripSGDIdentity(t *testing.T) {
 	if err := SaveState(&buf, o, params); err != nil {
 		t.Fatal(err)
 	}
-	// The SGD stream is header + empty blob: 10 header bytes + a
-	// zero-tensor serialize stream (4 magic + 1 version + 4 count).
-	if n := buf.Len(); n != 19 {
-		t.Errorf("SGD state stream is %d bytes, want 19 (self-framing, no payload)", n)
+	// The SGD stream is header + empty blob: 10 header bytes + a zero-tensor
+	// serialize stream. The serialize blob is v2, so it carries its 4-byte
+	// checksum: 4 magic + 1 version + 4 count + 4 checksum = 13 bytes, 23
+	// total (self-framing, no payload).
+	if n := buf.Len(); n != 23 {
+		t.Errorf("SGD state stream is %d bytes, want 23 (self-framing, no payload)", n)
 	}
 	o2 := NewSGD(0.1)
 	if err := LoadState(bytes.NewReader(buf.Bytes()), o2, params); err != nil {

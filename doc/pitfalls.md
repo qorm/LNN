@@ -258,8 +258,8 @@ proportion to the bytes it actually delivers. The contract in brief:
   see the optimizer state section of [persistence.md](persistence.md).
 
 Format spec, API guide and the complete contract — including the
-versioning rule (version 1 only; unknown versions error out rather than
-mis-parse) — in [persistence.md](persistence.md).
+versioning rule (v1 and v2 read, v2 written; unknown versions error out
+rather than mis-parse) — in [persistence.md](persistence.md).
 
 ## Residual register (stages 16 and 18)
 

@@ -28,7 +28,7 @@ understand the engine, take the reading order below.
 | [cookbook.md](cookbook.md) | Task recipes, each a complete measured program: the minimal loop, Adam + clipping, gradient accumulation, bit-exact checkpoint/resume, variable-`ts` event-driven sequences, model inspection, custom losses, LTC-vs-CfC, multi-module composition, loading untrusted files, LR annealing, deterministic reproduction, long-sequence training with `UnrollRemat` (chunked BPTT), Schedule-Free AdamW and the train/eval contract. |
 | [faq.md](faq.md) | Frequent questions, short answers: loss not falling, `NaN` losses, choosing `ts`/`units`/`unfolds`, gradient accumulation semantics, cross-platform last digits, reading load errors, resuming with Adam. |
 | [api.md](api.md) | API quick reference: every exported symbol per package in one line, with a pointer to its canonical documentation (godoc / concept guides). (New — created by a parallel documentation task.) |
-| [pgo.md](pgo.md) | Profile-guided optimization, measured honestly: why a library ships no profile, the workflow for profiling your own binary, and this repo's benchmark numbers — including the single bistable inlining decision the headline gains hinge on. |
+| [pgo.md](pgo.md) | Profile-guided optimization, measured honestly: why a library ships no profile, the workflow for profiling your own binary, and this repo's benchmark numbers — including the inlining decisions the headline gains hinge on. |
 
 A complete Simplified Chinese mirror of these guides lives in [`zh/`](zh/README.md), one file per row above.
 

@@ -2,9 +2,11 @@ package serialize
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"math"
 	"math/rand"
@@ -110,10 +112,25 @@ func TestEmptyStreamRoundTrip(t *testing.T) {
 	}
 }
 
-// frame prepends a valid magic+version header to raw, for forging streams.
+// frame prepends a valid magic+version (v2) header to raw, for forging
+// streams. The result has no checksum, so it is only a stream HEADER: the
+// forged streams built on it are meant to fail in the header/skeleton checks
+// (magic, version, count, rank, shape), which all fire before the checksum
+// is ever reached.
 func frame(raw []byte) []byte {
 	out := []byte{'L', 'N', 'N', 'S', byte(Version)}
 	return append(out, raw...)
+}
+
+// frameV2 is frame plus the v2 trailing CRC-32C, i.e. a structurally COMPLETE
+// v2 stream built from raw payload bytes. Use it where a forged stream must
+// pass every structural check and only fail on a later one (e.g. a trailing
+// byte after the checksum).
+func frameV2(raw []byte) []byte {
+	s := frame(raw)
+	var b [4]byte
+	binary.LittleEndian.PutUint32(b[:], crc32.Checksum(s, crc32cTable))
+	return append(s, b[:]...)
 }
 
 func count(n uint32) []byte {
@@ -143,12 +160,12 @@ func floats(fs ...float32) []byte {
 }
 
 func TestReadTensorsRejectsHostileStreams(t *testing.T) {
-	valid := func() []byte { // one [2] tensor with two floats
+	valid := func() []byte { // one [2] tensor with two floats, checksummed
 		var s []byte
 		s = append(s, 1) // rank
 		s = append(s, shape64(2)...)
 		s = append(s, floats(1, 2)...)
-		return frame(append(count(1), s...))
+		return frameV2(append(count(1), s...))
 	}
 
 	cases := []struct {
@@ -226,18 +243,19 @@ func TestReadTensorsRejectsHostileStreams(t *testing.T) {
 // TestReadTensorsRejectsUnknownVersionsActionably pins the versioning
 // contract: unknown versions are refused rather than parsed on a guess, and
 // the error must tell the caller which way the skew goes. A version above
-// the current one is a checkpoint from the future — the message carries the
-// actionable "written by a newer version / update" hint; a version below v1
-// can only be corruption, since no older layout was ever released. The
+// the current one (2) is a checkpoint from the future — the message carries
+// the actionable "written by a newer version / update" hint; a version below
+// v1 can only be corruption, since no older layout was ever released. The
 // historic prefix of the message is asserted too, so documentation quoting
-// it keeps matching.
+// it keeps matching. (Versions 1 and 2 are both valid layouts and load, so
+// they are deliberately absent here.)
 func TestReadTensorsRejectsUnknownVersionsActionably(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		version byte
 		want    string
 	}{
-		{"version 2 (next release)", 2, "written by a newer version"},
+		{"version 3 (next release)", 3, "written by a newer version"},
 		{"version 99 (far future)", 99, "update this build"},
 		{"version 0 (never released)", 0, "no earlier layout exists"},
 	} {
@@ -826,6 +844,288 @@ func TestMutatedTensorStreamsNeverPanic(t *testing.T) {
 				ReadTensors(noLen{bytes.NewReader(mut)})
 			}
 		}()
+	}
+}
+
+// --- v2 checksum integrity ---
+
+// TestV2StreamChecksumField pins the checksum encoding itself: the last four
+// bytes of a v2 stream are the standard CRC-32C (Castagnoli — the safetensors
+// algorithm) of the 30-byte body (magic, version, count, rank, shape, data),
+// independent of the round-trip.
+func TestV2StreamChecksumField(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteTensors(&buf, []*tensor.Tensor{tensor.FromData([]float32{1, 2, 3}, 3)}); err != nil {
+		t.Fatal(err)
+	}
+	raw := buf.Bytes()
+	if len(raw) != 34 {
+		t.Fatalf("v2 stream is %d bytes, want 34 (30 body + 4 checksum)", len(raw))
+	}
+	got := binary.LittleEndian.Uint32(raw[30:34])
+	want := crc32.Checksum(raw[:30], crc32cTable)
+	if got != want {
+		t.Errorf("stored checksum %08x, want %08x (CRC-32C of the 30 body bytes)", got, want)
+	}
+}
+
+// TestV2ChecksumDetectsTampering flips one byte in each structural segment of
+// a valid v2 stream — magic, version, shape, data and checksum — and requires
+// every flip to be rejected as an error on BOTH reader classes (the
+// unknown-length reader must verify the checksum just as rigorously). Shape
+// corruption fails in the early skeleton validation (before the checksum is
+// reached); data and checksum corruption fail on the checksum itself.
+func TestV2ChecksumDetectsTampering(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteTensors(&buf, []*tensor.Tensor{tensor.FromData([]float32{1.5, -2.25, 0}, 3)}); err != nil {
+		t.Fatal(err)
+	}
+	raw := buf.Bytes()
+	// Layout: magic(4) version(1) count(4) rank(1) shape(8) data(12) crc(4).
+	if len(raw) != 34 {
+		t.Fatalf("test stream is %d bytes, want 34", len(raw))
+	}
+	if _, err := ReadTensors(bytes.NewReader(raw)); err != nil {
+		t.Fatalf("valid v2 stream rejected: %v", err)
+	}
+
+	flip := func(pos int) []byte {
+		out := append([]byte(nil), raw...)
+		out[pos] ^= 0xFF
+		return out
+	}
+
+	cases := []struct {
+		name    string
+		stream  []byte
+		wantSub string
+	}{
+		{"magic", flip(1), "magic"},
+		{"version", flip(4), "version"}, // 2 ^ 0xFF = 253: a "newer version"
+		{"shape", flip(16), "limit"},    // high byte of the int64 dim: an enormous element count
+		{"data", flip(20), "checksum"},  // payload bit flip: recomputed CRC differs
+		{"checksum", flip(33), "checksum"},
+	}
+	for _, tc := range cases {
+		for _, rd := range []struct {
+			name string
+			r    func() io.Reader
+		}{
+			{"known length", func() io.Reader { return bytes.NewReader(tc.stream) }},
+			{"unknown length", func() io.Reader { return noLen{bytes.NewReader(tc.stream)} }},
+		} {
+			got, err := ReadTensors(rd.r())
+			if err == nil {
+				t.Fatalf("%s / %s: tampered stream accepted: %v", tc.name, rd.name, got)
+			}
+			if !strings.Contains(err.Error(), tc.wantSub) {
+				t.Errorf("%s / %s: error %q does not mention %q", tc.name, rd.name, err, tc.wantSub)
+			}
+		}
+	}
+}
+
+// TestV2ChecksumReadTruncation requires a stream whose checksum field is
+// cut short to fail as io.ErrUnexpectedEOF naming the checksum, on both
+// reader classes.
+func TestV2ChecksumReadTruncation(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteTensors(&buf, []*tensor.Tensor{tensor.FromData([]float32{1, 2, 3, 4}, 4)}); err != nil {
+		t.Fatal(err)
+	}
+	raw := buf.Bytes()
+	for _, cut := range []int{len(raw) - 1, len(raw) - 2, len(raw) - 4} {
+		for name, mk := range map[string]func() io.Reader{
+			"known length":   func() io.Reader { return bytes.NewReader(raw[:cut]) },
+			"unknown length": func() io.Reader { return noLen{bytes.NewReader(raw[:cut])} },
+		} {
+			_, err := ReadTensors(mk())
+			if !errors.Is(err, io.ErrUnexpectedEOF) || !strings.Contains(err.Error(), "checksum") {
+				t.Errorf("cut %d (%s): got %v, want a checksum ErrUnexpectedEOF", cut, name, err)
+			}
+		}
+	}
+}
+
+// TestV2TrailingBytesAfterChecksum pins the self-framing boundary of the v2
+// stream: after the checksum, any further byte is corruption.
+func TestV2TrailingBytesAfterChecksum(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteTensors(&buf, []*tensor.Tensor{tensor.New(1)}); err != nil {
+		t.Fatal(err)
+	}
+	raw := buf.Bytes()
+	for name, mk := range map[string]func() io.Reader{
+		"known length":   func() io.Reader { return bytes.NewReader(append(append([]byte(nil), raw...), 0xFF)) },
+		"unknown length": func() io.Reader { return noLen{bytes.NewReader(append(append([]byte(nil), raw...), 0xFF))} },
+	} {
+		_, err := ReadTensors(mk())
+		if err == nil || !strings.Contains(err.Error(), "trailing") {
+			t.Errorf("%s: got %v, want a trailing-byte error", name, err)
+		}
+	}
+}
+
+// TestV2ChecksumWriteFailure covers the writer's checksum-field error arm: a
+// writer that accepts exactly the 30-byte body but then fails must report the
+// failure with a checksum wrap, not silently drop the field.
+func TestV2ChecksumWriteFailure(t *testing.T) {
+	ts := []*tensor.Tensor{tensor.FromData([]float32{1, 2, 3}, 3)}
+	err := WriteTensors(&limitWriter{limit: 30}, ts)
+	if err == nil {
+		t.Fatal("checksum short write accepted")
+	}
+	if !strings.Contains(err.Error(), "checksum") || !strings.Contains(err.Error(), "space") {
+		t.Errorf("error %q loses the checksum wrap or the underlying cause", err)
+	}
+}
+
+// TestV1LegacyStreamReads proves the reader still decodes a hand-built v1
+// stream (no checksum) and keeps v1's self-framing (trailing bytes are
+// corruption, and there is no trailing checksum to read).
+func TestV1LegacyStreamReads(t *testing.T) {
+	var s []byte
+	s = append(s, 'L', 'N', 'N', 'S', 1) // v1 version byte
+	s = append(s, count(1)...)
+	s = append(s, 1)
+	s = append(s, shape64(2)...)
+	s = append(s, floats(1, 2)...)
+	out, err := ReadTensors(bytes.NewReader(s))
+	if err != nil {
+		t.Fatalf("v1 stream rejected: %v", err)
+	}
+	if len(out) != 1 || !sameBits(out[0], tensor.FromData([]float32{1, 2}, 2)) {
+		t.Fatalf("v1 decode mismatch: %v", out)
+	}
+	// A v1 empty stream loads too.
+	empty := append([]byte{'L', 'N', 'N', 'S', 1}, count(0)...)
+	out, err = ReadTensors(bytes.NewReader(empty))
+	if err != nil || len(out) != 0 {
+		t.Fatalf("v1 empty stream: out=%v err=%v", out, err)
+	}
+	// Trailing bytes after a v1 stream remain corruption (v1 has no checksum).
+	trail := append(append([]byte(nil), s...), 0xFF)
+	if _, err := ReadTensors(bytes.NewReader(trail)); err == nil || !strings.Contains(err.Error(), "trailing") {
+		t.Fatalf("v1 trailing byte: got %v, want trailing error", err)
+	}
+}
+
+// TestV1StreamErrorPaths covers the v1 read path's two error arms that the
+// golden fixtures (which all load successfully) cannot: a v1 stream that
+// fails mid-body surfaces as io.ErrUnexpectedEOF, and a v1 stream whose
+// trailing probe hits a reader-level failure reports that failure rather than
+// swallowing it.
+func TestV1StreamErrorPaths(t *testing.T) {
+	// Truncated mid-body: claims 2 floats, provides 1.
+	var truncated []byte
+	truncated = append(truncated, 'L', 'N', 'N', 'S', 1)
+	truncated = append(truncated, count(1)...)
+	truncated = append(truncated, 1)
+	truncated = append(truncated, shape64(2)...)
+	truncated = append(truncated, floats(1)...)
+	if _, err := ReadTensors(bytes.NewReader(truncated)); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Errorf("v1 mid-body truncation: got %v, want ErrUnexpectedEOF", err)
+	}
+
+	// Valid v1 stream whose trailing probe hits a reader failure.
+	var valid []byte
+	valid = append(valid, 'L', 'N', 'N', 'S', 1)
+	valid = append(valid, count(1)...)
+	valid = append(valid, 1)
+	valid = append(valid, shape64(2)...)
+	valid = append(valid, floats(1, 2)...)
+	boom := errors.New("v1 probe failure")
+	tail := io.MultiReader(bytes.NewReader(valid), &errReader{err: boom})
+	if _, err := ReadTensors(tail); !errors.Is(err, boom) {
+		t.Errorf("v1 probe failure: got %v, want wrapping %v", err, boom)
+	}
+}
+
+// TestGzipRoundTripBitExact exercises the v2 checksum path through a real
+// unknown-length reader (gzip.Reader has no Len method): the decompressed
+// stream round-trips bit-exactly, and a corrupted compressed stream is
+// rejected — by gzip's own checksum or by our CRC, whichever sees it first.
+func TestGzipRoundTripBitExact(t *testing.T) {
+	big := tensor.New(3*chunk + 5)
+	for i := range big.Data {
+		big.Data[i] = float32(i)*0.5 - 17
+	}
+	big.Data[7] = float32(math.NaN())
+	big.Data[8] = float32(math.Inf(-1))
+	in := []*tensor.Tensor{tensor.FromData([]float32{1, -2}, 2), big}
+
+	var buf bytes.Buffer
+	if err := WriteTensors(&buf, in); err != nil {
+		t.Fatal(err)
+	}
+	var comp bytes.Buffer
+	zw := gzip.NewWriter(&comp)
+	if _, err := zw.Write(buf.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	zr, err := gzip.NewReader(bytes.NewReader(comp.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := ReadTensors(zr)
+	if err != nil {
+		t.Fatalf("ReadTensors through gzip: %v", err)
+	}
+	if len(out) != len(in) {
+		t.Fatalf("read %d tensors, want %d", len(out), len(in))
+	}
+	for i := range in {
+		if !sameBits(in[i], out[i]) {
+			t.Errorf("tensor %d not bit-exact through gzip", i)
+		}
+	}
+
+	// A corrupted compressed stream is rejected (by gzip's checksum or ours).
+	badComp := append([]byte(nil), comp.Bytes()...)
+	badComp[len(badComp)-1] ^= 0xFF
+	zr2, err := gzip.NewReader(bytes.NewReader(badComp))
+	if err != nil {
+		return // gzip rejected the header outright: still an error, fine
+	}
+	if _, err := ReadTensors(zr2); err == nil {
+		t.Error("corrupted stream through gzip accepted")
+	}
+}
+
+// TestLoadParametersChecksumMismatchLeavesParamsUntouched extends the F5
+// validate-all-then-apply contract to the checksum: a stream whose checksum
+// is corrupt fails inside ReadTensors, before LoadParameters copies anything,
+// so every destination parameter is bit-identical afterwards.
+func TestLoadParametersChecksumMismatchLeavesParamsUntouched(t *testing.T) {
+	params := []*autograd.Variable{
+		autograd.Var(tensor.FromData([]float32{100, 200}, 2)),
+		autograd.Var(tensor.FromData([]float32{1, 2, 3}, 3)),
+	}
+	var buf bytes.Buffer
+	if err := WriteParameters(&buf, params); err != nil {
+		t.Fatal(err)
+	}
+	raw := buf.Bytes()
+	bad := append([]byte(nil), raw...)
+	bad[len(bad)-1] ^= 0xFF // corrupt the checksum's last byte
+
+	before := make([][]float32, len(params))
+	for i, p := range params {
+		before[i] = append([]float32(nil), p.Data.Data...)
+	}
+	if err := LoadParameters(bytes.NewReader(bad), params); err == nil {
+		t.Fatal("checksum-mismatched stream accepted")
+	}
+	for i, p := range params {
+		for j := range before[i] {
+			if math.Float32bits(p.Data.Data[j]) != math.Float32bits(before[i][j]) {
+				t.Errorf("failed load mutated param %d[%d]: got %v, want %v", i, j, p.Data.Data[j], before[i][j])
+			}
+		}
 	}
 }
 

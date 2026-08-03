@@ -221,20 +221,22 @@ go doc -all github.com/qorm/LNN/autograd   # 包内全部符号
 
 | 符号 | 签名 | 语义 | 失败 |
 |---|---|---|---|
-| [`SaveState`](https://pkg.go.dev/github.com/qorm/LNN/optimizer#SaveState) | `SaveState(w, o Optimizer, params) error` | 逐参数状态，**按下标键控**——Load 必须同序；超参数不入流；SGD → 19 字节恒等流；字节确定性；kind 0–4 = SGD/Momentum/Adam/AdEMAMix/ScheduleFreeAdamW（kind 4 另携带每个参数的 train/eval 模式位） | error：不支持的优化器类型、nil 参数、I/O |
+| [`SaveState`](https://pkg.go.dev/github.com/qorm/LNN/optimizer#SaveState) | `SaveState(w, o Optimizer, params) error` | 逐参数状态，**按下标键控**——Load 必须同序；超参数不入流；SGD → 23 字节恒等流；字节确定性；kind 0–4 = SGD/Momentum/Adam/AdEMAMix/ScheduleFreeAdamW（kind 4 另携带每个参数的 train/eval 模式位） | error：不支持的优化器类型、nil 参数、I/O |
 | [`LoadState`](https://pkg.go.dev/github.com/qorm/LNN/optimizer#LoadState) | `LoadState(r, o Optimizer, params) error` | 先全量校验再应用：失败时 `o` 原样不动；在场记录覆盖、缺席记录删除、陈旧键保留；续训位级一致（eval 模式的 ScheduleFree 流会恢复 eval 模式——`Step` 随之以 panic 守门直至 `Train`） | error：magic/version/kind 错误、计数不符、形状不符、pow 不一致（Adam/AdEMAMix/ScheduleFree）、`t`/`k` > 2²⁴、`lrMax`/`wsum` 非有限、mode 字节非法、截断（`io.ErrUnexpectedEOF`） |
 
 ## serialize — [godoc](https://pkg.go.dev/github.com/qorm/LNN/serialize) · [持久化](persistence.md)
 
-`"LNNS"` 线格式：magic、version、count，随后每个张量的 rank + shape +
-小端 float32 载荷。例外域：加载把输入视为不可信字节流——一切失败都是
-error，绝不 panic，恶意流的分配量只与实际送达的字节成比例。
+`"LNNS"` 线格式：magic、version、count，每个张量的 rank + shape +
+小端 float32 载荷，以及——v2——覆盖全部内容的尾部 CRC-32C 校验和
+（无校验和的 v1 仍可读；v2 是唯一写布局）。例外域：加载把输入视为
+不可信字节流——一切失败都是 error，绝不 panic，恶意流的分配量只与
+实际送达的字节成比例。
 
 | 符号 | 签名 | 语义 | 失败 |
 |---|---|---|---|
-| [`Version`](https://pkg.go.dev/github.com/qorm/LNN/serialize#Version) | `const Version uint8 = 1` | 冻结的格式版本；未知版本一律拒绝，绝不猜测 | — |
-| [`WriteTensors`](https://pkg.go.dev/github.com/qorm/LNN/serialize#WriteTensors) | `WriteTensors(w, ts []*tensor.Tensor) error` | 编码张量切片 | error：nil 张量、rank > 8、数量 > 2²⁰、负维度、Shape/Data 不符、溢出、I/O |
-| [`ReadTensors`](https://pkg.go.dev/github.com/qorm/LNN/serialize#ReadTensors) | `ReadTensors(r) ([]*tensor.Tensor, error)` | 解码；分配前先过固定上限；知长读取器预先核对剩余字节，未知长读取器渐进增长 | error：magic 错误、版本偏移（带方向提示）、超限、截断（`io.ErrUnexpectedEOF`）、尾随字节 |
+| [`Version`](https://pkg.go.dev/github.com/qorm/LNN/serialize#Version) | `const Version uint8 = 2` | 本构建写入的格式版本（v2，带 CRC-32C 校验和）；v1 仍可读以兼容遗留检查点；未知版本一律拒绝，绝不猜测 | — |
+| [`WriteTensors`](https://pkg.go.dev/github.com/qorm/LNN/serialize#WriteTensors) | `WriteTensors(w, ts []*tensor.Tensor) error` | 编码张量切片（v2：末尾追加 CRC-32C 校验和） | error：nil 张量、rank > 8、数量 > 2²⁰、负维度、Shape/Data 不符、溢出、I/O |
+| [`ReadTensors`](https://pkg.go.dev/github.com/qorm/LNN/serialize#ReadTensors) | `ReadTensors(r) ([]*tensor.Tensor, error)` | 解码（v1 与 v2 均可读；v2 校验校验和）；分配前先过固定上限；知长读取器预先核对剩余字节，未知长读取器渐进增长 | error：magic 错误、版本偏移（带方向提示）、超限、截断（`io.ErrUnexpectedEOF`）、尾随字节、v2 校验和失配 |
 | [`WriteParameters`](https://pkg.go.dev/github.com/qorm/LNN/serialize#WriteParameters) | `WriteParameters(w, params []*autograd.Variable) error` | 对 `p.Data` 依次 `WriteTensors`（顺序 = 加载键） | error：nil 参数/Data、WriteTensors 的各类错误 |
 | [`LoadParameters`](https://pkg.go.dev/github.com/qorm/LNN/serialize#LoadParameters) | `LoadParameters(r, params []*autograd.Variable) error` | **原位**复制回参数（指针身份不变）；先全量校验形状；**陈旧 `Grad` 刻意保留**——复用前先 `ZeroGrad` | error：nil 参数、数量/形状不符、ReadTensors 的各类错误 |
 

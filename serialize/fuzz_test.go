@@ -103,12 +103,14 @@ func fuzzValidTensorStream() []byte {
 	return buf.Bytes()
 }
 
-// fuzzGoldenSeed returns the committed golden model stream of the given kind,
-// if present. These are nn model streams (a kind byte + header before the
-// "LNNS" blob), so ReadTensors rejects them on magic — but they are dense,
-// structurally realistic byte sequences for the mutator to start from.
-func fuzzGoldenSeed(kind string) []byte {
-	raw, err := os.ReadFile("testdata/golden_v1_" + kind + ".lnns")
+// fuzzGoldenSeed returns the committed golden model stream of the given kind
+// and family, if present. These are nn model streams (a kind byte + header
+// before the "LNNS" blob), so ReadTensors rejects them on magic — but they
+// are dense, structurally realistic byte sequences for the mutator to start
+// from. Both families are seeded: the v1 files exercise the legacy read path,
+// the v2 files the checksum path.
+func fuzzGoldenSeed(family, kind string) []byte {
+	raw, err := os.ReadFile("testdata/golden_" + family + "_" + kind + ".lnns")
 	if err != nil {
 		return nil
 	}
@@ -126,19 +128,37 @@ func fuzzGoldenSeed(kind string) []byte {
 //     bit-stable), proving the reader only ever yields re-encodable tensors.
 func FuzzReadTensors(f *testing.F) {
 	// (1) Golden / legitimate streams.
-	f.Add(fuzzValidTensorStream())
+	valid := fuzzValidTensorStream()
+	f.Add(valid)
 	for _, k := range []string{"ltc", "cfc", "linear"} {
-		if g := fuzzGoldenSeed(k); g != nil {
-			f.Add(g) // model stream: rejected on magic, a realistic mutation base
+		for _, fam := range []string{"v1", "v2"} {
+			if g := fuzzGoldenSeed(fam, k); g != nil {
+				f.Add(g) // model stream: rejected on magic, a realistic mutation base
+			}
 		}
 	}
 	// Empty stream (magic read fails) and trivially small streams.
 	f.Add([]byte{})
 	f.Add([]byte{'L'})
 	f.Add([]byte("LNNS"))
-	f.Add(fuzzFrame(fuzzCount(0))) // valid empty tensor stream
+	var emptyBuf bytes.Buffer
+	if err := serialize.WriteTensors(&emptyBuf, nil); err != nil {
+		panic(err) // seeding bug, not a library fault
+	}
+	f.Add(emptyBuf.Bytes())        // genuine valid empty v2 stream (count 0 + checksum)
+	f.Add(fuzzFrame(fuzzCount(0))) // header-only empty stream: checksum truncated off
 
-	// (2) Hand-forged red-team classics. Each comment names the attack intent.
+	// (2) Checksum-path probes: the mutator gets realistic starting points for
+	// the v2 verification path — a flipped checksum byte, checksums truncated
+	// by 1 and 3 bytes, and trailing bytes after a valid checksum.
+	badCRC := append([]byte(nil), valid...)
+	badCRC[len(badCRC)-1] ^= 0xFF
+	f.Add(badCRC)
+	f.Add(valid[:len(valid)-1])
+	f.Add(valid[:len(valid)-3])
+	f.Add(append(append([]byte(nil), valid...), 0xFF))
+
+	// (3) Hand-forged red-team classics. Each comment names the attack intent.
 	f.Add([]byte("XXXX\x01" + string(fuzzCount(0))))                                               // bad magic
 	f.Add([]byte{'L', 'N', 'N', 'S', 99})                                                          // version 99 (far future)
 	f.Add([]byte{'L', 'N', 'N', 'S', 0, 0, 0, 0, 0})                                               // version 0 (never released)

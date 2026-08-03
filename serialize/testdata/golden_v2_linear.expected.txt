@@ -1,0 +1,6 @@
+# Golden expectation for golden_v2_linear.lnns — the exact outputs the loaded cell must produce.
+# float32 bit patterns in hex, row-major, one token per element.
+# cell: nn.NewLinear(6, 3, rand.New(rand.NewSource(303)))
+# input x [2 6]: [1 -1 0.5 -0.5 0.25 -0.25 0.75 -0.75 0.125 -0.125 2 -2]
+out 2 3
+be8aa433 bf882f46 3ebad431 3f8fb091 bf3b2973 4004f651

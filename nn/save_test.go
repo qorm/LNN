@@ -981,3 +981,82 @@ func TestLoadLTCRejectsRecurrentMaskShape(t *testing.T) {
 		t.Fatalf("recurrent mask shape: got %v, want shape error", err)
 	}
 }
+
+// TestModelStreamTamperDetectionAndNoSideEffects pins the model-level
+// inheritance of the v2 checksum: a model stream (kind byte + int32 header +
+// the checksummed "LNNS" blob) must reject a single-byte flip in ANY segment
+// — model kind, header, blob magic, blob version, blob shape, blob data or
+// blob checksum — with an error, and every failed load must leave the world
+// exactly as it was: the source cell's parameters bit-unchanged, no partial
+// cell materialized (LoadLTC parses and validates the entire blob — checksum
+// included — before constructing even the throwaway destination).
+func TestModelStreamTamperDetectionAndNoSideEffects(t *testing.T) {
+	cell := NewLTC(4, 6, nil, 5, rand.New(rand.NewSource(11)))
+	var buf bytes.Buffer
+	if err := SaveLTC(&buf, cell); err != nil {
+		t.Fatal(err)
+	}
+	raw := buf.Bytes()
+	if _, err := LoadLTC(bytes.NewReader(raw)); err != nil {
+		t.Fatalf("valid model stream rejected: %v", err)
+	}
+
+	// The blob starts after the model envelope: kind(1) + inDim/units/unfolds (3*4).
+	blobOff := 1 + 3*4
+	if string(raw[blobOff:blobOff+4]) != "LNNS" {
+		t.Fatalf("blob magic not at offset %d: % x", blobOff, raw[blobOff:blobOff+4])
+	}
+	// Within the blob: magic(4) version(1) count(4) rank(1), then the first
+	// tensor's 2 int64 shape dims (the sensory mask [inDim, units]).
+	shapeOff := blobOff + 4 + 1 + 4 + 1
+	// The first tensor's data follows its 8-byte rank... shape: blob + 9
+	// (magic+version+count) + 1 (rank) + 16 (2 int64 dims) = blob + 26.
+	dataOff := blobOff + 9 + 1 + 16
+
+	flip := func(pos int) []byte {
+		out := append([]byte(nil), raw...)
+		out[pos] ^= 0xFF
+		return out
+	}
+
+	before := make([][]float32, len(cell.Parameters()))
+	for i, p := range cell.Parameters() {
+		before[i] = append([]float32(nil), p.Data.Data...)
+	}
+
+	cases := []struct {
+		name    string
+		stream  []byte
+		wantSub string
+	}{
+		// The model envelope is outside the blob's checksum; model-level
+		// validation catches its corruption instead (kind tag, then the mask
+		// shapes vs the header dims).
+		{"model kind", flip(0), "kind"},
+		// inDim LSB 4 -> 251: passes the 2048 cap, but the streamed sensory
+		// mask is still [4,6], so the header-vs-mask shape check rejects it.
+		{"header inDim", flip(1), "mask shape"},
+		// Inside the blob the checksum covers everything after the magic.
+		{"blob magic", flip(blobOff), "magic"},
+		{"blob version", flip(blobOff + 4), "version"},
+		{"blob shape", flip(shapeOff + 7), "negative"},
+		{"blob data", flip(dataOff), "checksum"},
+		{"blob checksum", flip(len(raw) - 1), "checksum"},
+	}
+	for _, tc := range cases {
+		if _, err := LoadLTC(bytes.NewReader(tc.stream)); err == nil {
+			t.Fatalf("%s: tampered model stream accepted", tc.name)
+		} else if !strings.Contains(err.Error(), tc.wantSub) {
+			t.Errorf("%s: error %q does not mention %q", tc.name, err, tc.wantSub)
+		}
+		// Zero side effects: the source cell is untouched by every failed load.
+		for i, p := range cell.Parameters() {
+			for j := range before[i] {
+				if math.Float32bits(p.Data.Data[j]) != math.Float32bits(before[i][j]) {
+					t.Fatalf("%s: failed load mutated the source cell's parameter %d[%d]: got %v, want %v",
+						tc.name, i, j, p.Data.Data[j], before[i][j])
+				}
+			}
+		}
+	}
+}

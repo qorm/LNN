@@ -42,7 +42,7 @@
 | `autograd` | 即时前向 + 按算子种类（op kind）标签派发的反向传播；反向模式 `Backward` | tape/session 对象、逐节点反向闭包（已被标签取代）、图优化、高阶导数 |
 | `nn` | 层、细胞（LTC 与 CfC）、接线、序列展开（unroll）、参数聚合、六个 Save/Load 函数 | 自己的线上格式——持久化是独立的 `serialize` 包；内置优化器位于独立的 `optimizer` 包 |
 | `optimizer` | 作用于 `autograd` 叶节点的 SGD/Momentum/Adam/AdEMAMix/ScheduleFreeAdamW，显式 struct | 每参数速度/矩/`z` 序列以外的状态；学习率调度（由调用方持有的字段；ScheduleFreeAdamW 在设计上即以平均取代调度） |
-| `serialize` | 带版本的 `"LNNS"` 张量流与模型流；只返回 error 的加载路径，对恶意流安全 | 版本协商（只读 version 1，未知版本直接拒绝）；压缩、加密 |
+| `serialize` | 带版本的 `"LNNS"` 张量流与模型流；只返回 error 的加载路径，对恶意流安全 | 版本协商（读 v1 与 v2，只写 v2；未知版本直接拒绝）；压缩、加密 |
 
 ## 一次训练迭代的数据流
 
