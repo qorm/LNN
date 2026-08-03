@@ -48,6 +48,7 @@ last-digit differences across machines matter?").
 | 11 | [Annealing the learning rate mid-training](#11-annealing-the-learning-rate-mid-training) | Hyperparameters are exported fields: write `opt.LR`, in effect from the next `Step`. |
 | 12 | [Deterministic reproduction](#12-deterministic-reproduction) | Seed discipline: same seeds ⇒ bit-identical runs. |
 | 13 | [Long-sequence training: chunked BPTT with UnrollRemat](#13-long-sequence-training-chunked-bptt-with-unrollremat) | Bit-identical gradients at O(chunk) peak graph memory: rematerialization for sequences that outgrow the whole-graph model. |
+| 14 | [Schedule-Free AdamW: training without a schedule](#14-schedule-free-adamw-training-without-a-schedule) | The `y`/`z`/`x` contract in practice: train at `y`, `Eval` to export `x`, and the eval-mode checkpoint resume flow (guarded by a named panic). |
 
 ---
 
@@ -1926,3 +1927,193 @@ mechanism and the three fold classes it replays;
 case, value-dependent cells, the double-NaN payload corner); the
 `nn.UnrollRemat` godoc for the full contract; [api.md](api.md) for the
 one-line entry.
+
+---
+
+## 14. Schedule-Free AdamW: training without a schedule
+
+**Scenario:** you want production-grade training with **no learning-rate
+schedule to tune** — Schedule-Free AdamW (arXiv:2405.15682) replaces the
+decay with iterate averaging. The price is the train/eval contract:
+parameters hold `y` (the gradient-evaluation point) while training, and
+the deployable weights are `x`. The program below trains, exports `x`
+via `Eval`, demonstrates the guard that makes the contract cheap to
+obey (a named panic, not a silent wrong answer), and pauses/resumes
+through an **eval-mode checkpoint** across a fresh optimizer instance.
+
+```go
+package main
+
+import (
+	"bytes"
+	"fmt"
+	"math"
+	"math/rand"
+
+	"github.com/qorm/LNN/autograd"
+	"github.com/qorm/LNN/optimizer"
+	"github.com/qorm/LNN/tensor"
+)
+
+const (
+	n     = 32
+	iters = 120
+	lr    = 0.05
+)
+
+func data() (x, y *autograd.Variable) {
+	rng := rand.New(rand.NewSource(42))
+	xs, ys := make([]float32, n), make([]float32, n)
+	for i := range xs {
+		xs[i] = rng.Float32()*2 - 1
+		ys[i] = 2*xs[i] + 1
+	}
+	return autograd.Const(tensor.FromData(xs, n, 1)),
+		autograd.Const(tensor.FromData(ys, n, 1))
+}
+
+func lossOf(x, y, w, b *autograd.Variable) *autograd.Variable {
+	pred := autograd.Add(autograd.MatMul(x, w), b)
+	diff := autograd.Sub(pred, y)
+	return autograd.MeanAll(autograd.Hadamard(diff, diff))
+}
+
+func main() {
+	x, y := data()
+
+	// 1. Train with Schedule-Free AdamW: no lr schedule anywhere; the
+	//    parameters hold y (the gradient-evaluation point) throughout.
+	w := autograd.Var(tensor.Randn(rand.New(rand.NewSource(7)), 1, 1))
+	b := autograd.Var(tensor.New(1))
+	params := []*autograd.Variable{w, b}
+	opt := optimizer.NewScheduleFreeAdamWDefault(lr)
+	for it := 0; it < iters; it++ {
+		loss := lossOf(x, y, w, b)
+		for _, p := range params {
+			p.ZeroGrad()
+		}
+		loss.Backward()
+		opt.Step(params)
+	}
+
+	// 2. Eval converts params to the x sequence — the deployable weights.
+	opt.Eval(params)
+	fmt.Printf("after %d steps: eval weights x = (%.4f, %.4f)\n", iters, w.Data.Data[0], b.Data.Data[0])
+
+	// 3. Stepping while any parameter is in eval mode panics, naming the
+	//    index — training at x instead of y is the one misuse that would
+	//    silently ruin the method.
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Printf("Step in eval mode -> panic: %v\n", r)
+			}
+		}()
+		opt.Step(params)
+	}()
+
+	// 4. Train converts back to y; training resumes.
+	opt.Train(params)
+	for it := 0; it < 40; it++ {
+		loss := lossOf(x, y, w, b)
+		for _, p := range params {
+			p.ZeroGrad()
+		}
+		loss.Backward()
+		opt.Step(params)
+	}
+	opt.Eval(params)
+	fmt.Printf("after 40 more:      eval weights x = (%.4f, %.4f)\n", w.Data.Data[0], b.Data.Data[0])
+
+	// 5. Eval-mode checkpointing pauses training: the state stream carries
+	//    every parameter's mode bit, so a cross-instance resume is the same
+	//    LoadState -> (Step panics) -> Train -> resume flow.
+	w2 := autograd.Var(tensor.Randn(rand.New(rand.NewSource(7)), 1, 1))
+	b2 := autograd.Var(tensor.New(1))
+	params2 := []*autograd.Variable{w2, b2}
+	opt2 := optimizer.NewScheduleFreeAdamWDefault(lr)
+	for it := 0; it < iters; it++ {
+		loss := lossOf(x, y, w2, b2)
+		for _, p := range params2 {
+			p.ZeroGrad()
+		}
+		loss.Backward()
+		opt2.Step(params2)
+	}
+	opt2.Eval(params2)
+	var stateBuf bytes.Buffer
+	if err := optimizer.SaveState(&stateBuf, opt2, params2); err != nil {
+		panic(err)
+	}
+	fmt.Printf("eval-mode checkpoint: %d bytes, params now hold x\n", stateBuf.Len())
+
+	opt3 := optimizer.NewScheduleFreeAdamWDefault(lr)
+	if err := optimizer.LoadState(bytes.NewReader(stateBuf.Bytes()), opt3, params2); err != nil {
+		panic(err)
+	}
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Printf("Step before Train -> panic: %v\n", r)
+			}
+		}()
+		opt3.Step(params2)
+	}()
+	opt3.Train(params2)
+	for it := 0; it < 40; it++ {
+		loss := lossOf(x, y, w2, b2)
+		for _, p := range params2 {
+			p.ZeroGrad()
+		}
+		loss.Backward()
+		opt3.Step(params2)
+	}
+	opt3.Eval(params2)
+	fmt.Printf("resumed across checkpoint: x = (%.4f, %.4f) — same as the same-instance run: %v\n",
+		w2.Data.Data[0], b2.Data.Data[0],
+		math.Float32bits(w.Data.Data[0]) == math.Float32bits(w2.Data.Data[0]) &&
+			math.Float32bits(b.Data.Data[0]) == math.Float32bits(b2.Data.Data[0]))
+}
+```
+
+Measured output (seeds 42 / 7 — deterministic):
+
+```
+after 120 steps: eval weights x = (2.0591, 1.0162)
+Step in eval mode -> panic: optimizer.ScheduleFreeAdamW.Step: parameter 0 is in eval mode (its Data holds the evaluation weights x): gradients must be evaluated at y; call Train(params) before resuming training
+after 40 more:      eval weights x = (2.1853, 1.0146)
+eval-mode checkpoint: 131 bytes, params now hold x
+Step before Train -> panic: optimizer.ScheduleFreeAdamW.Step: parameter 0 is in eval mode (its Data holds the evaluation weights x): gradients must be evaluated at y; call Train(params) before resuming training
+resumed across checkpoint: x = (2.1853, 1.0146) — same as the same-instance run: true
+```
+
+**Key lines:**
+
+- Training looks completely ordinary — the same four-phase loop. What
+  changes is *where the weights live*: after `Step`, `params` still
+  hold `y`, not the weights you would deploy.
+- `opt.Eval(params)` converts in place to the averaged `x` sequence —
+  evaluate or export there. It is idempotent and touches only
+  parameters that carry state, so calling it twice is safe.
+- The panic at step 3 is the contract's guard, not an error: `Step`
+  checks every parameter's mode bit **before** modifying anything, so
+  training at `x` — the one silent-killer misuse — costs a named panic
+  instead of a ruined run. `Train` converts back (step 4 resumes).
+- The eval-mode checkpoint (kind 4) carries each parameter's mode bit,
+  so the cross-instance resume replays the same gate: `LoadState` →
+  `Step` panics → `Train` → resume, bit-identical to the same-instance
+  run (`Float32bits` compared). Checkpoint in **train mode** for a
+  bit-exact resume of the uninterrupted trajectory; the eval-mode
+  checkpoint is for exporting `x` or pausing (the `y→x→y` round trip
+  rounds, so such a resume sits a few ULP off the never-converted
+  trajectory).
+- LR here is 0.05 — official guidance wants 1×–10× the LR of a
+  scheduled AdamW. `NewScheduleFreeAdamWDefault(lr)` sets
+  β1 = 0.9, β2 = 0.999, eps = 1e-8.
+
+**See also:** [training.md](training.md) for the y/z/x equations, the
+choice guidance among the five optimizers (and AdEMAMix's long-memory
+EMA pair), and the warmup/hyperparameter notes;
+[persistence.md](persistence.md) for the kind-4 wire layout (mode byte,
+`lrMax`/`wsum`, the non-finite and β-change refusals); recipe 4 for the
+general checkpoint/resume pattern.

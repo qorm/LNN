@@ -14,33 +14,44 @@ import (
 // This file adds optimizer-state persistence on top of the serialize
 // package's versioned tensor stream, closing the checkpoint gap: nn's
 // Save/Load functions and serialize.WriteParameters restore model
-// parameters, but Momentum's velocity buffers and Adam's moment estimates,
-// update counts and bias-correction powers lived only in memory, so
-// resuming training from a checkpoint silently reset them — for Adam, that
-// throws away the learning-rate adaptation of every prior step (its bias
-// correction restarts as if t were 0). SaveState/LoadState make a resumed
-// trajectory bit-identical to an uninterrupted one.
+// parameters, but Momentum's velocity buffers, Adam's and AdEMAMix's
+// moment estimates, Schedule-Free's z sequence, and the update counts
+// and bias-correction powers of all three lived only in memory, so
+// resuming training from a checkpoint silently reset them — for Adam,
+// that throws away the learning-rate adaptation of every prior step
+// (its bias correction restarts as if t were 0). SaveState/LoadState
+// make a resumed trajectory bit-identical to an uninterrupted one.
 //
 // # Wire format
 //
 // All integers are little-endian (encoding/binary.LittleEndian); floats are
-// IEEE-754 float32, little-endian:
+// IEEE-754 float32 (resp. float64 for the one wide accumulator), little-endian:
 //
 //	magic    [4]byte  "LNO1"
 //	version  uint8    1
-//	kind     uint8    0 = SGD, 1 = Momentum, 2 = Adam
+//	kind     uint8    0 = SGD, 1 = Momentum, 2 = Adam,
+//	                 3 = AdEMAMix, 4 = ScheduleFreeAdamW
 //	count    uint32   number of parameter records (one per parameter, in
 //	                 the order of the params slice given to SaveState)
 //	repeated count times (the record section; empty for SGD):
 //	  present uint8   0 = no state for this parameter, 1 = state follows
-//	  Adam only, when present:
+//	  Adam and AdEMAMix only, when present:
 //	    t    uint32   update count
 //	    pow1 float32  Beta1^t, saved bit for bit
 //	    pow2 float32  Beta2^t, saved bit for bit
+//	  ScheduleFreeAdamW only, when present:
+//	    k       uint32  update count
+//	    pow2    float32 Beta2^k, saved bit for bit
+//	    lrMax   float32 largest scheduled learning rate seen
+//	    wsum    float64 average-weight accumulator, saved bit for bit
+//	    mode    uint8   the parameter's mode bit: 1 = train (its Data
+//	                    holds y), 0 = eval (its Data holds x)
 //	blob     tensors  serialize.WriteTensors over the state buffers, in
 //	                 parameter order: one velocity tensor per present
-//	                 Momentum parameter, m then v per present Adam
-//	                 parameter, and an (empty) stream of zero tensors for
+//	                 Momentum parameter; m then v per present Adam
+//	                 parameter; m1, m2 then v per present AdEMAMix
+//	                 parameter; z then v per present ScheduleFreeAdamW
+//	                 parameter; and an (empty) stream of zero tensors for
 //	                 SGD — so every state stream, whatever its kind, ends
 //	                 in one counted tensor blob that is self-framing and
 //	                 rejects trailing bytes
@@ -52,12 +63,28 @@ import (
 // own. Each state tensor carries the shape of its parameter's Data, so
 // LoadState validates it dimension by dimension.
 //
-// Hyperparameters (LR, Mu, Beta1/Beta2/Eps) are deliberately NOT in the
+// Hyperparameters (LR, Mu, Beta1/Beta2/Eps, Alpha/Beta3/Warmup,
+// WeightDecay/WarmupSteps) are deliberately NOT in the
 // stream: they are exported fields the caller sets on the destination
-// optimizer, exactly as at construction. For Adam the saved pow1/pow2 are
-// checked bit for bit against this optimizer's Beta1^t/Beta2^t, so loading
-// a stream saved under different betas fails as corruption rather than
-// silently resuming with inconsistent bias correction.
+// optimizer, exactly as at construction. For Adam and AdEMAMix the saved
+// pow1/pow2 are checked bit for bit against this optimizer's
+// Beta1^t/Beta2^t, and likewise for ScheduleFreeAdamW's pow2 against
+// Beta2^k, so loading a stream saved under different betas fails as
+// corruption rather than silently resuming with inconsistent bias
+// correction. Note the corollary: the pow fields are RUNNING products,
+// so a stream saved after the Beta fields were overwritten mid-training
+// (a supported runtime pattern — Step uses the fields as written) fails
+// this check too, because betaPow can only replay a single-beta product,
+// not the segmented one the optimizer accumulated. Resume across a beta
+// change is therefore deliberately refused, indistinguishable from
+// corruption; change betas only between checkpoints you do not intend
+// to resume from, or accept that post-change streams are unloadable.
+// ScheduleFreeAdamW's per-parameter mode bits ARE serialized (the mode
+// byte): an eval-mode checkpoint loads back into eval-mode state, so a
+// forgotten Train panics instead of silently training at x. Only the
+// optimizer-level mode flag — the gate for parameters that carry no
+// state — is transient and not serialized: a fresh optimizer is always
+// in train mode.
 //
 // # Error contract
 //
@@ -101,19 +128,24 @@ const (
 	kindSGD uint8 = iota
 	kindMomentum
 	kindAdam
+	kindAdEMAMix
+	kindScheduleFree
 )
 
-// maxT caps the Adam update count LoadState accepts from a stream. Value:
-// 2^24 (16,777,216 updates). The pow consistency check recomputes Beta^t
-// as t sequential float32 multiplications — the exact rounding path
-// Adam.Step maintains — so the streamed t is also a CPU claim on the load
-// path: a 13-byte record claiming t = 2^32-1 must not bill four billion
-// multiplications. The cap is deliberately load-only (the same asymmetry
-// as serialize's maxUnfolds and nn's maxUnits): Adam.Step's runtime
-// contract is unchanged, because a step count there is the caller's own
-// training history, while a load's input is an untrusted byte stream that
-// gets no vote on its own resource budget. 2^24 steps is far beyond any
-// realistic run in this library — each step is a full graph backward.
+// maxT caps the update count LoadState accepts from a stream for any
+// optimizer carrying a bias-correction power (Adam's and AdEMAMix's t,
+// ScheduleFreeAdamW's k). Value: 2^24 (16,777,216 updates). The pow
+// consistency check recomputes Beta^t as t sequential float32
+// multiplications — the exact rounding path Step maintains in its pow
+// fields — so the streamed t is also a CPU claim on the load path: a
+// 13-byte record claiming t = 2^32-1 must not bill four billion
+// multiplications. The cap is deliberately load-only (the same
+// asymmetry as serialize's maxUnfolds and nn's maxUnits): Step's
+// runtime contract is unchanged, because a step count there is the
+// caller's own training history, while a load's input is an untrusted
+// byte stream that gets no vote on its own resource budget. 2^24 steps
+// is far beyond any realistic run in this library — each step is a
+// full graph backward.
 const maxT = 1 << 24
 
 // stateWriter encodes the stream header and record section by hand with a
@@ -140,6 +172,14 @@ func (sw *stateWriter) u32(v uint32) {
 }
 
 func (sw *stateWriter) f32(v float32) { sw.u32(math.Float32bits(v)) }
+
+func (sw *stateWriter) u64(v uint64) {
+	var b [8]byte
+	binary.LittleEndian.PutUint64(b[:], v)
+	sw.write(b[:])
+}
+
+func (sw *stateWriter) f64(v float64) { sw.u64(math.Float64bits(v)) }
 
 // stateReader decodes the header and record section, normalizing both EOF
 // flavors into io.ErrUnexpectedEOF: a stream that ends mid-structure is
@@ -177,6 +217,14 @@ func (sr *stateReader) u32() uint32 {
 
 func (sr *stateReader) f32() float32 { return math.Float32frombits(sr.u32()) }
 
+func (sr *stateReader) u64() uint64 {
+	var b [8]byte
+	sr.read(b[:])
+	return binary.LittleEndian.Uint64(b[:])
+}
+
+func (sr *stateReader) f64() float64 { return math.Float64frombits(sr.u64()) }
+
 // stateKindOf returns the stream kind tag of a supported optimizer.
 func stateKindOf(o Optimizer) (uint8, bool) {
 	switch o.(type) {
@@ -186,6 +234,10 @@ func stateKindOf(o Optimizer) (uint8, bool) {
 		return kindMomentum, true
 	case *Adam:
 		return kindAdam, true
+	case *AdEMAMix:
+		return kindAdEMAMix, true
+	case *ScheduleFreeAdamW:
+		return kindScheduleFree, true
 	}
 	return 0, false
 }
@@ -198,6 +250,10 @@ func stateKindName(k uint8) string {
 		return "Momentum"
 	case kindAdam:
 		return "Adam"
+	case kindAdEMAMix:
+		return "AdEMAMix"
+	case kindScheduleFree:
+		return "ScheduleFreeAdamW"
 	}
 	return "unknown"
 }
@@ -256,24 +312,27 @@ func checkStateParams(op string, params []*autograd.Variable) error {
 // attaches the i-th record to params[i], so the same order must be given
 // to both). The stream carries only per-parameter state buffers — velocity
 // for Momentum; m, v, the update count t and the bias-correction powers
-// pow1/pow2 for Adam, saved bit for bit so a resumed run continues with
-// exactly the adaptation the interrupted run had accumulated.
-// Hyperparameters are not saved: set them on the destination optimizer
-// before LoadState. For SGD the save is an identity (the record section is
-// empty), but the stream is still written — magic, kind, count and an
-// empty tensor blob — so every kind round-trips through one uniform,
-// self-framing format.
+// pow1/pow2 for Adam; m1, m2, v, t and pow1/pow2 for AdEMAMix; z, v, the
+// update count k, pow2, the average-weight accumulator, lrMax and the
+// parameter's mode bit (1 = train, 0 = eval) for
+// ScheduleFreeAdamW — all counters saved bit for bit so a resumed run
+// continues with exactly the adaptation the interrupted run had
+// accumulated. Hyperparameters are not saved: set them on the destination
+// optimizer before LoadState. For SGD the save is an identity (the record
+// section is empty), but the stream is still written — magic, kind, count
+// and an empty tensor blob — so every kind round-trips through one
+// uniform, self-framing format.
 //
 // SaveState fails with a descriptive error on I/O failure, on a nil
 // parameter or one without Data, on an unsupported optimizer type
-// (anything but *SGD, *Momentum or *Adam), and on an Adam update count
-// that does not fit the format's uint32 field. It never panics and never
-// mutates o or params. Writing the same state twice yields byte-identical
-// streams.
+// (anything but *SGD, *Momentum, *Adam, *AdEMAMix or *ScheduleFreeAdamW),
+// and on an update count that does not fit the format's uint32 field.
+// It never panics and never mutates o or params. Writing the same state
+// twice yields byte-identical streams.
 func SaveState(w io.Writer, o Optimizer, params []*autograd.Variable) error {
 	kind, ok := stateKindOf(o)
 	if !ok {
-		return fmt.Errorf("optimizer: SaveState: unsupported optimizer type %T: state persistence covers SGD, Momentum and Adam", o)
+		return fmt.Errorf("optimizer: SaveState: unsupported optimizer type %T: state persistence covers SGD, Momentum, Adam, AdEMAMix and ScheduleFreeAdamW", o)
 	}
 	if err := checkStateParams("SaveState", params); err != nil {
 		return err
@@ -321,6 +380,49 @@ func SaveState(w io.Writer, o Optimizer, params []*autograd.Variable) error {
 				&tensor.Tensor{Shape: p.Data.Shape, Data: st.m},
 				&tensor.Tensor{Shape: p.Data.Shape, Data: st.v})
 		}
+	case *AdEMAMix:
+		for i, p := range params {
+			st := o.state[p]
+			if st == nil {
+				sw.u8(0)
+				continue
+			}
+			if st.t < 0 || uint64(st.t) > math.MaxUint32 {
+				return fmt.Errorf("optimizer: SaveState: parameter %d: update count %d does not fit the format's uint32 field", i, st.t)
+			}
+			sw.u8(1)
+			sw.u32(uint32(st.t))
+			sw.f32(st.pow1)
+			sw.f32(st.pow2)
+			ts = append(ts,
+				&tensor.Tensor{Shape: p.Data.Shape, Data: st.m1},
+				&tensor.Tensor{Shape: p.Data.Shape, Data: st.m2},
+				&tensor.Tensor{Shape: p.Data.Shape, Data: st.v})
+		}
+	case *ScheduleFreeAdamW:
+		for i, p := range params {
+			st := o.state[p]
+			if st == nil {
+				sw.u8(0)
+				continue
+			}
+			if st.k < 0 || uint64(st.k) > math.MaxUint32 {
+				return fmt.Errorf("optimizer: SaveState: parameter %d: update count %d does not fit the format's uint32 field", i, st.k)
+			}
+			sw.u8(1)
+			sw.u32(uint32(st.k))
+			sw.f32(st.pow2)
+			sw.f32(st.lrMax)
+			sw.f64(st.weightSum)
+			if st.trainMode {
+				sw.u8(1)
+			} else {
+				sw.u8(0)
+			}
+			ts = append(ts,
+				&tensor.Tensor{Shape: p.Data.Shape, Data: st.z},
+				&tensor.Tensor{Shape: p.Data.Shape, Data: st.v})
+		}
 	}
 	if sw.err != nil {
 		return fmt.Errorf("optimizer: writing state header: %w", sw.err)
@@ -338,7 +440,7 @@ func SaveState(w io.Writer, o Optimizer, params []*autograd.Variable) error {
 // optimizer afterwards steps bit-identically to the one that was saved —
 // a resumed training trajectory equals the uninterrupted one element for
 // element (see the resume tests). Any corruption, version skew, kind or
-// count mismatch, shape mismatch, inconsistent Adam counter, truncation
+// count mismatch, shape mismatch, inconsistent counter, truncation
 // or trailing byte is an error; all of the stream is validated before any
 // state is applied, so a failing load leaves o exactly as it was.
 //
@@ -350,14 +452,30 @@ func SaveState(w io.Writer, o Optimizer, params []*autograd.Variable) error {
 // honest-disclosure contract as serialize.LoadParameters' stale Grad).
 // Construct a fresh optimizer to load into for a clean state.
 //
-// The destination optimizer supplies the hyperparameters; for Adam the
-// streamed pow1/pow2 must equal this optimizer's Beta1^t/Beta2^t bit for
-// bit, so a stream saved under different betas fails as corruption rather
-// than resuming with inconsistent bias correction. An Adam update count
-// above maxT (2^24) is rejected before the blob is even parsed — a
-// load-only limit bounding the pow recomputation cost, with Adam.Step's
+// The destination optimizer supplies the hyperparameters; for Adam and
+// AdEMAMix the streamed pow1/pow2 must equal this optimizer's
+// Beta1^t/Beta2^t bit for bit, and likewise ScheduleFreeAdamW's pow2
+// against Beta2^k, so a stream saved under different betas fails as
+// corruption rather than resuming with inconsistent bias correction.
+// Because the pow fields are running products, the same refusal fires
+// for a stream saved after the Beta fields were overwritten
+// mid-training — betaPow replays a single-beta product, not the
+// segmented one such a run accumulates. That is deliberate (it doubles
+// as the hyperparameter-skew guard), but it means a beta change must
+// not straddle a checkpoint you intend to resume from. An update count
+// above maxT (2^24) — Adam's and AdEMAMix's t,
+// ScheduleFreeAdamW's k — is rejected before the blob is even parsed: a
+// load-only limit bounding the pow recomputation cost, with Step's
 // runtime contract unchanged. SGD carries no state; loading an SGD
 // stream validates the stream and changes nothing.
+//
+// For ScheduleFreeAdamW each record's mode bit is restored with the
+// rest of the state: a stream saved in eval mode loads back into
+// eval-mode state, so stepping before Train panics (naming the
+// parameter) instead of silently training at x, and Train then
+// performs the x-to-y conversion that makes the resume bit-identical
+// to the same-instance path. Only the optimizer-level mode flag — the
+// gate for parameters without state — is transient and not serialized.
 //
 // It never panics on stream contents (the stream is untrusted input,
 // the documented exception domain): truncation surfaces as
@@ -368,7 +486,7 @@ func SaveState(w io.Writer, o Optimizer, params []*autograd.Variable) error {
 func LoadState(r io.Reader, o Optimizer, params []*autograd.Variable) error {
 	kind, ok := stateKindOf(o)
 	if !ok {
-		return fmt.Errorf("optimizer: LoadState: unsupported optimizer type %T: state persistence covers SGD, Momentum and Adam", o)
+		return fmt.Errorf("optimizer: LoadState: unsupported optimizer type %T: state persistence covers SGD, Momentum, Adam, AdEMAMix and ScheduleFreeAdamW", o)
 	}
 	if err := checkStateParams("LoadState", params); err != nil {
 		return err
@@ -407,10 +525,13 @@ func LoadState(r io.Reader, o Optimizer, params []*autograd.Variable) error {
 	// Parse the record section into staging; the optimizer is not touched
 	// until every record, tensor and counter below has validated.
 	type stateRecord struct {
-		present bool
-		t       int     // Adam: update count
-		pow1    float32 // Adam: Beta1^t, as saved
-		pow2    float32 // Adam: Beta2^t, as saved
+		present   bool
+		t         int     // Adam/AdEMAMix: update count t; ScheduleFreeAdamW: k
+		pow1      float32 // Adam/AdEMAMix: Beta1^t, as saved
+		pow2      float32 // Adam/AdEMAMix: Beta2^t; ScheduleFreeAdamW: Beta2^k
+		lrMax     float32 // ScheduleFreeAdamW: largest scheduled lr seen
+		weightSum float64 // ScheduleFreeAdamW: average-weight accumulator
+		mode      bool    // ScheduleFreeAdamW: train (true) / eval (false)
 	}
 	recs := make([]stateRecord, count)
 	presentCount := 0
@@ -431,24 +552,61 @@ func LoadState(r io.Reader, o Optimizer, params []*autograd.Variable) error {
 			default:
 				return fmt.Errorf("optimizer: parameter %d: presence flag %d outside {0, 1}: the stream is corrupt", i, present)
 			}
-			if !recs[i].present || kind != kindAdam {
+			if !recs[i].present {
 				continue
 			}
-			t := sr.u32()
-			pow1 := sr.f32()
-			pow2 := sr.f32()
-			if sr.err != nil {
-				return fmt.Errorf("optimizer: parameter %d: reading Adam counters: %w", i, sr.err)
+			switch kind {
+			case kindMomentum:
+				// No counters beyond the presence flag.
+			case kindAdam, kindAdEMAMix:
+				t := sr.u32()
+				pow1 := sr.f32()
+				pow2 := sr.f32()
+				if sr.err != nil {
+					return fmt.Errorf("optimizer: parameter %d: reading %s counters: %w", i, stateKindName(kind), sr.err)
+				}
+				// Checked before the blob is even parsed, on the same
+				// discipline as serialize's size limits: t bounds the pow
+				// recomputation in the validation phase below.
+				if uint64(t) > maxT {
+					return fmt.Errorf("optimizer: parameter %d: update count %d exceeds the load limit %d", i, t, maxT)
+				}
+				recs[i].t = int(t)
+				recs[i].pow1 = pow1
+				recs[i].pow2 = pow2
+			case kindScheduleFree:
+				k := sr.u32()
+				pow2 := sr.f32()
+				lrMax := sr.f32()
+				wsum := sr.f64()
+				mode := sr.u8()
+				if sr.err != nil {
+					return fmt.Errorf("optimizer: parameter %d: reading %s counters: %w", i, stateKindName(kind), sr.err)
+				}
+				if uint64(k) > maxT {
+					return fmt.Errorf("optimizer: parameter %d: update count %d exceeds the load limit %d", i, k, maxT)
+				}
+				switch mode {
+				case 0, 1:
+				default:
+					return fmt.Errorf("optimizer: parameter %d: mode flag %d outside {0, 1}: the stream is corrupt", i, mode)
+				}
+				// Non-finite accumulators can never arise from Step
+				// (LR > 0 keeps every weight positive and finite):
+				// reject them here as corruption, before they would
+				// turn the first resumed update NaN.
+				if math.IsNaN(float64(lrMax)) || math.IsInf(float64(lrMax), 0) {
+					return fmt.Errorf("optimizer: parameter %d: stream lrMax %v is not finite: the stream is corrupt", i, lrMax)
+				}
+				if math.IsNaN(wsum) || math.IsInf(wsum, 0) {
+					return fmt.Errorf("optimizer: parameter %d: stream weight accumulator %v is not finite: the stream is corrupt", i, wsum)
+				}
+				recs[i].t = int(k)
+				recs[i].pow2 = pow2
+				recs[i].lrMax = lrMax
+				recs[i].weightSum = wsum
+				recs[i].mode = mode == 1
 			}
-			// Checked before the blob is even parsed, on the same
-			// discipline as serialize's size limits: t bounds the pow
-			// recomputation in the validation phase below.
-			if uint64(t) > maxT {
-				return fmt.Errorf("optimizer: parameter %d: update count %d exceeds the load limit %d", i, t, maxT)
-			}
-			recs[i].t = int(t)
-			recs[i].pow1 = pow1
-			recs[i].pow2 = pow2
 		}
 	}
 
@@ -462,6 +620,10 @@ func LoadState(r io.Reader, o Optimizer, params []*autograd.Variable) error {
 		tensorsPerPresent = 1 // velocity
 	case kindAdam:
 		tensorsPerPresent = 2 // m, v
+	case kindAdEMAMix:
+		tensorsPerPresent = 3 // m1, m2, v
+	case kindScheduleFree:
+		tensorsPerPresent = 2 // z, v
 	}
 	if want := presentCount * tensorsPerPresent; len(ts) != want {
 		return fmt.Errorf("optimizer: state blob holds %d tensors, want %d (%d present parameters, %d tensors each)",
@@ -471,6 +633,8 @@ func LoadState(r io.Reader, o Optimizer, params []*autograd.Variable) error {
 	// Validate every shape and counter before applying anything, so a
 	// stream that mismatches late leaves the optimizer exactly as it was.
 	adam, _ := o.(*Adam)
+	ademamix, _ := o.(*AdEMAMix)
+	scheduleFree, _ := o.(*ScheduleFreeAdamW)
 	k := 0
 	for i := range recs {
 		if !recs[i].present {
@@ -499,6 +663,38 @@ func LoadState(r io.Reader, o Optimizer, params []*autograd.Variable) error {
 			if want := betaPow(adam.Beta2, recs[i].t); math.Float32bits(recs[i].pow2) != math.Float32bits(want) {
 				return fmt.Errorf("optimizer: parameter %d: stream pow2 is 0x%08x but Beta2^%d = 0x%08x for this optimizer's Beta2=%v: the stream is corrupt or was saved with different Adam hyperparameters",
 					i, math.Float32bits(recs[i].pow2), recs[i].t, math.Float32bits(want), adam.Beta2)
+			}
+		case kindAdEMAMix:
+			if !tensor.SameShape(ts[k], params[i].Data) {
+				return fmt.Errorf("optimizer: parameter %d: moment m1 shape mismatch: stream has %v, parameter has %v", i, ts[k].Shape, shape)
+			}
+			if !tensor.SameShape(ts[k+1], params[i].Data) {
+				return fmt.Errorf("optimizer: parameter %d: moment m2 shape mismatch: stream has %v, parameter has %v", i, ts[k+1].Shape, shape)
+			}
+			if !tensor.SameShape(ts[k+2], params[i].Data) {
+				return fmt.Errorf("optimizer: parameter %d: moment v shape mismatch: stream has %v, parameter has %v", i, ts[k+2].Shape, shape)
+			}
+			// Same bit-for-bit pow discipline as Adam: betaPow replays
+			// Step's sequential product, so a mismatch means corruption
+			// or a hyperparameter skew between save and load.
+			if want := betaPow(ademamix.Beta1, recs[i].t); math.Float32bits(recs[i].pow1) != math.Float32bits(want) {
+				return fmt.Errorf("optimizer: parameter %d: stream pow1 is 0x%08x but Beta1^%d = 0x%08x for this optimizer's Beta1=%v: the stream is corrupt or was saved with different AdEMAMix hyperparameters",
+					i, math.Float32bits(recs[i].pow1), recs[i].t, math.Float32bits(want), ademamix.Beta1)
+			}
+			if want := betaPow(ademamix.Beta2, recs[i].t); math.Float32bits(recs[i].pow2) != math.Float32bits(want) {
+				return fmt.Errorf("optimizer: parameter %d: stream pow2 is 0x%08x but Beta2^%d = 0x%08x for this optimizer's Beta2=%v: the stream is corrupt or was saved with different AdEMAMix hyperparameters",
+					i, math.Float32bits(recs[i].pow2), recs[i].t, math.Float32bits(want), ademamix.Beta2)
+			}
+		case kindScheduleFree:
+			if !tensor.SameShape(ts[k], params[i].Data) {
+				return fmt.Errorf("optimizer: parameter %d: z shape mismatch: stream has %v, parameter has %v", i, ts[k].Shape, shape)
+			}
+			if !tensor.SameShape(ts[k+1], params[i].Data) {
+				return fmt.Errorf("optimizer: parameter %d: moment v shape mismatch: stream has %v, parameter has %v", i, ts[k+1].Shape, shape)
+			}
+			if want := betaPow(scheduleFree.Beta2, recs[i].t); math.Float32bits(recs[i].pow2) != math.Float32bits(want) {
+				return fmt.Errorf("optimizer: parameter %d: stream pow2 is 0x%08x but Beta2^%d = 0x%08x for this optimizer's Beta2=%v: the stream is corrupt or was saved with different ScheduleFreeAdamW hyperparameters",
+					i, math.Float32bits(recs[i].pow2), recs[i].t, math.Float32bits(want), scheduleFree.Beta2)
 			}
 		}
 		k += tensorsPerPresent
@@ -540,6 +736,45 @@ func LoadState(r io.Reader, o Optimizer, params []*autograd.Variable) error {
 				k += 2
 			} else {
 				delete(adam.state, params[i])
+			}
+		}
+	case kindAdEMAMix:
+		if ademamix.state == nil {
+			ademamix.state = make(map[*autograd.Variable]*ademamixState, len(params))
+		}
+		for i := range recs {
+			if recs[i].present {
+				ademamix.state[params[i]] = &ademamixState{
+					m1:   ts[k].Data,
+					m2:   ts[k+1].Data,
+					v:    ts[k+2].Data,
+					t:    recs[i].t,
+					pow1: recs[i].pow1,
+					pow2: recs[i].pow2,
+				}
+				k += 3
+			} else {
+				delete(ademamix.state, params[i])
+			}
+		}
+	case kindScheduleFree:
+		if scheduleFree.state == nil {
+			scheduleFree.state = make(map[*autograd.Variable]*scheduleFreeState, len(params))
+		}
+		for i := range recs {
+			if recs[i].present {
+				scheduleFree.state[params[i]] = &scheduleFreeState{
+					z:         ts[k].Data,
+					v:         ts[k+1].Data,
+					k:         recs[i].t,
+					pow2:      recs[i].pow2,
+					lrMax:     recs[i].lrMax,
+					weightSum: recs[i].weightSum,
+					trainMode: recs[i].mode,
+				}
+				k += 2
+			} else {
+				delete(scheduleFree.state, params[i])
 			}
 		}
 	}

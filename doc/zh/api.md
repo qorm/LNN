@@ -211,13 +211,18 @@ go doc -all github.com/qorm/LNN/autograd   # 包内全部符号
 | [`Momentum`](https://pkg.go.dev/github.com/qorm/LNN/optimizer#Momentum) / [`NewMomentum`](https://pkg.go.dev/github.com/qorm/LNN/optimizer#NewMomentum) | `struct{ LR, Mu float32 }` / `NewMomentum(lr, mu)` | 重球法：`v = Mu·v + g; p -= LR·v`；速度按参数指针键控 | panic：lr ≤ 0、mu ∉ [0,1)；Step：参数尺寸变更 |
 | [`Adam`](https://pkg.go.dev/github.com/qorm/LNN/optimizer#Adam) / [`NewAdam`](https://pkg.go.dev/github.com/qorm/LNN/optimizer#NewAdam) | `struct{ LR, Beta1, Beta2, Eps float32 }` / `NewAdam(lr, b1, b2, eps)` | 偏差校正动量，全程 float32；状态按参数指针键控 | panic：lr ≤ 0、beta ∉ [0,1)、eps ≤ 0；Step：参数尺寸变更 |
 | [`NewAdamDefault`](https://pkg.go.dev/github.com/qorm/LNN/optimizer#NewAdamDefault) | `NewAdamDefault(lr) *Adam` | Kingma & Ba 推荐值：0.9 / 0.999 / 1e-8 | panic：lr ≤ 0 |
+| [`AdEMAMix`](https://pkg.go.dev/github.com/qorm/LNN/optimizer#AdEMAMix) / [`NewAdEMAMix`](https://pkg.go.dev/github.com/qorm/LNN/optimizer#NewAdEMAMix) | `struct{ LR, Beta1, Beta2, Beta3, Alpha, Eps float32; Warmup int }` / `NewAdEMAMix(lr, b1, b2, b3, alpha, warmup, eps)` | Adam 外加第二条刻意**不校正**的慢速梯度 EMA，以 α 混入（arXiv:2409.03137，ICLR 2025）；α 线性/β3 半衰期 warmup 调度；不含解耦 weight decay；状态按参数指针键控 | panic：lr ≤ 0、beta ∉ [0,1)、alpha < 0、warmup < 0、eps ≤ 0；Step：参数尺寸变更 |
+| [`NewAdEMAMixDefault`](https://pkg.go.dev/github.com/qorm/LNN/optimizer#NewAdEMAMixDefault) | `NewAdEMAMixDefault(lr, warmup) *AdEMAMix` | 论文默认值：0.9 / 0.999 / 0.9999 / α=5 / 1e-8 | panic：lr ≤ 0 |
+| [`ScheduleFreeAdamW`](https://pkg.go.dev/github.com/qorm/LNN/optimizer#ScheduleFreeAdamW) / [`NewScheduleFreeAdamW`](https://pkg.go.dev/github.com/qorm/LNN/optimizer#NewScheduleFreeAdamW) | `struct{ LR, Beta1, Beta2, Eps, WeightDecay float32; WarmupSteps int }` / `NewScheduleFreeAdamW(lr, b1, b2, eps)` | 免调度 AdamW（arXiv:2405.15682，NeurIPS 2024）：在 `y` 处求梯度、在 `z` 上跑基础 AdamW、可部署权重是平均后的 `x`；**训练中参数恒持 `y`**——`Eval`/`Train` 转换；`WeightDecay` 解耦、在 `y` 处施加；偏差校正随官方 v1.3+ | panic：lr ≤ 0、b1 ∉ (0,1)、b2 ∉ [0,1)、eps ≤ 0；Step：eval 模式参数（按编号指名）或尺寸变更；Train/Eval：nil 数据或尺寸变更 |
+| [`NewScheduleFreeAdamWDefault`](https://pkg.go.dev/github.com/qorm/LNN/optimizer#NewScheduleFreeAdamWDefault) | `NewScheduleFreeAdamWDefault(lr) *ScheduleFreeAdamW` | 默认值 β1 0.9、β2 0.999、eps 1e-8（官方 LR 指引：调度版 AdamW 的 1×–10×） | panic：lr ≤ 0 |
+| [`Train`](https://pkg.go.dev/github.com/qorm/LNN/optimizer#ScheduleFreeAdamW.Train) / [`Eval`](https://pkg.go.dev/github.com/qorm/LNN/optimizer#ScheduleFreeAdamW.Eval) | `(*ScheduleFreeAdamW).Train(params)` / `Eval(params)` | 对每个持有状态的参数做原位 y↔x 转换（幂等；无状态参数不动）：`Eval` 用于评估/导出，`Train` 用于下一次 `Step` 之前 | panic：nil 数据、参数尺寸变更 |
 
 ### 状态持久化（`"LNO1"` 流——只报 error，绝不 panic）
 
 | 符号 | 签名 | 语义 | 失败 |
 |---|---|---|---|
-| [`SaveState`](https://pkg.go.dev/github.com/qorm/LNN/optimizer#SaveState) | `SaveState(w, o Optimizer, params) error` | 逐参数状态，**按下标键控**——Load 必须同序；超参数不入流；SGD → 19 字节恒等流；字节确定性 | error：不支持的优化器类型、nil 参数、I/O |
-| [`LoadState`](https://pkg.go.dev/github.com/qorm/LNN/optimizer#LoadState) | `LoadState(r, o Optimizer, params) error` | 先全量校验再应用：失败时 `o` 原样不动；在场记录覆盖、缺席记录删除、陈旧键保留；续训位级一致 | error：magic/version/kind 错误、计数不符、形状不符、Adam pow 不一致、`t` > 2²⁴、截断（`io.ErrUnexpectedEOF`） |
+| [`SaveState`](https://pkg.go.dev/github.com/qorm/LNN/optimizer#SaveState) | `SaveState(w, o Optimizer, params) error` | 逐参数状态，**按下标键控**——Load 必须同序；超参数不入流；SGD → 19 字节恒等流；字节确定性；kind 0–4 = SGD/Momentum/Adam/AdEMAMix/ScheduleFreeAdamW（kind 4 另携带每个参数的 train/eval 模式位） | error：不支持的优化器类型、nil 参数、I/O |
+| [`LoadState`](https://pkg.go.dev/github.com/qorm/LNN/optimizer#LoadState) | `LoadState(r, o Optimizer, params) error` | 先全量校验再应用：失败时 `o` 原样不动；在场记录覆盖、缺席记录删除、陈旧键保留；续训位级一致（eval 模式的 ScheduleFree 流会恢复 eval 模式——`Step` 随之以 panic 守门直至 `Train`） | error：magic/version/kind 错误、计数不符、形状不符、pow 不一致（Adam/AdEMAMix/ScheduleFree）、`t`/`k` > 2²⁴、`lrMax`/`wsum` 非有限、mode 字节非法、截断（`io.ErrUnexpectedEOF`） |
 
 ## serialize — [godoc](https://pkg.go.dev/github.com/qorm/LNN/serialize) · [持久化](persistence.md)
 

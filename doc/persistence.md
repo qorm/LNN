@@ -6,7 +6,7 @@
 versioned, little-endian binary format (magic `"LNNS"`), and `nn` builds
 six Save/Load functions on top of it for the LTC and CfC cells and the
 Linear layer. The `optimizer` package adds `SaveState`/`LoadState`
-(magic `"LNO1"`) for SGD/Momentum/Adam per-parameter state, so a resumed
+(magic `"LNO1"`) for the five optimizers' per-parameter state, so a resumed
 training run is bit-identical to an uninterrupted one. Loading treats its
 input as an untrusted byte stream: every failure is an error (never a
 panic), size claims are validated before any buffer is allocated, and a
@@ -38,7 +38,7 @@ The two optimizer-level functions (full format and contracts below):
 
 | function | signature | stream contents |
 |---|---|---|
-| `optimizer.SaveState(w, o, params)` / `optimizer.LoadState(r, o, params)` | `func(io.Writer, Optimizer, []*autograd.Variable) error` / `func(io.Reader, Optimizer, []*autograd.Variable) error` | magic `"LNO1"`; kind `0/1/2` = SGD/Momentum/Adam; count; presence records; one tensor blob |
+| `optimizer.SaveState(w, o, params)` / `optimizer.LoadState(r, o, params)` | `func(io.Writer, Optimizer, []*autograd.Variable) error` / `func(io.Reader, Optimizer, []*autograd.Variable) error` | magic `"LNO1"`; kind `0–4` = SGD/Momentum/Adam/AdEMAMix/ScheduleFreeAdamW; count; presence records; one tensor blob |
 
 The four stream-level building blocks in `serialize`:
 
@@ -328,9 +328,10 @@ bit-identical for `Momentum` and `Adam` too.
 
 ## Optimizer state streams: `SaveState`/`LoadState` (the `"LNO1"` format)
 
-A model checkpoint restores parameters — but the *state* of `Momentum`
-and `Adam` (velocity buffers; moment estimates, update counts,
-bias-correction powers) lived only in memory, so resuming from a
+A model checkpoint restores parameters — but the *state* of `Momentum`,
+`Adam`, `AdEMAMix` and `ScheduleFreeAdamW` (velocity buffers; moment
+estimates, the slow EMA, the `z` sequence, update counts, bias-correction
+powers, per-parameter mode bits) lived only in memory, so resuming from a
 model-only checkpoint silently reset it: for Adam that throws away the
 learning-rate adaptation of every prior step (its bias correction
 restarts as if `t` were 0). `optimizer.SaveState`/`LoadState` persist
@@ -505,14 +506,21 @@ Adam stream into Momentum -> optimizer: state stream kind 2 (Adam) does not matc
 **The resume contract, bit for bit.** 50 steps → checkpoint → resume 50
 steps into *fresh* objects vs. an uninterrupted 100 steps: steps 51–100
 agree **per parameter (`Float32bits`) and per printed loss, for all
-three optimizers** (`TestResumeBitExact{Adam,Momentum,SGD}`; the final
+five optimizers** (`TestResumeBitExact{Adam,Momentum,SGD}` and the
+stage-20 `TestResumeBitExact{AdEMAMix,ScheduleFree}`; the final
 loss bit patterns are pinned by the tests, and the red team re-verified
 the contract on a different model family — the LTC cells — rather than
 the implementer's). Adam's update count `t` and bias-correction powers
 `pow1 = Beta1^t`, `pow2 = Beta2^t` are saved **bit for bit**, so the
 resumed run continues with exactly the adaptation the interrupted run
 had accumulated; writing the same state twice yields byte-identical
-streams (`TestSaveStateDeterministic`).
+streams (`TestSaveStateDeterministic`). The two newer kinds carry their
+own counters — AdEMAMix the same `t`/`pow1`/`pow2` triple,
+ScheduleFreeAdamW `k`/`pow2` plus `lrMax` and the `wsum` average-weight
+accumulator — and both resume tests deliberately straddle the warmup
+boundary (`Warmup = 80` / `WarmupSteps = 60` against the 50-step split):
+the schedulers are pure functions of the restored update count, so the
+resumed half reproduces them exactly.
 
 ### Wire format (`"LNO1"`)
 
@@ -522,11 +530,11 @@ in the `"LNNS"` format:
 | field | type | notes |
 |---|---|---|
 | magic | `[4]byte` | exactly `L N O 1` |
-| version | `uint8` | `1`; other values are directional errors (higher → "written by a newer version… update this build"; lower → "no earlier layout exists") |
-| kind | `uint8` | `0` = SGD, `1` = Momentum, `2` = Adam; loading into the wrong optimizer type is a precise named error (above) |
+| version | `uint8` | `1`; other values are directional errors (higher → "written by a newer version… update this build"; lower → "no earlier layout exists"). The stage-20 kinds are **extension tags, not a version migration** — version stays 1 and a v1 reader simply rejects unknown kinds by name |
+| kind | `uint8` | `0` = SGD, `1` = Momentum, `2` = Adam, `3` = AdEMAMix, `4` = ScheduleFreeAdamW; loading into the wrong optimizer type is a precise named error (above) |
 | count | `uint32` | number of parameter records — one per parameter, in the order of the `params` slice given to `SaveState` |
-| record section, repeated `count` times (empty for SGD) | `present` `uint8` | `0` = no state for this parameter, `1` = state follows; Adam only, when present: `t` `uint32` (update count), `pow1`/`pow2` `float32` (`Beta1^t`/`Beta2^t`, saved bit for bit) |
-| blob | — | a single `serialize` tensor stream, in parameter order: one velocity tensor per present Momentum parameter, `m` then `v` per present Adam parameter, **zero** tensors for SGD — self-framing, trailing bytes rejected |
+| record section, repeated `count` times (empty for SGD) | `present` `uint8` | `0` = no state for this parameter, `1` = state follows; **Adam and AdEMAMix**, when present: `t` `uint32` (update count), `pow1`/`pow2` `float32` (`Beta1^t`/`Beta2^t`, saved bit for bit); **ScheduleFreeAdamW**, when present — 22 bytes: `k` `uint32` (update count), `pow2` `float32` (`Beta2^k`, bit for bit), `lrMax` `float32` (largest scheduled lr seen), `wsum` `float64` (average-weight accumulator, the one wide field), `mode` `uint8` (the parameter's mode bit: `1` = train — its Data holds `y`, `0` = eval — holds `x`) |
+| blob | — | a single `serialize` tensor stream, in parameter order: one velocity tensor per present Momentum parameter, `m` then `v` per present Adam parameter, `m1`, `m2` then `v` per present AdEMAMix parameter, `z` then `v` per present ScheduleFreeAdamW parameter, **zero** tensors for SGD — self-framing, trailing bytes rejected |
 
 Per-optimizer record layout: **SGD** is always a **19-byte**
 self-contained empty stream (a 10-byte header plus the 9-byte empty
@@ -534,14 +542,42 @@ tensor blob — independent of the parameter count; the save is an
 identity, but the stream is still written so every kind round-trips
 through one uniform format); **Momentum** carries one velocity tensor
 per present parameter; **Adam** carries `m` and `v` per present
-parameter plus the `t`/`pow1`/`pow2` counters in the record section.
-Hyperparameters (`LR`, `Mu`, `Beta1`/`Beta2`/`Eps`) are **deliberately
-not in the stream** — they are exported fields the caller sets on the
-destination optimizer, exactly as at construction; for Adam the saved
-`pow1`/`pow2` must equal this optimizer's `Beta1^t`/`Beta2^t` bit for
-bit, so a stream saved under different betas fails as corruption (a
+parameter plus the `t`/`pow1`/`pow2` counters in the record section;
+**AdEMAMix** reuses Adam's record layout verbatim and carries `m1`,
+`m2` and `v` in the blob; **ScheduleFreeAdamW** carries `z` and `v` in
+the blob plus the 22-byte record (`k`/`pow2`/`lrMax`/`wsum`/`mode`).
+Hyperparameters (`LR`, `Mu`, `Beta1`/`Beta2`/`Eps`,
+`Alpha`/`Beta3`/`Warmup`, `WeightDecay`/`WarmupSteps`) are
+**deliberately not in the stream** — they are exported fields the
+caller sets on the destination optimizer, exactly as at construction;
+the saved `pow1`/`pow2` (Adam, AdEMAMix) and `pow2` (ScheduleFreeAdamW)
+must equal the destination optimizer's own `Beta1^t`/`Beta2^t`/`Beta2^k`
+bit for bit, so a stream saved under different betas fails as corruption (a
 flipped pow bit doubles as a β-mismatch detector:
-`TestLoadStateRejectsInconsistentAdamCounters`).
+`TestLoadStateRejectsInconsistentAdamCounters` and its stage-20
+kind-3/4 mirrors). The check's corollary, documented since the
+beginning: the pow fields are **running products**, so overwriting a
+`Beta*` field mid-training and *then* saving makes the stream
+unloadable — `betaPow` can replay a single-beta product, not the
+segmented one the optimizer accumulated. Resume across a beta change is
+therefore deliberately refused, indistinguishable from corruption;
+change betas only between checkpoints you do not intend to resume from.
+Two ScheduleFree-only guards: `lrMax` and `wsum` arrive as accumulators
+that `Step` can only produce finite (LR > 0), so a non-finite value is
+rejected as corruption before it could poison the first resumed update
+(`TestLoadStateRejectsNonFiniteScheduleFreeCounters`); and the `mode`
+byte is validated ∈ {0, 1} (`TestLoadStateRejectsBadModeByte`).
+
+**The mode byte is what makes an eval-mode checkpoint resumable across
+instances.** A ScheduleFreeAdamW stream saved in eval mode restores
+every parameter's eval mode: the next `Step` panics naming the index
+(the train/eval guard of [training.md](training.md)), and `Train`
+converts `x → y` before training resumes — bit-identical to the
+same-instance Eval → Train → resume path (the `y→x→y` round trip
+itself rounds, so the resume sits a few ULP off the never-converted
+trajectory). Only the *optimizer-level* mode flag — the gate for
+parameters that carry no state — is transient and never serialized: a
+fresh optimizer is always in train mode.
 
 ### The untrusted-stream discipline
 
@@ -551,11 +587,14 @@ is written, so a failing load leaves the destination optimizer **bit
 for bit as it was** (velocity/m/v/t/pow untouched, and parameter 0 is
 not affected by a failure at parameter 1;
 `TestLoadStateRejectsShapeMismatchWithoutSideEffects`); **errors, never
-panics** — fourteen adversarial stream classes all return errors (six
-kind-cross-load pairs, unknown kind, bad magic, version 0/99 by
+panics** — the adversarial classes all return errors (all twenty
+kind-cross-load pairs over the five kinds, unknown kind, bad magic,
+version 0/99 by
 direction, count mismatch in both directions, presence flag `2`, shape
-mismatch on all three tensor paths, pow bit flips, `t` over the limit
-rejected before the blob is parsed, six truncation points →
+mismatch on all three tensor paths and on the new-kind paths, pow bit
+flips on all three counter-carrying kinds, non-finite `lrMax`/`wsum`,
+bad mode byte, `t`/`k` over the limit
+rejected before the blob is parsed, truncation at every record boundary →
 `io.ErrUnexpectedEOF`, trailing bytes, blob tensor count, I/O
 passthrough; the `TestLoadStateRejects*` family, plus 500 red-team
 mutants with 0 panics — the 76 that load successfully re-save
@@ -563,7 +602,8 @@ idempotently with 0 mismatches, and all 66 strict prefix truncations
 are refused); a **byte budget** with two gates — a 29-byte hostile
 stream allocates only 352 B and a 10-byte gigantic-count stream 276 B
 (`TestLoadStateHostileClaimsStayWithinByteBudget`); and **`maxT = 2²⁴`,
-a load-only limit** on Adam's update count — the pow consistency check
+a load-only limit** on the update count (Adam's and AdEMAMix's `t`,
+ScheduleFreeAdamW's `k`) — the pow consistency check
 recomputes `Beta^t` as `t` sequential multiplications, so a 13-byte
 record claiming `t = 2³²−1` must not bill four billion multiplications
 (the same load-side asymmetry as `maxUnfolds`/`maxUnits` below:

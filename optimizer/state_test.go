@@ -1000,3 +1000,912 @@ func TestCountToUint32(t *testing.T) {
 		t.Fatal("countToUint32(-1) accepted")
 	}
 }
+
+// --- 7. Stage-20 kinds: AdEMAMix and ScheduleFreeAdamW ---
+//
+// The same acceptance discipline as the original three kinds: bit-exact
+// resume (50+50 vs 100), internal-state round trips, adversarial streams,
+// sparse presence, deterministic saves. ScheduleFreeAdamW is checkpointed
+// in TRAIN mode (its parameters hold y; z rides the state stream), which
+// is the bit-exact training-resume path its documentation describes.
+
+func TestResumeBitExactAdEMAMix(t *testing.T) {
+	// Warmup = 80 deliberately crosses the 50-step checkpoint split: the
+	// resumed half passes the scheduler boundary at t = 80, so the test
+	// proves the alpha/beta3 schedules are reproduced exactly from the
+	// restored update count (they are pure functions of t and the
+	// exported fields — nothing else to serialize).
+	stateResumeBitExact(t, "AdEMAMix", func() Optimizer {
+		return NewAdEMAMix(0.05, 0.9, 0.99, 0.999, 2, 80, 1e-8)
+	})
+}
+
+func TestResumeBitExactScheduleFree(t *testing.T) {
+	// WarmupSteps = 60 deliberately crosses the split: the resumed half
+	// passes the warmup boundary at k = 60, so the test proves lrMax and
+	// the float64 weight accumulator are restored bit for bit (a wrong
+	// weightSum shifts c, hence y, from the first resumed step).
+	stateResumeBitExact(t, "ScheduleFreeAdamW", func() Optimizer {
+		o := NewScheduleFreeAdamW(0.05, 0.9, 0.99, 1e-8)
+		o.WarmupSteps = 60
+		return o
+	})
+}
+
+func TestRoundTripAdEMAMixStateBits(t *testing.T) {
+	o := NewAdEMAMix(0.02, 0.85, 0.99, 0.9995, 3, 4, 1e-7)
+	p0 := param([]float32{0.5, -1.5, 2}, []float32{1, -1, 0.25})
+	p1 := param([]float32{-3, 4}, []float32{0.75, -2})
+	params := []*autograd.Variable{p0, p1}
+	for i := 0; i < 5; i++ {
+		o.Step(params)
+		setGrad(p0, []float32{float32(i) - 2, 0.5, -0.125})
+		setGrad(p1, []float32{1.5, float32(-i)})
+	}
+	var buf bytes.Buffer
+	if err := SaveState(&buf, o, params); err != nil {
+		t.Fatal(err)
+	}
+	o2 := NewAdEMAMix(0.02, 0.85, 0.99, 0.9995, 3, 4, 1e-7)
+	if err := LoadState(bytes.NewReader(buf.Bytes()), o2, params); err != nil {
+		t.Fatal(err)
+	}
+	// Internal state: m1, m2, v bit for bit, t exact, pow1/pow2 bit for bit.
+	for _, p := range params {
+		a, b := o.state[p], o2.state[p]
+		if b == nil {
+			t.Fatalf("state of %p missing after round trip", p)
+		}
+		if !sameBits(a.m1, b.m1) || !sameBits(a.m2, b.m2) || !sameBits(a.v, b.v) {
+			t.Errorf("moments of %p differ after round trip", p)
+		}
+		if a.t != b.t {
+			t.Errorf("update count of %p: got %d, want %d", p, b.t, a.t)
+		}
+		if math.Float32bits(a.pow1) != math.Float32bits(b.pow1) || math.Float32bits(a.pow2) != math.Float32bits(b.pow2) {
+			t.Errorf("bias-correction powers of %p differ after round trip", p)
+		}
+	}
+	// Behavioral: load the same stream into a third optimizer keyed by
+	// pre-step clones, then step both: outputs must agree bit for bit.
+	p0b := param(p0.Data.Data, []float32{3, 3, 3})
+	p1b := param(p1.Data.Data, []float32{-0.5, 0.5})
+	o3 := NewAdEMAMix(0.02, 0.85, 0.99, 0.9995, 3, 4, 1e-7)
+	if err := LoadState(bytes.NewReader(buf.Bytes()), o3, []*autograd.Variable{p0b, p1b}); err != nil {
+		t.Fatal(err)
+	}
+	setGrad(p0, []float32{3, 3, 3})
+	setGrad(p1, []float32{-0.5, 0.5})
+	o.Step([]*autograd.Variable{p0, p1})
+	o3.Step([]*autograd.Variable{p0b, p1b})
+	if !sameBits(p0b.Data.Data, p0.Data.Data) || !sameBits(p1b.Data.Data, p1.Data.Data) {
+		t.Error("Step output differs between loaded and original optimizer")
+	}
+}
+
+func TestRoundTripScheduleFreeStateBits(t *testing.T) {
+	o := NewScheduleFreeAdamW(0.05, 0.85, 0.99, 1e-7)
+	o.WarmupSteps = 3
+	o.WeightDecay = 0.1
+	p0 := param([]float32{0.5, -1.5, 2}, []float32{1, -1, 0.25})
+	p1 := param([]float32{-3, 4}, []float32{0.75, -2})
+	params := []*autograd.Variable{p0, p1}
+	for i := 0; i < 5; i++ {
+		o.Step(params)
+		setGrad(p0, []float32{float32(i) - 2, 0.5, -0.125})
+		setGrad(p1, []float32{1.5, float32(-i)})
+	}
+	var buf bytes.Buffer
+	if err := SaveState(&buf, o, params); err != nil {
+		t.Fatal(err)
+	}
+	o2 := NewScheduleFreeAdamW(0.05, 0.85, 0.99, 1e-7)
+	o2.WarmupSteps = 3
+	o2.WeightDecay = 0.1
+	if err := LoadState(bytes.NewReader(buf.Bytes()), o2, params); err != nil {
+		t.Fatal(err)
+	}
+	// Internal state: z, v bit for bit; k exact; pow2 and lrMax bit for
+	// bit; the float64 weight accumulator bit for bit; the mode bit
+	// preserved (both saved in train mode).
+	for _, p := range params {
+		a, b := o.state[p], o2.state[p]
+		if b == nil {
+			t.Fatalf("state of %p missing after round trip", p)
+		}
+		if !sameBits(a.z, b.z) || !sameBits(a.v, b.v) {
+			t.Errorf("z/v of %p differ after round trip", p)
+		}
+		if a.k != b.k {
+			t.Errorf("update count of %p: got %d, want %d", p, b.k, a.k)
+		}
+		if math.Float32bits(a.pow2) != math.Float32bits(b.pow2) {
+			t.Errorf("pow2 of %p differs after round trip", p)
+		}
+		if math.Float32bits(a.lrMax) != math.Float32bits(b.lrMax) {
+			t.Errorf("lrMax of %p differs after round trip", p)
+		}
+		if math.Float64bits(a.weightSum) != math.Float64bits(b.weightSum) {
+			t.Errorf("weight accumulator of %p differs after round trip", p)
+		}
+		if a.trainMode != b.trainMode {
+			t.Errorf("mode bit of %p differs after round trip", p)
+		}
+	}
+	// Behavioral: load into a third optimizer keyed by pre-step clones
+	// (both in train mode, as constructors leave them), step both.
+	p0b := param(p0.Data.Data, []float32{3, 3, 3})
+	p1b := param(p1.Data.Data, []float32{-0.5, 0.5})
+	o3 := NewScheduleFreeAdamW(0.05, 0.85, 0.99, 1e-7)
+	o3.WarmupSteps = 3
+	o3.WeightDecay = 0.1
+	if err := LoadState(bytes.NewReader(buf.Bytes()), o3, []*autograd.Variable{p0b, p1b}); err != nil {
+		t.Fatal(err)
+	}
+	setGrad(p0, []float32{3, 3, 3})
+	setGrad(p1, []float32{-0.5, 0.5})
+	o.Step([]*autograd.Variable{p0, p1})
+	o3.Step([]*autograd.Variable{p0b, p1b})
+	if !sameBits(p0b.Data.Data, p0.Data.Data) || !sameBits(p1b.Data.Data, p1.Data.Data) {
+		t.Error("Step output differs between loaded and original optimizer")
+	}
+}
+
+func TestLoadStateRejectsCrossKindNewKinds(t *testing.T) {
+	p := param([]float32{1, 2}, []float32{3, 4})
+	params := []*autograd.Variable{p}
+	newOpts := func() map[string]Optimizer {
+		return map[string]Optimizer{
+			"SGD":               NewSGD(0.1),
+			"Momentum":          NewMomentum(0.1, 0.9),
+			"Adam":              NewAdamDefault(0.1),
+			"AdEMAMix":          NewAdEMAMixDefault(0.01, 0),
+			"ScheduleFreeAdamW": NewScheduleFreeAdamWDefault(0.05),
+		}
+	}
+	savers := newOpts()
+	streams := map[string][]byte{}
+	for name, o := range savers {
+		o.Step(params) // give the stateful kinds something to save
+		setGrad(p, []float32{3, 4})
+		var buf bytes.Buffer
+		if err := SaveState(&buf, o, params); err != nil {
+			t.Fatalf("saving %s state: %v", name, err)
+		}
+		streams[name] = buf.Bytes()
+	}
+	// All twenty cross-loadings must fail with the kind-mismatch error.
+	for sname, stream := range streams {
+		for lname, loader := range newOpts() {
+			if sname == lname {
+				continue
+			}
+			err := LoadState(bytes.NewReader(stream), loader, params)
+			if err == nil || !strings.Contains(err.Error(), "does not match optimizer kind") {
+				t.Errorf("%s stream into %s: got %v, want a kind-mismatch error", sname, lname, err)
+			}
+		}
+	}
+}
+
+func TestLoadStateRejectsInconsistentAdEMAMixCounters(t *testing.T) {
+	p := param([]float32{1, 2}, []float32{3, 4})
+	params := []*autograd.Variable{p}
+	o := NewAdEMAMixDefault(0.01, 0)
+	for i := 0; i < 3; i++ {
+		o.Step(params)
+		setGrad(p, []float32{3, 4})
+	}
+	var buf bytes.Buffer
+	if err := SaveState(&buf, o, params); err != nil {
+		t.Fatal(err)
+	}
+	valid := buf.Bytes()
+	// Layout: 10 header + presence(1) + t(4) + pow1(4) + pow2(4) + blob —
+	// the same counter layout as Adam. pow1 occupies bytes 15..18, pow2
+	// bytes 19..22.
+	flip := func(pos int) []byte {
+		b := append([]byte(nil), valid...)
+		b[pos] ^= 0x01
+		return b
+	}
+	err := LoadState(bytes.NewReader(flip(15)), NewAdEMAMixDefault(0.01, 0), params)
+	if err == nil || !strings.Contains(err.Error(), "pow1") {
+		t.Errorf("flipped pow1: got %v, want a pow1 consistency error", err)
+	}
+	err = LoadState(bytes.NewReader(flip(19)), NewAdEMAMixDefault(0.01, 0), params)
+	if err == nil || !strings.Contains(err.Error(), "pow2") {
+		t.Errorf("flipped pow2: got %v, want a pow2 consistency error", err)
+	}
+	// A stream saved under different betas fails as corruption-or-skew.
+	err = LoadState(bytes.NewReader(valid), NewAdEMAMix(0.01, 0.5, 0.999, 0.9999, 5, 0, 1e-8), params)
+	if err == nil || !strings.Contains(err.Error(), "different AdEMAMix hyperparameters") {
+		t.Errorf("beta skew: got %v, want a hyperparameter-skew error", err)
+	}
+	// The update-count load limit fires before any blob parsing.
+	big := stateStreamHeader(byte(kindAdEMAMix), 1)
+	big = append(big, 1) // present
+	var tBytes [4]byte
+	binary.LittleEndian.PutUint32(tBytes[:], math.MaxUint32)
+	big = append(big, tBytes[:]...)
+	big = append(big, valid[15:23]...) // pow1, pow2: never reached
+	err = LoadState(bytes.NewReader(big), NewAdEMAMixDefault(0.01, 0), params)
+	if err == nil || !strings.Contains(err.Error(), "exceeds the load limit") {
+		t.Errorf("huge t: got %v, want the load-limit error", err)
+	}
+}
+
+func TestLoadStateRejectsInconsistentScheduleFreeCounters(t *testing.T) {
+	p := param([]float32{1, 2}, []float32{3, 4})
+	params := []*autograd.Variable{p}
+	o := NewScheduleFreeAdamWDefault(0.05)
+	for i := 0; i < 3; i++ {
+		o.Step(params)
+		setGrad(p, []float32{3, 4})
+	}
+	var buf bytes.Buffer
+	if err := SaveState(&buf, o, params); err != nil {
+		t.Fatal(err)
+	}
+	valid := buf.Bytes()
+	// Layout: 10 header + presence(1) + k(4) + pow2(4) + lrMax(4) +
+	// wsum(8) + blob. pow2 occupies bytes 15..18.
+	flip := func(pos int) []byte {
+		b := append([]byte(nil), valid...)
+		b[pos] ^= 0x01
+		return b
+	}
+	err := LoadState(bytes.NewReader(flip(15)), NewScheduleFreeAdamWDefault(0.05), params)
+	if err == nil || !strings.Contains(err.Error(), "pow2") {
+		t.Errorf("flipped pow2: got %v, want a pow2 consistency error", err)
+	}
+	// A stream saved under a different Beta2 fails as corruption-or-skew.
+	err = LoadState(bytes.NewReader(valid), NewScheduleFreeAdamW(0.05, 0.9, 0.5, 1e-8), params)
+	if err == nil || !strings.Contains(err.Error(), "different ScheduleFreeAdamW hyperparameters") {
+		t.Errorf("beta skew: got %v, want a hyperparameter-skew error", err)
+	}
+	// The update-count load limit fires before any blob parsing.
+	big := stateStreamHeader(byte(kindScheduleFree), 1)
+	big = append(big, 1) // present
+	var kBytes [4]byte
+	binary.LittleEndian.PutUint32(kBytes[:], math.MaxUint32)
+	big = append(big, kBytes[:]...)
+	big = append(big, valid[15:32]...) // pow2, lrMax, wsum, mode: never reached
+	err = LoadState(bytes.NewReader(big), NewScheduleFreeAdamWDefault(0.05), params)
+	if err == nil || !strings.Contains(err.Error(), "exceeds the load limit") {
+		t.Errorf("huge k: got %v, want the load-limit error", err)
+	}
+}
+
+func TestLoadStateRejectsShapeMismatchNewKinds(t *testing.T) {
+	// Source: state for a 2-element parameter, one stream per new kind.
+	src := param([]float32{1, 2}, []float32{3, 4})
+	am := NewAdEMAMixDefault(0.01, 0)
+	am.Step([]*autograd.Variable{src})
+	sf := NewScheduleFreeAdamWDefault(0.05)
+	sf.Step([]*autograd.Variable{src})
+	var amBuf, sfBuf bytes.Buffer
+	if err := SaveState(&amBuf, am, []*autograd.Variable{src}); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveState(&sfBuf, sf, []*autograd.Variable{src}); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("AdEMAMixM1", func(t *testing.T) {
+		dst := param([]float32{9, 9, 9}, []float32{1, 1, 1})
+		da := NewAdEMAMixDefault(0.01, 0)
+		da.Step([]*autograd.Variable{dst})
+		stBefore := da.state[dst]
+		m1Before := append([]float32(nil), stBefore.m1...)
+		err := LoadState(bytes.NewReader(amBuf.Bytes()), da, []*autograd.Variable{dst})
+		if err == nil || !strings.Contains(err.Error(), "moment m1 shape mismatch") {
+			t.Fatalf("got %v, want a moment m1 shape mismatch", err)
+		}
+		if da.state[dst] != stBefore || !sameBits(da.state[dst].m1, m1Before) {
+			t.Error("failed load modified the destination AdEMAMix state")
+		}
+	})
+	t.Run("AdEMAMixM2", func(t *testing.T) {
+		// Forged blob: m1 fits, m2 does not — the middle tensor of the
+		// three. The destination must be untouched.
+		f32le := func(v float32) []byte {
+			var b [4]byte
+			binary.LittleEndian.PutUint32(b[:], math.Float32bits(v))
+			return b[:]
+		}
+		raw := stateStreamHeader(byte(kindAdEMAMix), 1)
+		raw = append(raw, 1) // present
+		var tb [4]byte
+		binary.LittleEndian.PutUint32(tb[:], 1) // t = 1
+		raw = append(raw, tb[:]...)
+		raw = append(raw, f32le(0.9)...)   // pow1 = Beta1^1
+		raw = append(raw, f32le(0.999)...) // pow2 = Beta2^1
+		var blob bytes.Buffer
+		if err := serialize.WriteTensors(&blob, []*tensor.Tensor{
+			{Shape: []int{2}, Data: []float32{1, 2}},    // m1: fits
+			{Shape: []int{3}, Data: []float32{1, 2, 3}}, // m2: mismatch
+			{Shape: []int{2}, Data: []float32{5, 6}},    // v: never reached
+		}); err != nil {
+			t.Fatal(err)
+		}
+		raw = append(raw, blob.Bytes()...)
+
+		d0 := param([]float32{0, 0}, []float32{1, 1})
+		dst := NewAdEMAMixDefault(0.01, 0)
+		dst.Step([]*autograd.Variable{d0})
+		mBefore := append([]float32(nil), dst.state[d0].m1...)
+		err := LoadState(bytes.NewReader(raw), dst, []*autograd.Variable{d0})
+		if err == nil || !strings.Contains(err.Error(), "moment m2 shape mismatch") {
+			t.Fatalf("got %v, want a moment m2 shape mismatch", err)
+		}
+		if !sameBits(dst.state[d0].m1, mBefore) {
+			t.Error("failed load modified the destination state")
+		}
+	})
+	t.Run("AdEMAMixLateV", func(t *testing.T) {
+		// Forged blob: two parameters, everything fits until parameter 1's
+		// v. Validate-all-then-apply must reach it and leave both
+		// destination entries untouched.
+		f32le := func(v float32) []byte {
+			var b [4]byte
+			binary.LittleEndian.PutUint32(b[:], math.Float32bits(v))
+			return b[:]
+		}
+		raw := stateStreamHeader(byte(kindAdEMAMix), 2)
+		for i := 0; i < 2; i++ {
+			raw = append(raw, 1) // present
+			var tb [4]byte
+			binary.LittleEndian.PutUint32(tb[:], 1) // t = 1
+			raw = append(raw, tb[:]...)
+			raw = append(raw, f32le(0.9)...)   // pow1 = Beta1^1
+			raw = append(raw, f32le(0.999)...) // pow2 = Beta2^1
+		}
+		var blob bytes.Buffer
+		if err := serialize.WriteTensors(&blob, []*tensor.Tensor{
+			{Shape: []int{2}, Data: []float32{1, 2}},    // m1 of p0: fits
+			{Shape: []int{2}, Data: []float32{3, 4}},    // m2 of p0: fits
+			{Shape: []int{2}, Data: []float32{5, 6}},    // v of p0: fits
+			{Shape: []int{2}, Data: []float32{7, 8}},    // m1 of p1: fits
+			{Shape: []int{2}, Data: []float32{9, 10}},   // m2 of p1: fits
+			{Shape: []int{3}, Data: []float32{1, 2, 3}}, // v of p1: mismatch
+		}); err != nil {
+			t.Fatal(err)
+		}
+		raw = append(raw, blob.Bytes()...)
+
+		d0 := param([]float32{0, 0}, []float32{1, 1})
+		d1 := param([]float32{0, 0}, []float32{1, 1})
+		dst := NewAdEMAMixDefault(0.01, 0)
+		dst.Step([]*autograd.Variable{d0, d1})
+		m0 := append([]float32(nil), dst.state[d0].m1...)
+		m1 := append([]float32(nil), dst.state[d1].m1...)
+		err := LoadState(bytes.NewReader(raw), dst, []*autograd.Variable{d0, d1})
+		if err == nil || !strings.Contains(err.Error(), "parameter 1") || !strings.Contains(err.Error(), "moment v shape mismatch") {
+			t.Fatalf("got %v, want parameter 1 moment v shape mismatch", err)
+		}
+		if !sameBits(dst.state[d0].m1, m0) || !sameBits(dst.state[d1].m1, m1) {
+			t.Error("failed load modified the destination state")
+		}
+	})
+	t.Run("ScheduleFreeZ", func(t *testing.T) {
+		dst := param([]float32{9, 9, 9}, []float32{1, 1, 1})
+		ds := NewScheduleFreeAdamWDefault(0.05)
+		ds.Step([]*autograd.Variable{dst})
+		stBefore := ds.state[dst]
+		zBefore := append([]float32(nil), stBefore.z...)
+		err := LoadState(bytes.NewReader(sfBuf.Bytes()), ds, []*autograd.Variable{dst})
+		if err == nil || !strings.Contains(err.Error(), "z shape mismatch") {
+			t.Fatalf("got %v, want a z shape mismatch", err)
+		}
+		if ds.state[dst] != stBefore || !sameBits(ds.state[dst].z, zBefore) {
+			t.Error("failed load modified the destination ScheduleFreeAdamW state")
+		}
+	})
+	t.Run("ScheduleFreeLateV", func(t *testing.T) {
+		// Forged blob: z fits, v does not; the destination must be untouched.
+		f32le := func(v float32) []byte {
+			var b [4]byte
+			binary.LittleEndian.PutUint32(b[:], math.Float32bits(v))
+			return b[:]
+		}
+		f64le := func(v float64) []byte {
+			var b [8]byte
+			binary.LittleEndian.PutUint64(b[:], math.Float64bits(v))
+			return b[:]
+		}
+		raw := stateStreamHeader(byte(kindScheduleFree), 1)
+		raw = append(raw, 1) // present
+		var kb [4]byte
+		binary.LittleEndian.PutUint32(kb[:], 1) // k = 1
+		raw = append(raw, kb[:]...)
+		raw = append(raw, f32le(0.999)...)  // pow2 = Beta2^1
+		raw = append(raw, f32le(0.05)...)   // lrMax
+		raw = append(raw, f64le(0.0025)...) // weightSum
+		raw = append(raw, 1)                // mode: train
+		var blob bytes.Buffer
+		if err := serialize.WriteTensors(&blob, []*tensor.Tensor{
+			{Shape: []int{2}, Data: []float32{1, 2}},    // z: fits
+			{Shape: []int{3}, Data: []float32{1, 2, 3}}, // v: mismatch
+		}); err != nil {
+			t.Fatal(err)
+		}
+		raw = append(raw, blob.Bytes()...)
+
+		d0 := param([]float32{0, 0}, []float32{1, 1})
+		dst := NewScheduleFreeAdamWDefault(0.05)
+		dst.Step([]*autograd.Variable{d0})
+		zBefore := append([]float32(nil), dst.state[d0].z...)
+		err := LoadState(bytes.NewReader(raw), dst, []*autograd.Variable{d0})
+		if err == nil || !strings.Contains(err.Error(), "moment v shape mismatch") {
+			t.Fatalf("got %v, want a moment v shape mismatch", err)
+		}
+		if !sameBits(dst.state[d0].z, zBefore) {
+			t.Error("failed load modified the destination state")
+		}
+	})
+}
+
+func TestLoadStateRejectsMidRecordTruncationNewKinds(t *testing.T) {
+	p0 := param([]float32{1}, nil)
+	// AdEMAMix: present flag delivered, counters cut in half.
+	raw := stateStreamHeader(byte(kindAdEMAMix), 1)
+	raw = append(raw, 1, 5, 0) // present, then 2 of the 4 t bytes
+	err := LoadState(bytes.NewReader(raw), NewAdEMAMixDefault(0.01, 0), []*autograd.Variable{p0})
+	if err == nil || !errors.Is(err, io.ErrUnexpectedEOF) || !strings.Contains(err.Error(), "AdEMAMix counters") {
+		t.Errorf("mid-counter truncation: got %v, want ErrUnexpectedEOF in the AdEMAMix counters", err)
+	}
+	// ScheduleFreeAdamW: k, pow2 and lrMax delivered, wsum cut in half.
+	raw = stateStreamHeader(byte(kindScheduleFree), 1)
+	raw = append(raw, 1)
+	var kb [4]byte
+	binary.LittleEndian.PutUint32(kb[:], 1)
+	raw = append(raw, kb[:]...)   // k
+	raw = append(raw, 0, 0, 0, 0) // pow2
+	raw = append(raw, 0, 0, 0, 0) // lrMax
+	raw = append(raw, 0, 0, 0)    // 3 of the 8 wsum bytes
+	err = LoadState(bytes.NewReader(raw), NewScheduleFreeAdamWDefault(0.05), []*autograd.Variable{p0})
+	if err == nil || !errors.Is(err, io.ErrUnexpectedEOF) || !strings.Contains(err.Error(), "ScheduleFreeAdamW counters") {
+		t.Errorf("mid-wsum truncation: got %v, want ErrUnexpectedEOF in the ScheduleFreeAdamW counters", err)
+	}
+}
+
+func TestSparsePresenceRoundTripNewKinds(t *testing.T) {
+	t.Run("AdEMAMix", func(t *testing.T) {
+		p0 := param([]float32{1}, []float32{2})
+		p1 := param([]float32{3}, nil) // nil Grad: never given state
+		p2 := param([]float32{5}, []float32{6})
+		params := []*autograd.Variable{p0, p1, p2}
+		o := NewAdEMAMixDefault(0.01, 0)
+		o.Step(params)
+		var buf bytes.Buffer
+		if err := SaveState(&buf, o, params); err != nil {
+			t.Fatal(err)
+		}
+		o2 := NewAdEMAMixDefault(0.01, 0)
+		if err := LoadState(bytes.NewReader(buf.Bytes()), o2, params); err != nil {
+			t.Fatal(err)
+		}
+		if !sameBits(o2.state[p0].m1, o.state[p0].m1) || !sameBits(o2.state[p2].m2, o.state[p2].m2) {
+			t.Error("present moments lost in the round trip")
+		}
+		if _, ok := o2.state[p1]; ok {
+			t.Error("absent record fabricated state: the load must not invent zero state")
+		}
+		// Behavioral: p1's first step under o2 equals a fresh optimizer's.
+		setGrad(p1, []float32{8})
+		o2.Step([]*autograd.Variable{p1})
+		pf := param([]float32{3}, []float32{8})
+		NewAdEMAMixDefault(0.01, 0).Step([]*autograd.Variable{pf})
+		if !sameBits(p1.Data.Data, pf.Data.Data) {
+			t.Errorf("sparse parameter's first update = %v, want fresh %v", p1.Data.Data, pf.Data.Data)
+		}
+	})
+	t.Run("ScheduleFreeAdamW", func(t *testing.T) {
+		p0 := param([]float32{1}, []float32{2})
+		p1 := param([]float32{3}, nil)
+		p2 := param([]float32{5}, []float32{6})
+		params := []*autograd.Variable{p0, p1, p2}
+		o := NewScheduleFreeAdamWDefault(0.05)
+		o.Step(params)
+		var buf bytes.Buffer
+		if err := SaveState(&buf, o, params); err != nil {
+			t.Fatal(err)
+		}
+		o2 := NewScheduleFreeAdamWDefault(0.05)
+		if err := LoadState(bytes.NewReader(buf.Bytes()), o2, params); err != nil {
+			t.Fatal(err)
+		}
+		if !sameBits(o2.state[p0].z, o.state[p0].z) || !sameBits(o2.state[p2].v, o.state[p2].v) {
+			t.Error("present z/v lost in the round trip")
+		}
+		if _, ok := o2.state[p1]; ok {
+			t.Error("absent record fabricated state: the load must not invent zero state")
+		}
+		setGrad(p1, []float32{8})
+		o2.Step([]*autograd.Variable{p1})
+		pf := param([]float32{3}, []float32{8})
+		NewScheduleFreeAdamWDefault(0.05).Step([]*autograd.Variable{pf})
+		if !sameBits(p1.Data.Data, pf.Data.Data) {
+			t.Errorf("sparse parameter's first update = %v, want fresh %v", p1.Data.Data, pf.Data.Data)
+		}
+	})
+}
+
+func TestAbsentRecordDeletesExistingStateNewKinds(t *testing.T) {
+	t.Run("AdEMAMix", func(t *testing.T) {
+		p0 := param([]float32{1}, []float32{2})
+		p1 := param([]float32{3}, []float32{4})
+		src := NewAdEMAMixDefault(0.01, 0)
+		src.Step([]*autograd.Variable{p0})
+		var buf bytes.Buffer
+		if err := SaveState(&buf, src, []*autograd.Variable{p0, p1}); err != nil {
+			t.Fatal(err)
+		}
+		stale := param([]float32{9}, []float32{9})
+		dst := NewAdEMAMixDefault(0.01, 0)
+		dst.Step([]*autograd.Variable{p0, p1, stale})
+		if err := LoadState(bytes.NewReader(buf.Bytes()), dst, []*autograd.Variable{p0, p1}); err != nil {
+			t.Fatal(err)
+		}
+		if !sameBits(dst.state[p0].m1, src.state[p0].m1) {
+			t.Error("present record not restored")
+		}
+		if _, ok := dst.state[p1]; ok {
+			t.Error("absent record did not delete the existing entry")
+		}
+		if _, ok := dst.state[stale]; !ok {
+			t.Error("stale key for a variable outside params was deleted (documented to survive)")
+		}
+	})
+	t.Run("ScheduleFreeAdamW", func(t *testing.T) {
+		p0 := param([]float32{1}, []float32{2})
+		p1 := param([]float32{3}, []float32{4})
+		src := NewScheduleFreeAdamWDefault(0.05)
+		src.Step([]*autograd.Variable{p0})
+		var buf bytes.Buffer
+		if err := SaveState(&buf, src, []*autograd.Variable{p0, p1}); err != nil {
+			t.Fatal(err)
+		}
+		stale := param([]float32{9}, []float32{9})
+		dst := NewScheduleFreeAdamWDefault(0.05)
+		dst.Step([]*autograd.Variable{p0, p1, stale})
+		if err := LoadState(bytes.NewReader(buf.Bytes()), dst, []*autograd.Variable{p0, p1}); err != nil {
+			t.Fatal(err)
+		}
+		if !sameBits(dst.state[p0].z, src.state[p0].z) {
+			t.Error("present record not restored")
+		}
+		if _, ok := dst.state[p1]; ok {
+			t.Error("absent record did not delete the existing entry")
+		}
+		if _, ok := dst.state[stale]; !ok {
+			t.Error("stale key for a variable outside params was deleted (documented to survive)")
+		}
+	})
+}
+
+// Loading into optimizers built as struct literals (nil state maps) must
+// work for the new kinds too: LoadState initializes the maps.
+func TestLoadStateInitializesZeroValueOptimizersNewKinds(t *testing.T) {
+	p := param([]float32{1, 2}, []float32{3, 4})
+	params := []*autograd.Variable{p}
+
+	srcA := NewAdEMAMixDefault(0.01, 0)
+	srcA.Step(params)
+	var buf bytes.Buffer
+	if err := SaveState(&buf, srcA, params); err != nil {
+		t.Fatal(err)
+	}
+	am := &AdEMAMix{LR: 0.01, Beta1: 0.9, Beta2: 0.999, Beta3: 0.9999, Alpha: 5, Eps: 1e-8} // nil state map
+	if err := LoadState(bytes.NewReader(buf.Bytes()), am, params); err != nil {
+		t.Fatal(err)
+	}
+	if !sameBits(am.state[p].m1, srcA.state[p].m1) || am.state[p].t != srcA.state[p].t {
+		t.Error("state not restored into the zero-value AdEMAMix")
+	}
+
+	srcS := NewScheduleFreeAdamWDefault(0.05)
+	srcS.Step(params)
+	buf.Reset()
+	if err := SaveState(&buf, srcS, params); err != nil {
+		t.Fatal(err)
+	}
+	sf := &ScheduleFreeAdamW{LR: 0.05, Beta1: 0.9, Beta2: 0.999, Eps: 1e-8} // nil state map
+	if err := LoadState(bytes.NewReader(buf.Bytes()), sf, params); err != nil {
+		t.Fatal(err)
+	}
+	if !sameBits(sf.state[p].z, srcS.state[p].z) || sf.state[p].k != srcS.state[p].k {
+		t.Error("state not restored into the zero-value ScheduleFreeAdamW")
+	}
+	// The restored per-parameter mode bit governs Step: the stream above
+	// was saved in train mode, so even a zero-value literal (whose
+	// optimizer-level flag zeroes to eval) steps without a panic — the
+	// per-state mode, not the optimizer-level flag, is what Step checks
+	// for stateful parameters. (Its Beta1 = 0 is still outside the
+	// constructor envelope; real code builds optimizers with the
+	// constructors. This test only pins that LoadState initializes the
+	// state map on a literal and restores the mode bit.)
+	if !sf.state[p].trainMode {
+		t.Error("train-mode stream restored as eval mode")
+	}
+	setGrad(p, []float32{1, 1})
+	sf.Step(params) // must not panic: the restored state is in train mode
+}
+
+func TestSaveStateDeterministicNewKinds(t *testing.T) {
+	build := func() ([]*autograd.Variable, []Optimizer) {
+		p0 := param([]float32{0.5, -1.25}, []float32{1, 2})
+		p1 := param([]float32{3}, []float32{-4})
+		ps := []*autograd.Variable{p0, p1}
+		opts := []Optimizer{NewAdEMAMixDefault(0.01, 8), NewScheduleFreeAdamWDefault(0.05)}
+		for i := 0; i < 3; i++ {
+			for _, o := range opts {
+				o.Step(ps)
+			}
+			setGrad(p0, []float32{float32(i), -0.5})
+			setGrad(p1, []float32{2.5})
+		}
+		return ps, opts
+	}
+	ps1, opts1 := build()
+	ps2, opts2 := build()
+	names := []string{"AdEMAMix", "ScheduleFreeAdamW"}
+	for i := range opts1 {
+		var b1, b2 bytes.Buffer
+		if err := SaveState(&b1, opts1[i], ps1); err != nil {
+			t.Fatal(err)
+		}
+		if err := SaveState(&b2, opts2[i], ps2); err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(b1.Bytes(), b2.Bytes()) {
+			t.Errorf("%s: two saves of identical state produced different bytes", names[i])
+		}
+	}
+}
+
+func TestSaveStateRejectsOversizedCountersNewKinds(t *testing.T) {
+	p := param([]float32{1, 2}, []float32{3, 4})
+	params := []*autograd.Variable{p}
+	badT := int64(math.MaxUint32)
+	badT++ // runtime arithmetic: portable across int widths (wraps negative on 32-bit)
+
+	am := NewAdEMAMixDefault(0.01, 0)
+	am.Step(params)
+	stA := am.state[p]
+	stA.t = int(badT)
+	var buf bytes.Buffer
+	if err := SaveState(&buf, am, params); err == nil || !strings.Contains(err.Error(), "uint32") {
+		t.Errorf("AdEMAMix oversized t: got %v, want a uint32-fit error", err)
+	}
+	stA.t = -1
+	if err := SaveState(&buf, am, params); err == nil || !strings.Contains(err.Error(), "uint32") {
+		t.Errorf("AdEMAMix negative t: got %v, want a uint32-fit error", err)
+	}
+
+	sf := NewScheduleFreeAdamWDefault(0.05)
+	sf.Step(params)
+	stS := sf.state[p]
+	stS.k = int(badT)
+	if err := SaveState(&buf, sf, params); err == nil || !strings.Contains(err.Error(), "uint32") {
+		t.Errorf("ScheduleFreeAdamW oversized k: got %v, want a uint32-fit error", err)
+	}
+	stS.k = -1
+	if err := SaveState(&buf, sf, params); err == nil || !strings.Contains(err.Error(), "uint32") {
+		t.Errorf("ScheduleFreeAdamW negative k: got %v, want a uint32-fit error", err)
+	}
+}
+
+// --- 8. ScheduleFreeAdamW mode bit: persistence and the eval checkpoint ---
+
+// TestEvalCheckpointResumeCrossInstanceBitExact is the High-1 acceptance
+// test: an eval-mode checkpoint (params hold x, the state stream carries
+// z/v and the mode bits) resumed through FRESH objects must run
+// bit-identically to the same-instance Eval -> Train -> resume path —
+// and stepping before Train must panic, not silently train at x.
+func TestEvalCheckpointResumeCrossInstanceBitExact(t *testing.T) {
+	const total, split = 80, 50
+	newOpt := func() *ScheduleFreeAdamW {
+		o := NewScheduleFreeAdamW(0.05, 0.9, 0.99, 1e-8)
+		o.WarmupSteps = 20
+		return o
+	}
+	xs, ys := stateFitData(7)
+
+	// Same-instance path: train to the split, checkpoint in EVAL mode
+	// (params hold x), Train back, finish the run.
+	same := nn.NewLinear(1, 1, rand.New(rand.NewSource(42)))
+	osame := newOpt()
+	sameLoss := make([]float32, 0, total)
+	sameTraj := make([][]uint32, 0, total)
+	for i := 0; i < split; i++ {
+		sameLoss = append(sameLoss, stateTrainStep(same, xs, ys, osame))
+		sameTraj = append(sameTraj, paramsBits(same.Parameters()))
+	}
+	var modelBuf, stateBuf bytes.Buffer
+	osame.Eval(same.Parameters())
+	if err := nn.SaveLinear(&modelBuf, same); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveState(&stateBuf, osame, same.Parameters()); err != nil {
+		t.Fatal(err)
+	}
+	osame.Train(same.Parameters())
+	for i := split; i < total; i++ {
+		sameLoss = append(sameLoss, stateTrainStep(same, xs, ys, osame))
+		sameTraj = append(sameTraj, paramsBits(same.Parameters()))
+	}
+
+	// Cross-instance path: a fresh model from the eval-mode model stream
+	// (its parameters hold x) and a fresh optimizer from the state stream
+	// (every restored state is back in eval mode).
+	loaded, err := nn.LoadLinear(bytes.NewReader(modelBuf.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ocross := newOpt()
+	if err := LoadState(bytes.NewReader(stateBuf.Bytes()), ocross, loaded.Parameters()); err != nil {
+		t.Fatal(err)
+	}
+	// The guard the mode byte exists for: forgetting Train panics (the
+	// pre-20b behavior silently trained at x, 2.2e-3 off in 10 steps).
+	for _, p := range loaded.Parameters() {
+		setGrad(p, make([]float32, len(p.Data.Data)))
+	}
+	msg, ok := panicMessage(func() { ocross.Step(loaded.Parameters()) })
+	if !ok || !strings.Contains(msg, "eval mode") {
+		t.Fatalf("Step after loading an eval-mode checkpoint: (%v, %q), want an eval-mode panic", ok, msg)
+	}
+	// The documented resume: Train performs the x->y conversion with the
+	// restored z, producing the same y the same-instance path rounded to.
+	ocross.Train(loaded.Parameters())
+	for i := split; i < total; i++ {
+		loss := stateTrainStep(loaded, xs, ys, ocross)
+		if math.Float32bits(loss) != math.Float32bits(sameLoss[i]) {
+			t.Fatalf("step %d: cross-instance loss %#08x != same-instance %#08x: eval-checkpoint resume not bit-exact",
+				i, math.Float32bits(loss), math.Float32bits(sameLoss[i]))
+		}
+		if !equalBits(paramsBits(loaded.Parameters()), sameTraj[i]) {
+			t.Fatalf("step %d: cross-instance parameter trajectory differs from the same-instance path", i)
+		}
+	}
+	t.Logf("cross-instance eval-checkpoint resume bit-exact over steps %d-%d", split+1, total)
+}
+
+// TestMixedModeRoundTripScheduleFree: a checkpoint taken mid-Eval (a
+// subset already at x, the rest still at y) round-trips the per-parameter
+// mode bits exactly — and the restored optimizer enforces them.
+func TestMixedModeRoundTripScheduleFree(t *testing.T) {
+	p0 := param([]float32{1}, []float32{2})
+	p1 := param([]float32{3}, []float32{4})
+	params := []*autograd.Variable{p0, p1}
+	o := NewScheduleFreeAdamWDefault(0.05)
+	for i := 0; i < 3; i++ {
+		o.Step(params)
+		setGrad(p0, []float32{2})
+		setGrad(p1, []float32{4})
+	}
+	o.Eval([]*autograd.Variable{p0}) // p0 at x, p1 still at y
+
+	var buf bytes.Buffer
+	if err := SaveState(&buf, o, params); err != nil {
+		t.Fatal(err)
+	}
+	// The raw mode bytes: record 0 eval (0), record 1 train (1). Record
+	// layout per present record: 1 presence + 4 k + 4 pow2 + 4 lrMax +
+	// 8 wsum + 1 mode = 22 bytes, starting at offset 10.
+	raw := buf.Bytes()
+	if raw[31] != 0 || raw[53] != 1 {
+		t.Fatalf("raw mode bytes: got %d, %d, want 0 (eval), 1 (train)", raw[31], raw[53])
+	}
+
+	o2 := NewScheduleFreeAdamWDefault(0.05)
+	if err := LoadState(bytes.NewReader(raw), o2, params); err != nil {
+		t.Fatal(err)
+	}
+	if o2.state[p0].trainMode || !o2.state[p1].trainMode {
+		t.Fatalf("mode bits after round trip: p0=%v p1=%v, want false, true",
+			o2.state[p0].trainMode, o2.state[p1].trainMode)
+	}
+	// Enforcement follows the restored bits: Step panics on p0 until its
+	// own Train, and p1 alone never triggers the gate.
+	msg, ok := panicMessage(func() { o2.Step(params) })
+	if !ok || !strings.Contains(msg, "parameter 0") {
+		t.Fatalf("Step with a restored eval-mode parameter: (%v, %q)", ok, msg)
+	}
+	o2.Train([]*autograd.Variable{p0})
+	o2.Step(params)
+}
+
+func TestLoadStateRejectsBadModeByte(t *testing.T) {
+	p := param([]float32{1, 2}, []float32{3, 4})
+	params := []*autograd.Variable{p}
+	o := NewScheduleFreeAdamWDefault(0.05)
+	o.Step(params)
+	var buf bytes.Buffer
+	if err := SaveState(&buf, o, params); err != nil {
+		t.Fatal(err)
+	}
+	valid := buf.Bytes()
+	// Mode byte at offset 31 (see the layout above): a value outside
+	// {0, 1} is corruption, an absent one is truncation.
+	mutated := append([]byte(nil), valid...)
+	mutated[31] = 2
+	err := LoadState(bytes.NewReader(mutated), NewScheduleFreeAdamWDefault(0.05), params)
+	if err == nil || !strings.Contains(err.Error(), "mode flag 2 outside {0, 1}") {
+		t.Errorf("mode = 2: got %v, want a mode-flag error", err)
+	}
+	err = LoadState(bytes.NewReader(valid[:31]), NewScheduleFreeAdamWDefault(0.05), params)
+	if err == nil || !errors.Is(err, io.ErrUnexpectedEOF) || !strings.Contains(err.Error(), "ScheduleFreeAdamW counters") {
+		t.Errorf("mode byte cut: got %v, want ErrUnexpectedEOF in the counters", err)
+	}
+	// The failed loads touched nothing: the destination re-saves
+	// byte-identically.
+	dst := NewScheduleFreeAdamWDefault(0.05)
+	dst.Step(params)
+	before := func() []byte {
+		var b bytes.Buffer
+		if err := SaveState(&b, dst, params); err != nil {
+			t.Fatal(err)
+		}
+		return b.Bytes()
+	}()
+	if err := LoadState(bytes.NewReader(mutated), dst, params); err == nil {
+		t.Fatal("corrupt mode accepted")
+	}
+	var after bytes.Buffer
+	if err := SaveState(&after, dst, params); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after.Bytes()) {
+		t.Error("failed load modified the destination optimizer")
+	}
+}
+
+func TestLoadStateRejectsNonFiniteScheduleFreeCounters(t *testing.T) {
+	p := param([]float32{1, 2}, []float32{3, 4})
+	params := []*autograd.Variable{p}
+	o := NewScheduleFreeAdamWDefault(0.05)
+	o.Step(params)
+	var buf bytes.Buffer
+	if err := SaveState(&buf, o, params); err != nil {
+		t.Fatal(err)
+	}
+	valid := buf.Bytes()
+	// lrMax occupies bytes 19..22, wsum 23..30.
+	put32 := func(pos int, v float32) []byte {
+		b := append([]byte(nil), valid...)
+		binary.LittleEndian.PutUint32(b[pos:], math.Float32bits(v))
+		return b
+	}
+	put64 := func(pos int, v float64) []byte {
+		b := append([]byte(nil), valid...)
+		binary.LittleEndian.PutUint64(b[pos:], math.Float64bits(v))
+		return b
+	}
+	nan32 := float32(math.NaN())
+	nan64 := math.NaN()
+	inf32 := float32(math.Inf(1))
+	inf64 := math.Inf(-1)
+	cases := []struct {
+		name   string
+		stream []byte
+		want   string
+	}{
+		{"lrMax NaN", put32(19, nan32), "lrMax"},
+		{"lrMax +Inf", put32(19, inf32), "lrMax"},
+		{"wsum NaN", put64(23, nan64), "weight accumulator"},
+		{"wsum -Inf", put64(23, inf64), "weight accumulator"},
+	}
+	for _, c := range cases {
+		err := LoadState(bytes.NewReader(c.stream), NewScheduleFreeAdamWDefault(0.05), params)
+		if err == nil || !strings.Contains(err.Error(), c.want) || !strings.Contains(err.Error(), "not finite") {
+			t.Errorf("%s: got %v, want a not-finite error naming the %s", c.name, err, c.want)
+		}
+	}
+	// Control: the unmodified stream still loads.
+	if err := LoadState(bytes.NewReader(valid), NewScheduleFreeAdamWDefault(0.05), params); err != nil {
+		t.Errorf("control stream rejected: %v", err)
+	}
+}

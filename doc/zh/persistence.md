@@ -2,7 +2,7 @@
 
 # 持久化：Save、Load 与 LNNS 格式
 
-**摘要：** `serialize` 包以一种紧凑、带版本、小端序（little-endian）的二进制格式（魔数（magic）`"LNNS"`）持久化张量，`nn` 在其上为 LTC、CfC 细胞与 Linear 层构建了六个 Save/Load 函数。`optimizer` 包另以 `SaveState`/`LoadState`（魔数 `"LNO1"`）持久化 SGD/Momentum/Adam 的按参数状态，使续训（resume）轨迹与不间断训练逐位一致。加载路径把输入视为**不可信字节流**（untrusted byte stream）：一切失败都是 error（绝不 panic），尺寸声明在任何缓冲区分配**之前**完成校验，恶意流的分配量只与它**实际送达**的字节数成正比。
+**摘要：** `serialize` 包以一种紧凑、带版本、小端序（little-endian）的二进制格式（魔数（magic）`"LNNS"`）持久化张量，`nn` 在其上为 LTC、CfC 细胞与 Linear 层构建了六个 Save/Load 函数。`optimizer` 包另以 `SaveState`/`LoadState`（魔数 `"LNO1"`）持久化五种优化器的按参数状态，使续训（resume）轨迹与不间断训练逐位一致。加载路径把输入视为**不可信字节流**（untrusted byte stream）：一切失败都是 error（绝不 panic），尺寸声明在任何缓冲区分配**之前**完成校验，恶意流的分配量只与它**实际送达**的字节数成正比。
 
 **读者对象：** 需要为训练好的模型做检查点（checkpoint）的工程师；以及任何想逐字节弄清线上格式（wire format）及其安全契约的人。
 
@@ -28,7 +28,7 @@
 
 | 函数 | 签名 | 流内容 |
 |---|---|---|
-| `optimizer.SaveState(w, o, params)` / `optimizer.LoadState(r, o, params)` | `func(io.Writer, Optimizer, []*autograd.Variable) error` / `func(io.Reader, Optimizer, []*autograd.Variable) error` | 魔数 `"LNO1"`；kind `0/1/2` = SGD/Momentum/Adam；数量；存在性记录；一条张量 blob |
+| `optimizer.SaveState(w, o, params)` / `optimizer.LoadState(r, o, params)` | `func(io.Writer, Optimizer, []*autograd.Variable) error` / `func(io.Reader, Optimizer, []*autograd.Variable) error` | 魔数 `"LNO1"`；kind `0–4` = SGD/Momentum/Adam/AdEMAMix/ScheduleFreeAdamW；数量；存在性记录；一条张量 blob |
 
 `serialize` 中的四个流级构件：
 
@@ -293,7 +293,7 @@ unknown format version     -> serialize: unsupported format version 99 (this bui
 
 ## 优化器状态流：`SaveState`/`LoadState`（`"LNO1"` 格式）
 
-模型检查点恢复的是参数——但 `Momentum` 与 `Adam` 的*状态*（velocity 缓冲、矩估计、更新计数、偏差校正幂）过去只存活在内存里，从纯模型检查点续训会把它们静默重置：对 Adam 而言，这等于丢弃此前每一步积累的学习率自适应（偏差校正像 `t = 0` 一样重新开始）。`optimizer.SaveState`/`LoadState` 把这份状态持久化为自定界的**状态流**（state stream，魔数 `"LNO1"`——刻意区别于 `"LNNS"`：状态流*内嵌*一条张量 blob，它自身不是 blob），并使**续训（resume）与不间断训练逐位一致**：
+模型检查点恢复的是参数——但 `Momentum`、`Adam`、`AdEMAMix` 与 `ScheduleFreeAdamW` 的*状态*（velocity 缓冲、矩估计、慢速 EMA、`z` 序列、更新计数、偏差校正幂、逐参数模式位）过去只存活在内存里，从纯模型检查点续训会把它们静默重置：对 Adam 而言，这等于丢弃此前每一步积累的学习率自适应（偏差校正像 `t = 0` 一样重新开始）。`optimizer.SaveState`/`LoadState` 把这份状态持久化为自定界的**状态流**（state stream，魔数 `"LNO1"`——刻意区别于 `"LNNS"`：状态流*内嵌*一条张量 blob，它自身不是 blob），并使**续训（resume）与不间断训练逐位一致**：
 
 ```go
 package main
@@ -458,7 +458,7 @@ loss: iter 49 = 0.024681, iter 99 = 0.011424
 Adam stream into Momentum -> optimizer: state stream kind 2 (Adam) does not match optimizer kind 1 (Momentum)
 ```
 
-**续训契约，逐位等价。** 50 步 → 检查点 → 全新对象续训 50 步 vs 不间断 100 步：第 51–100 步**逐参数（`Float32bits`）轨迹 + 逐步 loss 逐位吻合，三优化器全过**（`TestResumeBitExact{Adam,Momentum,SGD}`；终损位模式由测试钉死；红队按指令换用不同模型族——LTC 细胞——而非实施方的模型族复验通过）。Adam 的更新计数 `t` 与偏差校正幂 `pow1 = Beta1^t`、`pow2 = Beta2^t` **逐位保存**，因此续训完整继承中断运行积累的自适应；同一状态写两次得到逐字节相同的流（`TestSaveStateDeterministic`）。
+**续训契约，逐位等价。** 50 步 → 检查点 → 全新对象续训 50 步 vs 不间断 100 步：第 51–100 步**逐参数（`Float32bits`）轨迹 + 逐步 loss 逐位吻合，五种优化器全过**（`TestResumeBitExact{Adam,Momentum,SGD}` 与阶段 20 的 `TestResumeBitExact{AdEMAMix,ScheduleFree}`；终损位模式由测试钉死；红队按指令换用不同模型族——LTC 细胞——而非实施方的模型族复验通过）。Adam 的更新计数 `t` 与偏差校正幂 `pow1 = Beta1^t`、`pow2 = Beta2^t` **逐位保存**，因此续训完整继承中断运行积累的自适应；同一状态写两次得到逐字节相同的流（`TestSaveStateDeterministic`）。两个新 kind 自带各自的计数器——AdEMAMix 沿用同一 `t`/`pow1`/`pow2` 三元组，ScheduleFreeAdamW 为 `k`/`pow2` 外加 `lrMax` 与 `wsum` 平均权重累加器——两个续训测试都刻意横跨 warmup 边界（`Warmup = 80` / `WarmupSteps = 60` 对 50 步切分）：调度器是恢复后更新计数的纯函数，续训的下半程精确复现它们。
 
 ### 线上格式（`"LNO1"`）
 
@@ -467,17 +467,19 @@ Adam stream into Momentum -> optimizer: state stream kind 2 (Adam) does not matc
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | 魔数 | `[4]byte` | 恰为 `L N O 1` |
-| 版本 | `uint8` | `1`；其他值按方向分流报错（偏高 → "written by a newer version… update this build"；偏低 → "no earlier layout exists"） |
-| kind | `uint8` | `0` = SGD、`1` = Momentum、`2` = Adam；加载进错误的优化器类型是精确的指名错误（见上） |
+| 版本 | `uint8` | `1`；其他值按方向分流报错（偏高 → "written by a newer version… update this build"；偏低 → "no earlier layout exists"）。阶段 20 的新 kind 是**扩展标签而非版本迁移**——version 保持 1，旧读端只会按名拒绝未知 kind |
+| kind | `uint8` | `0` = SGD、`1` = Momentum、`2` = Adam、`3` = AdEMAMix、`4` = ScheduleFreeAdamW；加载进错误的优化器类型是精确的指名错误（见上） |
 | 数量 | `uint32` | 参数记录数——每参数一条，按 `SaveState` 所收 `params` 切片的次序 |
-| 记录段，重复 `count` 次（SGD 为空） | `present` `uint8` | `0` = 该参数无状态，`1` = 状态随后；仅 Adam 且 present 时：`t` `uint32`（更新计数）、`pow1`/`pow2` `float32`（`Beta1^t`/`Beta2^t`，逐位保存） |
-| blob | — | 单条 `serialize` 张量流，按参数次序：每个 present 的 Momentum 参数一个 velocity 张量，每个 present 的 Adam 参数 `m` 后跟 `v`，SGD **零**个张量——自定界，拒绝尾字节 |
+| 记录段，重复 `count` 次（SGD 为空） | `present` `uint8` | `0` = 该参数无状态，`1` = 状态随后；**Adam 与 AdEMAMix** 且 present 时：`t` `uint32`（更新计数）、`pow1`/`pow2` `float32`（`Beta1^t`/`Beta2^t`，逐位保存）；**ScheduleFreeAdamW** 且 present 时——22 字节：`k` `uint32`（更新计数）、`pow2` `float32`（`Beta2^k`，逐位）、`lrMax` `float32`（见过的最大调度 lr）、`wsum` `float64`（平均权重累加器，唯一的宽字段）、`mode` `uint8`（该参数的模式位：`1` = train——其 Data 持有 `y`，`0` = eval——持有 `x`） |
+| blob | — | 单条 `serialize` 张量流，按参数次序：每个 present 的 Momentum 参数一个 velocity 张量，每个 present 的 Adam 参数 `m` 后跟 `v`，每个 present 的 AdEMAMix 参数 `m1`、`m2` 后跟 `v`，每个 present 的 ScheduleFreeAdamW 参数 `z` 后跟 `v`，SGD **零**个张量——自定界，拒绝尾字节 |
 
-三优化器的记录布局：**SGD** 恒为 **19 字节**自洽空流（10 字节头部加 9 字节空张量 blob——与参数个数无关；保存是恒等操作，但流仍然写出，使每种 kind 都经同一统一格式 round-trip）；**Momentum** 每个 present 参数携带一个 velocity 张量；**Adam** 每个 present 参数携带 `m` 与 `v`，外加记录段中的 `t`/`pow1`/`pow2` 计数器。超参（`LR`、`Mu`、`Beta1`/`Beta2`/`Eps`）**刻意不入流**——它们是导出字段，由调用方在目标优化器上设置，与构造时完全一样；对 Adam，流内 `pow1`/`pow2` 必须与本优化器的 `Beta1^t`/`Beta2^t` 逐位相等，因此在不同 beta 下保存的流按损坏失败（pow 位翻转一石二鸟地兼作 β 超参错配探测器：`TestLoadStateRejectsInconsistentAdamCounters`）。
+五种优化器的记录布局：**SGD** 恒为 **19 字节**自洽空流（10 字节头部加 9 字节空张量 blob——与参数个数无关；保存是恒等操作，但流仍然写出，使每种 kind 都经同一统一格式 round-trip）；**Momentum** 每个 present 参数携带一个 velocity 张量；**Adam** 每个 present 参数携带 `m` 与 `v`，外加记录段中的 `t`/`pow1`/`pow2` 计数器；**AdEMAMix** 逐字沿用 Adam 的记录布局，blob 中携带 `m1`、`m2` 与 `v`；**ScheduleFreeAdamW** blob 中携带 `z` 与 `v`，外加 22 字节记录（`k`/`pow2`/`lrMax`/`wsum`/`mode`）。超参（`LR`、`Mu`、`Beta1`/`Beta2`/`Eps`、`Alpha`/`Beta3`/`Warmup`、`WeightDecay`/`WarmupSteps`）**刻意不入流**——它们是导出字段，由调用方在目标优化器上设置，与构造时完全一样；流内 `pow1`/`pow2`（Adam、AdEMAMix）与 `pow2`（ScheduleFreeAdamW）必须与目标优化器自身的 `Beta1^t`/`Beta2^t`/`Beta2^k` 逐位相等，因此在不同 beta 下保存的流按损坏失败（pow 位翻转一石二鸟地兼作 β 超参错配探测器：`TestLoadStateRejectsInconsistentAdamCounters` 及其阶段 20 的 kind 3/4 镜像）。该校验的推论自始即有文档：pow 字段是**滚动乘积**——训练中改写 `Beta*` 字段*之后*再保存，流将不可加载：`betaPow` 只能重放单一 beta 的乘积，无法重放优化器实际积累的分段乘积。跨 beta 改写的续训因此被刻意拒绝，与损坏不可区分；只在你不打算续训的检查点之间改 beta。两条 ScheduleFree 专有守卫：`lrMax` 与 `wsum` 作为累加器，`Step` 只可能产出有限值（LR > 0），因此非有限值一律按损坏拒绝，不给它毒化续训后首次更新的机会（`TestLoadStateRejectsNonFiniteScheduleFreeCounters`）；`mode` 字节校验 ∈ {0, 1}（`TestLoadStateRejectsBadModeByte`）。
+
+**正是 mode 字节让 eval 模式检查点可以跨实例续训。** eval 模式下保存的 ScheduleFreeAdamW 流会把每个参数的 eval 模式一并恢复：下一次 `Step` 按编号指名 panic（[training.md](training.md) 的 train/eval 守卫），`Train` 完成 `x → y` 转换后续训——与同实例 Eval → Train → 续训路径逐位一致（`y→x→y` 往返本身有舍入，因此续训相对从未转换的轨迹差几个 ULP）。只有*优化器级*模式标志——对无状态参数的闸门——是瞬态且不入流的：新建的优化器永远在 train 模式。
 
 ### 不可信流纪律
 
-与模型流同一纪律：**validate-all-then-apply（先全验后应用）**——一切记录、张量与计数器在任何状态写入之前完成解析与校验，因此失败的加载让目标优化器**逐位保持原样**（velocity/m/v/t/pow 分毫不动，parameter 0 不受 parameter 1 失败的牵连；`TestLoadStateRejectsShapeMismatchWithoutSideEffects`）；**只有 error，绝不 panic**——14 类对抗流全部 error（kind 互载 6 对、未知 kind、坏魔数、version 0/99 按方向分流、count 双向不符、存在性标志 `2`、形状失配三条路径、pow 位翻转、`t` 超限在 blob 解析之前拒绝、六个截断点 → `io.ErrUnexpectedEOF`、尾字节、blob 张量数、I/O 透传；`TestLoadStateRejects*` 族，外加红队 500 个变异体 0 panic——其中 76 个加载成功者重存幂等、0 失配，66 个严格前缀截断全部拒绝）；**字节预算双门禁**——29 字节恶意流仅分配 352 B、10 字节巨 count 流仅 276 B（`TestLoadStateHostileClaimsStayWithinByteBudget`）；**`maxT = 2²⁴` 仅加载侧限额**——pow 一致性校验把 `Beta^t` 重算为 `t` 次顺序乘法，因此一条 13 字节、声称 `t = 2³²−1` 的记录不得记上四十亿次乘法的账（与下面 `maxUnfolds`/`maxUnits` 相同的加载侧不对称论证：`Adam.Step` 的运行时契约不变，因为那里的步数是调用方自己的训练史，而加载的输入是不可信流，对自己的资源预算没有表决权）。
+与模型流同一纪律：**validate-all-then-apply（先全验后应用）**——一切记录、张量与计数器在任何状态写入之前完成解析与校验，因此失败的加载让目标优化器**逐位保持原样**（velocity/m/v/t/pow 分毫不动，parameter 0 不受 parameter 1 失败的牵连；`TestLoadStateRejectsShapeMismatchWithoutSideEffects`）；**只有 error，绝不 panic**——各类对抗流全部 error（五种 kind 的跨 kind 互载全 20 对、未知 kind、坏魔数、version 0/99 按方向分流、count 双向不符、存在性标志 `2`、形状失配三条路径及新 kind 路径、三种带计数器 kind 的 pow 位翻转、非有限 `lrMax`/`wsum`、非法 mode 字节、`t`/`k` 超限在 blob 解析之前拒绝、每个记录边界截断 → `io.ErrUnexpectedEOF`、尾字节、blob 张量数、I/O 透传；`TestLoadStateRejects*` 族，外加红队 500 个变异体 0 panic——其中 76 个加载成功者重存幂等、0 失配，66 个严格前缀截断全部拒绝）；**字节预算双门禁**——29 字节恶意流仅分配 352 B、10 字节巨 count 流仅 276 B（`TestLoadStateHostileClaimsStayWithinByteBudget`）；**`maxT = 2²⁴` 仅加载侧限额**（Adam 与 AdEMAMix 的 `t`、ScheduleFreeAdamW 的 `k`）——pow 一致性校验把 `Beta^t` 重算为 `t` 次顺序乘法，因此一条 13 字节、声称 `t = 2³²−1` 的记录不得记上四十亿次乘法的账（与下面 `maxUnfolds`/`maxUnits` 相同的加载侧不对称论证：`Adam.Step` 的运行时契约不变，因为那里的步数是调用方自己的训练史，而加载的输入是不可信流，对自己的资源预算没有表决权）。
 
 ### 索引键控与陈旧键
 

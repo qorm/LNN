@@ -57,7 +57,7 @@ can be audited on their own ([persistence.md](persistence.md)).
 | `tensor` | Dense buffers and numeric kernels; validation by panic | strides, views, in-place ops, broadcasting beyond an enumerated subset |
 | `autograd` | Eager forward + op-kind-tagged backward dispatch; reverse-mode `Backward` | tape/session objects, per-node backward closures (replaced by a tag), graph optimization, higher-order derivatives |
 | `nn` | Layers, cells (LTC and CfC), wiring, sequence unrolling, parameter aggregation, six Save/Load functions | its own wire format — persistence is the separate `serialize` package; built-in optimizers live in the separate `optimizer` package |
-| `optimizer` | SGD/Momentum/Adam as explicit structs over `autograd` leaves | state beyond per-parameter velocity/moments; lr schedules (caller-owned fields) |
+| `optimizer` | SGD/Momentum/Adam/AdEMAMix/ScheduleFreeAdamW as explicit structs over `autograd` leaves | state beyond per-parameter velocity/moments/the `z` sequence; lr schedules (caller-owned fields; ScheduleFreeAdamW replaces them by design) |
 | `serialize` | Versioned `"LNNS"` tensor streams and model streams; error-only load path, safe against hostile streams | version negotiation (version 1 only, unknown versions are rejected); compression, encryption |
 
 ## Data flow of one training iteration

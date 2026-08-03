@@ -46,6 +46,7 @@ replace github.com/qorm/LNN => /path/to/LNN   // 你的仓库检出路径
 | 11 | [训练中途退火学习率](#11-训练中途退火学习率) | 超参就是导出字段：写 `opt.LR`，下一次 `Step` 起生效。 |
 | 12 | [确定性复现](#12-确定性复现) | 种子纪律：同样的 seed ⇒ 逐位一致的运行。 |
 | 13 | [长序列训练：UnrollRemat 分块 BPTT](#13-长序列训练unrollremat-分块-bptt) | 梯度逐位一致、峰值图内存 O(chunk)：为超出全图驻留模型的序列准备的重实体化。 |
+| 14 | [Schedule-Free AdamW：无调度训练](#14-schedule-free-adamw无调度训练) | `y`/`z`/`x` 契约实战：在 `y` 上训练、`Eval` 导出 `x`，以及 eval 检查点续训流程（由指名 panic 守门）。 |
 
 ---
 
@@ -1872,3 +1873,182 @@ bug）。闭合引用参数的正则项是合法的（损失只调用一次）�
 [architecture.md](architecture.md)；留档的残余角落（最坏情形、
 值依赖细胞、双 NaN 载荷角）见 [pitfalls.md](pitfalls.md)；完整
 契约见 `nn.UnrollRemat` 的 godoc；一行式条目见 [api.md](api.md)。
+
+---
+
+## 14. Schedule-Free AdamW：无调度训练
+
+**场景：** 想要生产级训练却**不想调任何学习率调度**——Schedule-Free
+AdamW（arXiv:2405.15682）以迭代平均取代衰减。代价是 train/eval
+契约：训练中参数持有 `y`（求梯度的点），可部署的权重是 `x`。下面的
+程序完成训练、经 `Eval` 导出 `x`、演示让契约易于遵守的守卫（指名
+panic，而非静默错答），并经一个 **eval 模式检查点**在全新优化器实例
+上暂停/续训。
+
+```go
+package main
+
+import (
+	"bytes"
+	"fmt"
+	"math"
+	"math/rand"
+
+	"github.com/qorm/LNN/autograd"
+	"github.com/qorm/LNN/optimizer"
+	"github.com/qorm/LNN/tensor"
+)
+
+const (
+	n     = 32
+	iters = 120
+	lr    = 0.05
+)
+
+func data() (x, y *autograd.Variable) {
+	rng := rand.New(rand.NewSource(42))
+	xs, ys := make([]float32, n), make([]float32, n)
+	for i := range xs {
+		xs[i] = rng.Float32()*2 - 1
+		ys[i] = 2*xs[i] + 1
+	}
+	return autograd.Const(tensor.FromData(xs, n, 1)),
+		autograd.Const(tensor.FromData(ys, n, 1))
+}
+
+func lossOf(x, y, w, b *autograd.Variable) *autograd.Variable {
+	pred := autograd.Add(autograd.MatMul(x, w), b)
+	diff := autograd.Sub(pred, y)
+	return autograd.MeanAll(autograd.Hadamard(diff, diff))
+}
+
+func main() {
+	x, y := data()
+
+	// 1. 用 Schedule-Free AdamW 训练：从头到尾没有 lr 调度；
+	//    参数全程持有 y（求梯度的点）。
+	w := autograd.Var(tensor.Randn(rand.New(rand.NewSource(7)), 1, 1))
+	b := autograd.Var(tensor.New(1))
+	params := []*autograd.Variable{w, b}
+	opt := optimizer.NewScheduleFreeAdamWDefault(lr)
+	for it := 0; it < iters; it++ {
+		loss := lossOf(x, y, w, b)
+		for _, p := range params {
+			p.ZeroGrad()
+		}
+		loss.Backward()
+		opt.Step(params)
+	}
+
+	// 2. Eval 把参数转换到 x 序列——可部署的权重。
+	opt.Eval(params)
+	fmt.Printf("after %d steps: eval weights x = (%.4f, %.4f)\n", iters, w.Data.Data[0], b.Data.Data[0])
+
+	// 3. 任一参数处于 eval 模式时 Step 会按编号指名 panic——
+	//    在 x 上训练是唯一会静默毁掉本方法的误用。
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Printf("Step in eval mode -> panic: %v\n", r)
+			}
+		}()
+		opt.Step(params)
+	}()
+
+	// 4. Train 转回 y；训练继续。
+	opt.Train(params)
+	for it := 0; it < 40; it++ {
+		loss := lossOf(x, y, w, b)
+		for _, p := range params {
+			p.ZeroGrad()
+		}
+		loss.Backward()
+		opt.Step(params)
+	}
+	opt.Eval(params)
+	fmt.Printf("after 40 more:      eval weights x = (%.4f, %.4f)\n", w.Data.Data[0], b.Data.Data[0])
+
+	// 5. eval 模式检查点用于暂停：状态流携带每个参数的模式位，
+	//    因此跨实例续训是同一条 LoadState ->（Step 必 panic）-> Train -> 续训 流程。
+	w2 := autograd.Var(tensor.Randn(rand.New(rand.NewSource(7)), 1, 1))
+	b2 := autograd.Var(tensor.New(1))
+	params2 := []*autograd.Variable{w2, b2}
+	opt2 := optimizer.NewScheduleFreeAdamWDefault(lr)
+	for it := 0; it < iters; it++ {
+		loss := lossOf(x, y, w2, b2)
+		for _, p := range params2 {
+			p.ZeroGrad()
+		}
+		loss.Backward()
+		opt2.Step(params2)
+	}
+	opt2.Eval(params2)
+	var stateBuf bytes.Buffer
+	if err := optimizer.SaveState(&stateBuf, opt2, params2); err != nil {
+		panic(err)
+	}
+	fmt.Printf("eval-mode checkpoint: %d bytes, params now hold x\n", stateBuf.Len())
+
+	opt3 := optimizer.NewScheduleFreeAdamWDefault(lr)
+	if err := optimizer.LoadState(bytes.NewReader(stateBuf.Bytes()), opt3, params2); err != nil {
+		panic(err)
+	}
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Printf("Step before Train -> panic: %v\n", r)
+			}
+		}()
+		opt3.Step(params2)
+	}()
+	opt3.Train(params2)
+	for it := 0; it < 40; it++ {
+		loss := lossOf(x, y, w2, b2)
+		for _, p := range params2 {
+			p.ZeroGrad()
+		}
+		loss.Backward()
+		opt3.Step(params2)
+	}
+	opt3.Eval(params2)
+	fmt.Printf("resumed across checkpoint: x = (%.4f, %.4f) — same as the same-instance run: %v\n",
+		w2.Data.Data[0], b2.Data.Data[0],
+		math.Float32bits(w.Data.Data[0]) == math.Float32bits(w2.Data.Data[0]) &&
+			math.Float32bits(b.Data.Data[0]) == math.Float32bits(b2.Data.Data[0]))
+}
+```
+
+实测输出（seed 42 / 7——确定性）：
+
+```
+after 120 steps: eval weights x = (2.0591, 1.0162)
+Step in eval mode -> panic: optimizer.ScheduleFreeAdamW.Step: parameter 0 is in eval mode (its Data holds the evaluation weights x): gradients must be evaluated at y; call Train(params) before resuming training
+after 40 more:      eval weights x = (2.1853, 1.0146)
+eval-mode checkpoint: 131 bytes, params now hold x
+Step before Train -> panic: optimizer.ScheduleFreeAdamW.Step: parameter 0 is in eval mode (its Data holds the evaluation weights x): gradients must be evaluated at y; call Train(params) before resuming training
+resumed across checkpoint: x = (2.1853, 1.0146) — same as the same-instance run: true
+```
+
+**关键行：**
+
+- 训练本身与常例无异——同一个四阶段循环。变化在于*权重住在哪里*：
+  `Step` 之后 `params` 仍持有 `y`，而不是你会部署的那份权重。
+- `opt.Eval(params)` 原位转换到平均后的 `x` 序列——评估或导出都在
+  这里做。它幂等，且只触碰已持有状态的参数，调用两次也安全。
+- 第 3 步的 panic 是契约的守卫而非错误：`Step` 在修改任何东西**之前**
+  先检查每个参数的模式位，因此在 `x` 上训练——唯一会静默毁掉运行的
+  误用——代价是一次指名 panic 而非一次毁掉的结果。`Train` 转回
+  （第 4 步继续训练）。
+- eval 模式检查点（kind 4）携带每个参数的模式位，因此跨实例续训
+  重放同一道闸门：`LoadState` → `Step` panic → `Train` → 续训，
+  与同实例运行逐位一致（`Float32bits` 对比）。要逐位恢复不间断轨迹
+  请在 **train 模式**下存档；eval 检查点用于导出 `x` 或暂停
+  （`y→x→y` 往返有舍入，这种续训相对从未转换的轨迹差几个 ULP）。
+- 这里 LR 取 0.05——官方指引要调度版 AdamW 的 1×–10×。
+  `NewScheduleFreeAdamWDefault(lr)` 取 β1 = 0.9、β2 = 0.999、
+  eps = 1e-8。
+
+**延伸阅读：** y/z/x 方程与五种优化器的选用指引（以及 AdEMAMix 的
+长记忆双 EMA）见 [training.md](training.md)；kind 4 线格式（mode
+字节、`lrMax`/`wsum`、非有限与 β 改写拒载）见
+[persistence.md](persistence.md)；通用检查点/续训模式见食谱 4。

@@ -7,7 +7,7 @@
 stability (learning rate and gradient clipping). The update phase is
 either five hand-rolled lines of Go — the basis for understanding the
 engine — or one `optimizer.Step` call (the `optimizer` package ships
-SGD/Momentum/Adam), the recommended form for production training. This
+SGD/Momentum/Adam/AdEMAMix/Schedule-Free AdamW), the recommended form for production training. This
 guide shows both end to end.
 
 **Audience:** engineers about to train their first model with the library.
@@ -139,7 +139,7 @@ root.
 
 The `optimizer` package packages phase 4 of the loop — exactly the
 hand-rolled update above, same `float32` arithmetic, same in-place writes
-to `p.Data` — as one auditable method call. Three explicit structs, no
+to `p.Data` — as one auditable method call. Five explicit structs, no
 configuration objects, no reflection:
 
 | Optimizer | Constructor | Update rule |
@@ -147,6 +147,8 @@ configuration objects, no reflection:
 | `SGD` | `optimizer.NewSGD(lr)` | `p -= LR·g` — the hand-rolled loop itself |
 | `Momentum` | `optimizer.NewMomentum(lr, mu)` | `v = Mu·v + g`, then `p -= LR·v` — velocity stores *unscaled* gradients, exactly the "Optional: momentum" snippet below |
 | `Adam` | `optimizer.NewAdam(lr, beta1, beta2, eps)` or `optimizer.NewAdamDefault(lr)` (Kingma & Ba's 0.9 / 0.999 / 1e-8) | bias-corrected first/second moment estimates |
+| `AdEMAMix` | `optimizer.NewAdEMAMix(lr, b1, b2, b3, alpha, warmup, eps)` or `optimizer.NewAdEMAMixDefault(lr, warmup)` (0.9 / 0.999 / 0.9999 / α=5 / 1e-8) | Adam plus a second, *slow* gradient EMA mixed in with coefficient α — very old gradients keep a vote |
+| `ScheduleFreeAdamW` | `optimizer.NewScheduleFreeAdamW(lr, b1, b2, eps)` or `optimizer.NewScheduleFreeAdamWDefault(lr)` | no learning-rate schedule: gradients evaluated at `y`, base AdamW on `z`, deployable weights are the averaged `x` — with a `Train`/`Eval` conversion contract |
 
 All implement `optimizer.Optimizer` (`Step(params []*autograd.Variable)`),
 constructors validate their arguments and panic with the offending value,
@@ -214,8 +216,9 @@ precisely the arithmetic you asked for.
 
 ### State is keyed by pointer identity
 
-`Momentum` and `Adam` keep per-parameter state (velocity; Adam's moment
-buffers and step count) in maps keyed by `*autograd.Variable` pointer.
+`Momentum`, `Adam`, `AdEMAMix` and `ScheduleFreeAdamW` keep per-parameter
+state (velocity; moment buffers, slow-EMA buffers, the `z` sequence and
+update counts) in maps keyed by `*autograd.Variable` pointer.
 Consequences:
 
 - The same variable stepped repeatedly accumulates its state; distinct
@@ -243,6 +246,111 @@ does not apply here. Adam's square root goes through `math.Sqrt` — the
 standard library has no `float32` sqrt, and one correctly-rounded
 conversion per element is not an accumulation, so it cannot drift.
 
+## AdEMAMix and Schedule-Free AdamW
+
+Two newer update rules landed in the package, each ported against a
+third-party `float64` reference implementation of its paper (max
+deviation 9.5e-6 / 3.3e-7 respectively, with discrimination guards so
+the gate detects injected mutations), covered by 77 top-level tests
+plus the load-path fuzz target, and pinned by the same 50+50-vs-100
+bit-exact resume contract as the original three
+([persistence.md](persistence.md)).
+
+### AdEMAMix: Adam with a long memory
+
+Pagliardini, Ablin & Grangier, *The AdEMAMix Optimizer: Better, Faster,
+Older* ([arXiv:2409.03137](https://arxiv.org/abs/2409.03137), ICLR 2025):
+Adam augmented with a second, **slow** EMA of the gradient, mixed in
+with coefficient α, so very old gradients keep a non-negligible
+influence while the fast EMA stays reactive. Per element, at update
+count `t`:
+
+```
+m1  = β1·m1 + (1−β1)·g          fast EMA
+m2  = β3(t)·m2 + (1−β3(t))·g    slow EMA — deliberately NO bias correction
+v   = β2·v + (1−β2)·g²
+p  −= LR · (m1/(1−β1ᵗ) + α(t)·m2) / (sqrt(v/(1−β2ᵗ)) + eps)
+```
+
+- The uncorrected slow EMA is the paper's design, not an omission:
+  with β3 = 0.9999 the correction `1−β3ᵗ` stays tiny for thousands of
+  steps and dividing by it would blow up the early updates (the
+  paper's Fig. 27 divergence). Instead the buffer fills slowly while
+  the **warmup schedulers** ramp its influence over the first `Warmup`
+  steps: α(t) linear from 0, and β3(t) linear *in the EMA half-life*
+  (near 1 a fixed β3 increment matters far more than near 0.9).
+- `NewAdEMAMixDefault(lr, warmup)` uses β = (0.9, 0.999, 0.9999), α = 5,
+  eps = 1e-8; the paper sets warmup to the total iteration count
+  (`Warmup = 0` disables the schedulers).
+- Like this package's Adam, **no decoupled weight decay** (the paper's
+  λ / the official `weight_decay`): apply it yourself if your recipe
+  needs one.
+- One inherent caveat to know before long **zero-gradient pauses** (a
+  frozen loss, a data gap): while `g = 0`, the update magnitude evolves
+  as `(β3/√β2)ᵗ` — ≈ 1.0004ᵗ with the defaults, i.e. it *grows*
+  exponentially during the pause until float32 limits bottom out.
+  Paper-inherent (an uncorrected slow EMA over a decaying second
+  moment), noted in the godoc; avoid long zero-gradient stretches, or
+  expect a transient when they end.
+
+### Schedule-Free AdamW: no learning-rate schedule at all
+
+Defazio et al., *The Road Less Scheduled*
+([arXiv:2405.15682](https://arxiv.org/abs/2405.15682), NeurIPS 2024
+oral; MLCommons AlgoPerf self-tuning track winner): AdamW's decay
+schedule replaced by iterate averaging — no stopping time, no decay to
+tune. Three sequences run per parameter; the bias correction follows
+the **current official implementation** (schedulefree v1.3+, dividing
+`v` by `1−β2ᵗ` inside the root), not the paper-published variant:
+
+```
+y = (1−β1)·z + β1·x    gradients are evaluated at y
+z −= lr · g'           base AdamW step, g' = g / (sqrt(v/(1−β2ᵗ)) + eps) (+ WeightDecay·y)
+x = (1−c)·x + c·z      polynomially weighted average of z — the deployable weights
+```
+
+- **The train/eval contract — the one thing to get right.** During
+  training every parameter's `Data` holds `y` (the gradient-evaluation
+  point), never the deployable `x`. `Eval(params)` converts in place to
+  `x` — evaluate, export, checkpoint-for-inference there — and
+  `Train(params)` converts back before the next `Step`. Every stepped
+  parameter carries its **own mode bit**, and `Step` checks all of them
+  before modifying anything: stepping a parameter that holds `x` panics
+  naming its index — training at `x` is the one misuse that would
+  silently ruin the method (it is what the official implementation
+  raises on). `Eval`/`Train` are idempotent and touch only parameters
+  that carry state; a fresh optimizer starts in train mode (at
+  construction `x = y = z`, so the officially mandatory initial
+  `train()` converts nothing).
+- β1 = 0 (Polyak-Ruppert, `y = z`) is **rejected** — the in-place
+  conversion needs `1/β1`. Official guidance, adopted in the godoc: LR
+  1×–10× larger than scheduled AdamW (their default 0.0025), β1
+  0.95–0.98 for very long runs. `WeightDecay` is decoupled and applied
+  at `y` (0 default), exactly as upstream. Do not layer a decay
+  schedule on top — replacing it is the point.
+- **Checkpointing.** `SaveState` persists `z`, `v`, the counters **and
+  each parameter's mode bit** (kind 4, [persistence.md](persistence.md)).
+  Checkpoint in **train mode** for a bit-exact resume; checkpoint in
+  **eval mode** to export `x`, or to pause: after `LoadState` every
+  restored parameter is back in eval mode, `Step` panics naming the
+  index, and `Train` converts — resuming bit-identically to the
+  same-instance Eval → Train → resume path (the `y→x→y` round trip
+  itself rounds, so an eval-checkpoint resume sits a few ULP off the
+  never-converted trajectory). The full flow, with a measured program,
+  is [cookbook.md](cookbook.md) recipe 14.
+
+### Choosing among the five
+
+Plain guidance, no rankings: **SGD/Momentum** to understand the loop
+(and tiny problems), **Adam** the default production choice,
+**AdEMAMix** when long-horizon gradient memory is the point of the task
+and you accept the warmup schedule and the zero-pause caveat,
+**Schedule-Free** when you cannot or do not want to tune a decay
+schedule and accept the train/eval discipline and a larger LR. Everything
+else in this guide is optimizer-agnostic: the four-phase loop, the
+`ZeroGrad` discipline, clipping, pointer-keyed state, hot-swappable
+exported fields, and bit-exact resume through `SaveState`/`LoadState`.
+
 ## Why the hand-rolled loop remains
 
 The library's contract is a small, readable, auditable numeric core; an
@@ -250,7 +358,7 @@ update rule is five lines of Go, and writing it yourself keeps lr
 schedules, clipping and regularization in your code, visible and
 diffable, rather than hidden behind a framework abstraction. Nothing in
 the graph engine assumes how leaves are updated. The `optimizer` package
-(above) packages precisely this loop for the three common rules and is
+(above) packages precisely this loop for the five common rules and is
 the recommended form for production training; the hand-rolled version
 stays the basis for understanding what `Step` does — and for every
 update rule the package does not cover (weight-decay variants, exotic

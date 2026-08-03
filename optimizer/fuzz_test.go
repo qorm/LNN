@@ -23,9 +23,11 @@ import (
 // (4) + version (1) + kind (1) + count (4); the kind byte is therefore at
 // offset 5 and the count at offset 6.
 const (
-	fuzzKindSGD      = 0
-	fuzzKindMomentum = 1
-	fuzzKindAdam     = 2
+	fuzzKindSGD          = 0
+	fuzzKindMomentum     = 1
+	fuzzKindAdam         = 2
+	fuzzKindAdEMAMix     = 3
+	fuzzKindScheduleFree = 4
 )
 
 func fuzzStateHeader(kind byte, count uint32) []byte {
@@ -75,7 +77,7 @@ func fuzzStepped(newOpt func() optimizer.Optimizer, params []*autograd.Variable)
 	return o
 }
 
-// FuzzLoadState feeds arbitrary byte streams to LoadState against all three
+// FuzzLoadState feeds arbitrary byte streams to LoadState against all five
 // persisted optimizer kinds. Oracle:
 //   - never panics;
 //   - if the stream carries a valid magic, version and a kind that differs
@@ -89,12 +91,17 @@ func FuzzLoadState(f *testing.F) {
 	sgd := fuzzSaveState(f, fuzzStepped(func() optimizer.Optimizer { return optimizer.NewSGD(0.1) }, params), params)
 	mom := fuzzSaveState(f, fuzzStepped(func() optimizer.Optimizer { return optimizer.NewMomentum(0.1, 0.9) }, params), params)
 	adam := fuzzSaveState(f, fuzzStepped(func() optimizer.Optimizer { return optimizer.NewAdamDefault(0.1) }, params), params)
+	ademamix := fuzzSaveState(f, fuzzStepped(func() optimizer.Optimizer { return optimizer.NewAdEMAMixDefault(0.01, 0) }, params), params)
+	scheduleFree := fuzzSaveState(f, fuzzStepped(func() optimizer.Optimizer { return optimizer.NewScheduleFreeAdamWDefault(0.05) }, params), params)
 
-	// (1) Legitimate streams of all three kinds (each is a cross-kind hostile
-	// input for the other two). (2) Empty/tiny. (3) Hand-forged red-team cases.
+	// (1) Legitimate streams of all five kinds (each is a cross-kind hostile
+	// input for the other four). (2) Empty/tiny. (3) Hand-forged red-team
+	// cases.
 	f.Add(sgd)
 	f.Add(mom)
 	f.Add(adam)
+	f.Add(ademamix)
+	f.Add(scheduleFree)
 	f.Add([]byte{})
 	f.Add([]byte("LNO1"))
 	f.Add([]byte{'X', 'X', 'X', 'X', 1, 0, 0, 0, 0, 0}) // bad magic
@@ -115,6 +122,26 @@ func FuzzLoadState(f *testing.F) {
 		b = append(b, 0, 0, 0, 0, 0, 0, 0, 0)
 		return b
 	}())
+	f.Add(func() []byte { // AdEMAMix record with t = maxUint32 (same limit)
+		b := fuzzStateHeader(fuzzKindAdEMAMix, 1)
+		b = append(b, 1)
+		var t [4]byte
+		binary.LittleEndian.PutUint32(t[:], math.MaxUint32)
+		b = append(b, t[:]...)
+		b = append(b, 0, 0, 0, 0, 0, 0, 0, 0) // pow1, pow2
+		return b
+	}())
+	f.Add(func() []byte { // ScheduleFreeAdamW record with k = maxUint32 (same limit)
+		b := fuzzStateHeader(fuzzKindScheduleFree, 1)
+		b = append(b, 1)
+		var k [4]byte
+		binary.LittleEndian.PutUint32(k[:], math.MaxUint32)
+		b = append(b, k[:]...)
+		// pow2 + lrMax + wsum + mode must be present so the record read
+		// completes and the k-limit check (not a truncation) is what fires.
+		b = append(b, make([]byte, 17)...)
+		return b
+	}())
 	f.Add(func() []byte { // Momentum header + a blob claiming a 1<<62-wide tensor
 		b := fuzzStateHeader(fuzzKindMomentum, 1)
 		b = append(b, 1) // present
@@ -127,6 +154,7 @@ func FuzzLoadState(f *testing.F) {
 	}())
 	f.Add(append(append([]byte(nil), adam...), 0x00)) // trailing byte
 	f.Add(mom[:len(mom)/2])                           // mid-stream truncation
+	f.Add(scheduleFree[:len(scheduleFree)/2])         // mid-stream truncation, wide counters
 
 	kinds := []struct {
 		name string
@@ -136,6 +164,8 @@ func FuzzLoadState(f *testing.F) {
 		{"SGD", fuzzKindSGD, func() optimizer.Optimizer { return optimizer.NewSGD(0.1) }},
 		{"Momentum", fuzzKindMomentum, func() optimizer.Optimizer { return optimizer.NewMomentum(0.1, 0.9) }},
 		{"Adam", fuzzKindAdam, func() optimizer.Optimizer { return optimizer.NewAdamDefault(0.1) }},
+		{"AdEMAMix", fuzzKindAdEMAMix, func() optimizer.Optimizer { return optimizer.NewAdEMAMixDefault(0.01, 0) }},
+		{"ScheduleFreeAdamW", fuzzKindScheduleFree, func() optimizer.Optimizer { return optimizer.NewScheduleFreeAdamWDefault(0.05) }},
 	}
 
 	f.Fuzz(func(t *testing.T, data []byte) {
