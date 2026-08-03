@@ -29,6 +29,7 @@
 | 19 | 机会地图余项：LTC 感知入核 + VJP scratch 复用 + 引擎卫生批 | ✅ 完成（红队双放行；LTCStep 77 allocs/UnrollBackward 3,750，累计 −99%/−97%） |
 | 20 | 优化器双线：AdEMAMix + Schedule-Free AdamW + LNO1 kind 3/4 | ✅ 完成（红队两轮终审签发；参考对照 9.5e-6/3.3e-7，eval 检查点跨实例续训逐位） |
 | 21 | 阶段 15 遗留收清：LNNS CRC32C 完整性（格式 v2）+ PGO 画像重采 | ✅ 完成（待库主裁决提交；红队双路有条件放行、条件全清，serialize 覆盖率 100%） |
+| 22 | 纯维护卫生批：ops.go 纯文件拆分（tensor 5 文件 / autograd 引擎+算子）+ 五包注释单一真源审计（遗留 #6/#8） | ✅ 完成（待库主裁决提交；红队放行，零行为变更，覆盖率持平） |
 
 **阶段 15 双线调研综合结论（只读分析，待库主决策）**：
 
@@ -496,3 +497,8 @@ Git 历史：`87ccf77` 基线 → `08aba45` 阶段3a → `102af40` 阶段3b → 
   - **RT-P（PGO）**：头条数字全部独立复现（旧画像 −69.2%/−56.2%、新画像 Hadamard −56.6%、LTCStep/CfCStep ≈0~−3%）；**「三世界」框架对 tensor 层成立但 autograd 行不随包装函数集走**（仅内联 Hadamard 的画像仍给 ChainForwardBackward 完整 −23%，其收益跟随更深调用路径）；条件 **F1-F4 主控直接修复**（pgo.md 双语：CFB 新画像双态披露、「31.0→9.9 µs」与表格 9,918 ns 对齐、834→956 降格为路径之一而非门槛、grep 启发式补「下界」说明）
 - 2026-08-03：**21c 文档同步（Agent-Y，14 文件双语）**：persistence.md 双语（张量流/模型流表补 `checksum [4]byte` v2 行、Versioning 节改写「读 v1+v2 只写 v2」、Golden 双系、新增完整性披露段含 unfolds 残余窗口 + LNO1 record 段披露、SGD 19→23 字节、示例输出实测 1863/75/2736 字节 + 错误串 reads version 2）；api.md 双语（`Version`=2 + 描述、SGD 23-byte）；全仓陈旧引用扫描修正（README 双版/architecture/pitfalls/faq/cookbook 双语）；**字节数全部实测**（golden_v2 经 wc -c、示例输出逐字运行）；误伤防护：LNO1 自身 version=1 与 v1 黄金字节数有意保留
 - 2026-08-03：**21d 主控终验全绿**——gofmt 空 / build / vet / 五包 `-race`；diff 范围 26 文件 + 6 新 golden_v2 测试件（测试件与 golden_v1 同族先例在仓内）；PLAN.md 阶段 21 规划落盘。阶段 21 累计 5 个 agent（Agent-A/Agent-D/RT-S/RT-P/Agent-Y），累计 66 个 agent。**待库主裁决**：提交 + 打 tag——建议 **v0.6.1**（唯一 API 变化为 `serialize.Version` 值 1→2，零新导出符号，旧流兼容读取，格式 v2 为追加式演进）
+- 2026-08-03：**v0.6.1 发布闭环（库主裁决「提交 + v0.6.1」）**——提交 `55cdba9`（33 文件 +1152/−371，含 6 新 golden_v2 测试件）+ annotated tag v0.6.1 + 推送；**CI 双架构双跑全绿**（main + tag：gofmt/vet/build/race/ltc-sequence 冒烟/fuzz-smoke 全过）；**GitHub Release v0.6.1 注释化发布**（亮点/验证链/传承说明）；**代理解析**：goproxy.cn 实测 v0.6.1、`@latest` 指向 v0.6.1。阶段 21 关闭。项目终态：16 个版本标签（v0.1.0–v0.6.1）+ LNNS v2 完整性校验（模型流与 LNO1 状态流自动继承、v1 兼容）+ 全融合热路径 + 11 fuzz 门禁 + 双架构 CI + 24 篇双语指南；**阶段 15 调研遗留特性项清零**
+- 2026-08-03：**阶段 22 启动**（库主令「ops.go 拆分、包注释清理」——遗留 #6/#8）——主控勘察确认 **#8 已在前几阶段顺带清零**（五包各恰一处包注释真源：tensor/autograd/nn/optimizer 经 doc.go、serialize 经 serialize.go，源码内零陈旧重复），转审计收尾；核心为 ops.go 纯文件拆分。PLAN.md 追加阶段 22 规划
+- 2026-08-03：**22a 实施 + 主控独立复验全绿**——`tensor/ops.go`（631 行）拆 5 文件（ops_matmul 103 / ops_broadcast 181 / ops_elementwise 133 / ops_slice 62 / ops_reduce 172），`autograd/ops.go`（1000 行）拆 ops_engine.go（735 行：opKind/runBackward/私有梯度助手）+ ops.go（272 行：公共算子构造器）；import 按实际引用拆分。**纯移动性双证**：主控独立双重集比对 tensor 453 / autograd 391 行函数块逐字节一致（覆盖 doc comment/签名/函数体全文）；硬纪律零「顺手改进」。门禁全绿：gofmt 空 / build / vet / 五包 -race / 覆盖率 tensor 100%・autograd 100% 不降 / 例程逐位一致（0.690761→0.041996、0.620651→0.029091）。包注释审计：五包各恰一处真源、doc.go 表述零过时（零改动）
+- 2026-08-03：**22b RT-H 红队放行**——独立 Go AST 提取器逐声明完整文本比对（tensor 35 / autograd 43 声明多重集逐字节一致、跨文件顺序保持）；**残差校验**证明原文件无内容被丢（剥掉 package+import+声明后仅剩 package 子句，拆分是可逆完备划分）；import 合法、API 面 52 符号双向差集空、覆盖率持平、例程与 fuzz 冒烟全绿（FuzzTensorConstructors 300k/FuzzOpGraphs 514k execs）、doc.go 引用符号零缺失。**裁决：放行**（零行为变更纯移动，可作零风险维护性提交）
+- 2026-08-03：**22c 主控终验**——PROGRESS.md 阶段 22 落账。阶段 22 累计 2 个 agent（实施 + RT-H），累计 68 个 agent。**待库主裁决**：提交（建议直接提交、不打 tag——纯维护零 API 变化，属 v0.6.1 后内部卫生；如需语义版本可 v0.6.2）
